@@ -1,0 +1,34 @@
+schema_version: interop.model-profile.v1
+id: hermes-3-llama-ollama
+match:
+  model_patterns:
+    - "^hermes-3"
+    - "hermes-3"
+  backends:
+    - ollama
+    - openai-compatible
+template:
+  source: backend
+  fallback: hermes
+tool_calling:
+  supported: true
+  parser: hermes
+  automatic: true
+  required: true
+  named: true
+  parallel: true
+  strict_arguments: true
+reasoning:
+  supported: false
+context:
+  declared_tokens: 131072
+  safe_tokens: 8192
+  reserve_output_tokens: 4096
+streaming:
+  supported: true
+  tool_arguments_incremental: false
+repair:
+  malformed_json: reparse
+  unknown_tool: reject
+  missing_tool_id: synthesize
+  max_attempts: 2
