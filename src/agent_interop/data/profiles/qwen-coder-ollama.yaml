@@ -1,0 +1,52 @@
+schema_version: interop.model-profile.v2
+id: qwen-coder-ollama
+match:
+  model_patterns:
+    - "^qwen.*coder"
+  backends:
+    - ollama
+tool_calling:
+  presentation:
+    mode: prompted
+    schema_format: openai_function
+    # Empirically validated (live benchmark against qwen2.5-coder:7b,
+    # repair-on tool-call success 42% -> 67%): the qwen-tool-v1 template
+    # adds an explicit "don't wrap in fences" instruction on top of the
+    # <tool_call> envelope this profile's parser actually recognizes.
+    contract_template: qwen-tool-v1
+  extraction:
+    parser: tool_call_envelope
+    envelope: tool_call
+    fallbacks:
+      # Real, verified behavior (see benchmark above): this model's
+      # default habit is a bare or fenced JSON object with no <tool_call>
+      # tags at all, rather than the tag envelope it's taught. Recovers
+      # that shape instead of silently discarding it.
+      #
+      # `auto` is deliberately excluded here: under tool_choice=auto, a
+      # bare/fenced JSON object in the response is genuinely ambiguous
+      # (a real tool call vs. demonstration/example content), and this
+      # is a *builtin*-tier profile shipped to every install by default.
+      # Recovering it unconditionally would mean a stock install
+      # executes content the model may not have intended as a call.
+      # `required`/`named` are unaffected — the client already asked
+      # for a specific tool, so there is no such ambiguity to recover
+      # from. An operator who wants `auto` recovery for their own
+      # measured setup can enable it in a project/user-tier profile
+      # override, which requires a per-request nonce match (see
+      # profiles_v2.py's ALLOW_AMBIGUOUS_AUTO_FALLBACK handling).
+      - parser: whole_message_json
+        skip_when_native_present: true
+        tool_choice_modes: [required, named]
+  choice:
+    automatic: true
+    required: true
+    named: true
+    parallel: false
+reasoning:
+  supported: true
+context:
+  declared_tokens: 131072
+  safe_tokens: 65536
+streaming:
+  supported: true

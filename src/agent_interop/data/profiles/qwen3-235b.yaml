@@ -1,0 +1,30 @@
+schema_version: interop.model-profile.v2
+id: qwen3-235b-a100b
+match:
+  model_patterns:
+    - "^qwen3-235b"
+  backends:
+    - ollama
+    - openai_compatible
+tool_calling:
+  presentation:
+    mode: prompted
+  extraction:
+    # See qwen3-coder.yaml: was `parser: qwen` (matches only
+    # <tool>...</tool>) while the rendered contract taught
+    # <tool_call>...</tool_call> — a real mismatch. Switched to the
+    # extractor that actually matches what's taught.
+    parser: tool_call_envelope
+    envelope: tool_call
+  choice:
+    automatic: true
+    required: true
+    named: true
+    parallel: true
+reasoning:
+  supported: true
+context:
+  declared_tokens: 32768
+  safe_tokens: 16384
+streaming:
+  supported: true

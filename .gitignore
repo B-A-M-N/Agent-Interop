@@ -7,3 +7,16 @@ dist/
 build/
 .DS_Store
 *.log
+
+# Coverage artifacts (scripts/release.sh runs pytest --cov)
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Local tool/editor state
+.claude/
+.gemini_security/
+
+# Stray local benchmark artifacts (not release inputs)
+benchmark_results_*.json

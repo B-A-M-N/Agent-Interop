@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-gate:
+    name: Release gate (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          # Pinned, not "latest" — an unpinned CI dependency means a new
+          # uv release can silently change resolver/lock behavior on an
+          # unrelated PR with no diff to review.
+          version: "0.10.8"
+          python-version: ${{ matrix.python-version }}
+
+      - name: Sync dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Run release gate
+        # --check allows CI's checkout to be treated as clean without also
+        # skipping any other step — the gate itself still lints, type-checks,
+        # tests with coverage, builds the wheel, installs it into a fresh
+        # venv, and runs CLI/config smoke tests against that installed
+        # artifact. (The non-check mode additionally demands the tree be
+        # dirt-free by git's own accounting, which is redundant here since
+        # actions/checkout already gives a clean tree.)
+        #
+        # INTEROP_RELEASE_WHEEL_OUT copies the EXACT wheel this run just
+        # installed, imported, and smoke-tested into dist/ — CI previously
+        # ran a second, independent `uv build` here and uploaded that
+        # instead, meaning the artifact actually published had never itself
+        # been verified by anything above, only a same-source sibling build.
+        run: ./scripts/release.sh --check
+        env:
+          INTEROP_RELEASE_WHEEL_OUT: dist
+
+      - name: Upload wheel
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-wheel
+          path: dist/*.whl
+          if-no-files-found: error

@@ -1,0 +1,24 @@
+schema_version: interop.model-profile.v2
+id: gpt-4o-mini-compat
+match:
+  model_patterns:
+    - "^gpt-4o-mini"
+  backends:
+    - openai_compatible
+tool_calling:
+  presentation:
+    mode: native
+    schema_format: openai_function
+  extraction:
+    parser: native_structured
+    envelope: native_structured
+  choice:
+    automatic: true
+    required: true
+    named: true
+    parallel: true
+context:
+  declared_tokens: 128000
+  safe_tokens: 65536
+streaming:
+  supported: true

@@ -1,0 +1,1 @@
+"""Upstream protocol codecs — render requests and decode responses."""

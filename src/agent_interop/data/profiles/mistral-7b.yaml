@@ -1,0 +1,31 @@
+schema_version: interop.model-profile.v2
+id: mistral-7b
+match:
+  model_patterns:
+    - "^mistral-7b"
+  backends:
+    - ollama
+    - openai_compatible
+tool_calling:
+  presentation:
+    mode: prompted
+  extraction:
+    # Was `parser: mistral` (MistralExtractor, which matches a
+    # `[TOOL_CALLS]` prefix — Mistral's own native format) while the
+    # rendered contract taught <tool_call>...</tool_call> — a real,
+    # previously-invisible mismatch. Switched to the extractor that
+    # actually matches what's taught; not empirically re-validated
+    # against this specific model, but the mismatch it replaces was
+    # definitely broken.
+    parser: tool_call_envelope
+    envelope: tool_call
+  choice:
+    automatic: true
+    required: true
+    named: true
+    parallel: false
+context:
+  declared_tokens: 8192
+  safe_tokens: 4096
+streaming:
+  supported: true

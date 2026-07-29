@@ -1,0 +1,24 @@
+schema_version: interop.model-profile.v2
+id: generic-fallback
+match:
+  model_patterns:
+    - ".*"
+  backends:
+    - ollama
+    - openai_compatible
+tool_calling:
+  presentation:
+    mode: prompted
+  extraction:
+    parser: tool_call_envelope
+    envelope: tool_call
+  choice:
+    automatic: false
+    required: true
+    named: false
+    parallel: false
+context:
+  declared_tokens: 4096
+  safe_tokens: 2048
+streaming:
+  supported: true

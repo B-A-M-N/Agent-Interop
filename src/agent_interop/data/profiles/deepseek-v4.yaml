@@ -1,0 +1,30 @@
+schema_version: interop.model-profile.v2
+id: deepseek-v4-0324
+match:
+  model_patterns:
+    - "^deepseek-v4"
+  backends:
+    - ollama
+    - openai_compatible
+tool_calling:
+  presentation:
+    mode: prompted
+  extraction:
+    # See deepseek-r1.yaml: was `parser: deepseek` (matches only a
+    # literal \x14...\x14 control-byte delimiter) while the rendered
+    # contract taught <tool_call>...</tool_call> — a real mismatch.
+    # Switched to the extractor that actually matches what's taught.
+    parser: tool_call_envelope
+    envelope: tool_call
+  choice:
+    automatic: true
+    required: true
+    named: true
+    parallel: true
+reasoning:
+  supported: true
+context:
+  declared_tokens: 131072
+  safe_tokens: 65536
+streaming:
+  supported: true

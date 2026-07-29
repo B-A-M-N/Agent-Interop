@@ -1,0 +1,34 @@
+schema_version: interop.model-profile.v2
+id: deepseek-r1
+match:
+  model_patterns:
+    - "^deepseek-r1"
+  backends:
+    - ollama
+    - openai_compatible
+tool_calling:
+  presentation:
+    mode: prompted
+  extraction:
+    # Was `parser: deepseek` (DeepSeekExtractor, which matches a literal
+    # \x14...\x14 control-byte delimiter — DeepSeek's own native special-
+    # token format, not something a text prompt can reliably teach a
+    # model to type) while the rendered contract taught
+    # <tool_call>...</tool_call> — a real, previously-invisible mismatch.
+    # Switched to the extractor that actually matches what's taught; not
+    # empirically re-validated against this specific model, but the
+    # mismatch it replaces was definitely broken.
+    parser: tool_call_envelope
+    envelope: tool_call
+  choice:
+    automatic: true
+    required: true
+    named: true
+    parallel: true
+reasoning:
+  supported: true
+context:
+  declared_tokens: 16384
+  safe_tokens: 8192
+streaming:
+  supported: true

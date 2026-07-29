@@ -2,34 +2,92 @@
 
 ## Agent Compatibility Gateway — local LLM compatibility layer for coding agents
 
-Interop sits between coding agents (Claude Code, Codex, Cline, etc.) and
-local inference backends (Ollama, vLLM, llama.cpp) and translates between
-the formats each side expects.
+Interop sits between a coding agent and a local inference backend and
+translates between the wire formats each side expects.
+
+### Client integration status (MVP)
+
+Verification claims here are deliberately layered — "the gateway handles
+this protocol correctly" and "this exact client binary works against it"
+are different, separately-earned claims, and collapsing them into one
+"Supported" label previously overstated what the test suite actually
+proves. None of the tiers below currently include a test that launches
+and drives the real `claude` or `codex` binary end-to-end; that is the
+one verification level this project has not yet done for any client.
+
+| Client | Backend | Verified as |
+|--------|---------|-------------|
+| Claude Code | Ollama | Gateway-tested protocol |
+| Codex | Ollama / OpenAI-compatible (vLLM, llama.cpp) | Gateway-tested protocol |
+| Crush | Manual configuration | Unit-tested integration (no automatic launch) |
+| Cline, OpenCode, Aider, Continue, Qwen Code | — | Unit-tested integration |
+
+Verification tiers, weakest to strongest:
+
+- **Unit-tested integration** — the launcher builds a correct launch spec
+  (protocol, env vars, base URL, shim args) for this client and it's
+  covered by unit tests against that spec, in isolation from a live
+  gateway or backend.
+- **Gateway-tested protocol** — the client's wire protocol (Anthropic
+  Messages / OpenAI Chat / OpenAI Responses) is exercised end-to-end
+  through a real `Gateway` instance against a fake or real backend in the
+  test suite — request decode, tool-call extraction/repair, response
+  encode — but not through the actual client binary.
+- **Manually tested client** — a developer has run the real client
+  binary against Interop by hand and confirmed the tool loop works.
+  (Not currently claimed for any client here — see below.)
+- **Reproducibly release-tested client** — an automated, opt-in
+  acceptance test invokes the real client binary end-to-end and is part
+  of the release gate. (Not currently implemented — see "Known gaps.")
+
+MVP scope is Linux, Python 3.11+, loopback ingress, and one route per
+process. Multi-route operation, remote ingress exposure, and any client
+above are not part of the tested MVP surface beyond the tier listed — the
+code paths exist but haven't been proven at a higher tier.
+
+### Known gaps
+
+- No test in this repository launches or drives a real `claude` or
+  `codex` binary. Everything under "Client integration status" above is
+  verified at the launch-spec or gateway-protocol level, not against the
+  actual client process.
 
 ### Quick start
 
 ```bash
-pip install interop
+pip install agent-interop
 interop install
 ollama launch claude --model qwen3-coder
 ```
 
-After `interop install`, `ollama launch <agent>` transparently routes through
-Interop's format translation layer. Non-launch commands (serve, pull, etc.)
-pass through normally.
+The PyPI distribution is `agent-interop`; the CLI command stays `interop`.
+The importable Python package is `agent_interop` (`import agent_interop`,
+`from agent_interop.config import ...`) — this was renamed from the
+original `interop` specifically so its top-level module name can't collide
+with an unrelated third-party distribution that happens to also ship a
+package literally named `interop`.
+
+`interop install` puts a script literally named `ollama` at the front of
+your PATH, shadowing the real `ollama` binary — every invocation of the
+`ollama` command on this system, not just ones you type yourself, runs this
+wrapper from then on. `ollama launch <agent>` is intercepted and routed
+through Interop's format translation layer; every other subcommand (serve,
+pull, push, etc.) execs straight through to the real binary unmodified.
+`interop uninstall` removes the wrapper and restores the real binary at the
+front of PATH. If you'd rather not modify PATH resolution at all, use
+`interop run <agent>` instead — same result, no shim, no `ollama install`.
+
+Contributing to Interop itself (not just using it) needs the dev extras —
+see [Development](#development) below.
 
 ### Why
 
-Local models fail in coding agents because of format mismatches:
-
-- Wrong chat templates
-- Broken tool-call JSON
-- Missing tool-call IDs
-- Wrong stop tokens
-- Bad streaming format
-- No error recovery
-
-Interop fixes all of this without the user having to think about it.
+Local models fail in coding agents because of format mismatches. Interop
+translates supported coding-agent protocols, presents tools in a
+model-compatible form, and repairs bounded, unambiguous tool-call defects.
+Conformance testing reports capabilities that cannot be recovered safely —
+effectiveness varies by model. Use `interop test <model>` to check
+conformance (experimental — see "Evidence and certification" below).
 
 ### Architecture
 
@@ -45,7 +103,7 @@ Interop Gateway (protocol translation)
   ├── Model-specific template rendering
   ├── Tool-call parsing (Hermes, Qwen, DeepSeek, Mistral, Llama, generic JSON)
   ├── Schema validation + bounded repair
-  ├── Capability detection + conformance levels
+  ├── Capability detection + per-route conformance levels
   └── Loop detection
   │
   ▼
@@ -54,6 +112,146 @@ Ollama / vLLM / llama.cpp
   ▼
 Local model
 ```
+
+### Status
+
+#### Implemented
+
+- Protocol translation: Anthropic Messages ↔ OpenAI Chat ↔ OpenAI Responses,
+  streaming and non-streaming, exercised through full ASGI-level tests (real
+  HTTP requests against the FastAPI app, not just unit-level Gateway calls)
+- Tool-call parsing for Hermes, Qwen, DeepSeek, Mistral, Llama, and generic
+  JSON envelope dialects — generic/bare JSON tool-call scanning is **off by
+  default** (opt-in per profile) because it can misinterpret ordinary JSON in
+  model output as a tool call
+- Schema validation with bounded cursor-scoped repair (one-issue/one-mutation
+  at root level; nested `$ref`/`oneOf`/`anyOf` paths not yet supported)
+- Streaming support for all three protocol adapters, including token usage
+  emission (`usage_update`) before the terminal event, with error visibility
+  and readiness/liveness endpoints (`/health/live`, `/health/ready`)
+- Conformance test suite with 12 tests across cumulative L0-L4 levels
+- Backends: Ollama (via upstream codecs), OpenAI-compatible (via upstream
+  codecs, covers vLLM and llama.cpp)
+- Shim installation for `ollama launch` interception, with an install
+  manifest so uninstall restores the exact prior wrapper
+- Config validation on startup, with a config schema version and a
+  round-tripping `interop init` → load cycle
+- History reconciliation with sequential pairing, safety checks, and
+  deterministic ID synthesis (stable across retries of the same request)
+- Centralized error registry wired into all protocol adapters, with
+  credential/secret redaction applied to every client-visible error message
+- Malformed stream frame handling with typed markers, a bounded retry
+  threshold, and client-safe error details
+- Loop detection wired into gateway response assembly, scoped per
+  `(session, route)` and never triggered for a client that supplied no
+  session identifier
+- Request execution coordinator in both streaming and non-streaming paths —
+  bookkeeping (evidence write-back, execution finalization) completes before
+  the terminal event is yielded, not after
+- Fenced-code masking applied to all textual extractors (Hermes, Mistral,
+  Llama, generic)
+- Structured tool corrections in rejection error details
+- Backend constraints from codec (OpenAI Chat: 64-char names, 128 tools)
+- systemd user service management (`interop service install/start/stop/logs`)
+
+#### Experimental
+
+- `interop certify` / evidence recording / replay — evidence is disabled by
+  default and never activates compatibility-pack trust automatically; see
+  "Evidence and certification" below
+- `/v1/capabilities` — declared metadata only (see "Capability state" below),
+  not a verified guarantee
+- Multi-route fan-out (gateway serves multiple models simultaneously)
+- MCP diagnostics and MCP tool-schema helpers (present in the codebase,
+  not wired into any production request path)
+
+#### Explicitly deferred scope
+
+These items are architecturally bounded but not implemented:
+
+1. **`$ref` resolution and `oneOf`/`anyOf` branch disambiguation** — Nested repair
+   supports directly-addressable object and array paths. Repairs inside unresolved
+   `$ref` targets or ambiguous `oneOf`/`anyOf` branches are rejected without mutation.
+
+2. **Probe-derived model digest and quantization** — These fields depend on
+   backend-specific discovery APIs. Fields remain empty rather than invented.
+   Evidence is not marked verified when required identity dimensions are unavailable.
+
+3. **Persistent multi-turn session management** — Loop detection uses a
+   client-supplied session ID when present. No persistent session store or
+   lifecycle contract exists beyond the bounded in-process LRU cache, and a
+   request with no session ID gets no session tracking at all (by design —
+   see "Implemented" above).
+
+#### Planned (not yet implemented)
+
+- Wiring `testing/conformance.py`'s cumulative L0-L4 level calculation
+  (`_compute_level`/`_cumulative_requirements` — the algorithm itself
+  already exists) into the live `interop test`/`interop certify` path and
+  `/v1/capabilities`, which currently report the separate
+  `ToolCapabilityLevel`/`AgentCapabilityLevel` scheme from capabilities.py
+  instead
+- Additional model profiles beyond the current packaged set
+- Destination-aware request validation from live backend probe metadata
+
+### Conformance levels
+
+Interop classifies models into cumulative conformance levels. Each level
+requires **all** behaviors of the previous level plus new ones. Levels are
+determined by the conformance test suite, not assumed.
+
+| Level | Required behavior |
+|-------|-------------------|
+| L0 | Chat only — no tool support |
+| L1 | Call an explicitly-named tool with correct arguments |
+| L2 | L1 + Automatically select the right tool + avoid tools when unnecessary |
+| L3 | L2 + Sequential tool calls + error recovery + structured/nested arguments |
+| L4 | L3 + Parallel tool calls + edit-and-verify cycles + distinct call IDs |
+
+Use `interop test <model>` to run the conformance suite against a model.
+The `/v1/capabilities` endpoint reports per-route level and degraded reason
+— as **declared** metadata, not a verified result (see below).
+
+### Capability state
+
+`/v1/capabilities` reports declared capability state per route, derived from
+static model-profile and codec metadata:
+
+```json
+{
+  "source": "declared_profile_metadata",
+  "verified": false,
+  "capability_model": {
+    "<route_id>": {
+      "tool_level": {"value": "..."},
+      "agent_level": {"value": "..."},
+      "capabilities": {
+        "<capability_name>": {"state": "declared|unsupported|...", "details": {}}
+      },
+      "compatibility": {"status": "...", "missing_capabilities": [], "warnings": [], "remediation": []}
+    }
+  }
+}
+```
+
+`state` follows `unsupported → declared → probed → verified/degraded →
+user-forced`. Only `probed`, `verified`, and `user-forced` count as actually
+available (`CapabilityState.is_available()`); `declared` means only that
+model/codec metadata *claims* the capability — nothing has confirmed it
+against a live backend. Live conformance results (`interop certify`) are
+recorded as evidence but do not automatically upgrade what this endpoint
+reports — see "Evidence and certification" below.
+
+### Evidence and certification (experimental)
+
+The evidence store is **disabled by default** — it must be explicitly
+enabled in config (`evidence.enabled: true`) before anything is recorded.
+`interop certify` runs the conformance battery against a real backend and
+records observations, but it does **not** mark results as manually verified
+— that flag is reserved for actual human review, and an automated CLI run
+conflating the two would let a passing suite silently activate trust it
+hasn't earned. Treat `certify`, `evidence`, and `replay` as experimental
+tooling for now, not a production trust mechanism.
 
 ### Install
 
@@ -75,6 +273,17 @@ git clone ...
 cd interop
 uv venv
 source .venv/bin/activate
-uv pip install -e ".[dev,cli,server]"
+uv pip install -e ".[dev]"
 pytest
 ```
+
+Before opening a PR, run the release gate locally — the same checks CI runs
+(lint, types, tests with coverage, wheel build/install/import, config
+round-trip, CLI smoke tests):
+
+```bash
+./scripts/release.sh --check
+```
+
+(`--check` allows a dirty working tree for local iteration; drop the flag to
+run the exact gate a real release requires.)

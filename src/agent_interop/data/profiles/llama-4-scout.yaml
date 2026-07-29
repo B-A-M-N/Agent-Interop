@@ -1,0 +1,28 @@
+schema_version: interop.model-profile.v2
+id: llama-4-scout
+match:
+  model_patterns:
+    - "^llama-4-scout"
+  backends:
+    - ollama
+    - openai_compatible
+tool_calling:
+  presentation:
+    mode: prompted
+  extraction:
+    # See llama-3x-instruct.yaml: was `parser: llama` (matches only a
+    # `<|python_tag|>` prefix) while the rendered contract taught
+    # <tool_call>...</tool_call> — a real mismatch. Switched to the
+    # extractor that actually matches what's taught.
+    parser: tool_call_envelope
+    envelope: tool_call
+  choice:
+    automatic: true
+    required: true
+    named: true
+    parallel: true
+context:
+  declared_tokens: 262144
+  safe_tokens: 131072
+streaming:
+  supported: true

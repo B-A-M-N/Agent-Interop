@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-import json
-
-from interop.types import (
+from agent_interop.abi import CanonicalToolCallBlock, CanonicalToolResultBlock
+from agent_interop.types import (
     CanonicalTool,
     CapabilityLevel,
     ContentBlock,
     ProtocolKind,
-    ToolCall,
-    ToolCallDialect,
-    ToolResult,
     tool_from_anthropic,
     tool_from_openai,
     tool_to_anthropic,
@@ -36,7 +32,7 @@ class TestToolCall:
         tool = tool_from_openai(spec)
         assert tool.name == "read_file"
         assert tool.description == "Read a file"
-        assert "path" in tool.parameters["properties"]
+        assert "path" in tool.input_schema["properties"]
 
     def test_from_anthropic(self):
         spec = {
@@ -50,13 +46,13 @@ class TestToolCall:
         }
         tool = tool_from_anthropic(spec)
         assert tool.name == "read_file"
-        assert "path" in tool.parameters["properties"]
+        assert "path" in tool.input_schema["properties"]
 
     def test_to_openai(self):
         tool = CanonicalTool(
             name="search",
             description="Search code",
-            parameters={"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]},
+            input_schema={"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]},
         )
         result = tool_to_openai(tool)
         assert result["type"] == "function"
@@ -66,7 +62,7 @@ class TestToolCall:
         tool = CanonicalTool(
             name="search",
             description="Search code",
-            parameters={"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]},
+            input_schema={"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]},
         )
         result = tool_to_anthropic(tool)
         assert result["name"] == "search"
@@ -89,13 +85,13 @@ class TestContentBlock:
         assert b.text == "hello"
 
     def test_tool_use_block(self):
-        tc = ToolCall(id="tc1", name="read", arguments={"path": "/tmp"})
+        tc = CanonicalToolCallBlock(id="tc1", name="read", arguments={"path": "/tmp"})
         b = ContentBlock(type="tool_use", tool_call=tc)
         assert b.type == "tool_use"
         assert b.tool_call.name == "read"
 
     def test_tool_result_block(self):
-        tr = ToolResult(call_id="tc1", tool_name="read", content="file content")
+        tr = CanonicalToolResultBlock(tool_call_id="tc1", content="file content")
         b = ContentBlock(type="tool_result", tool_result=tr)
         assert b.type == "tool_result"
         assert b.tool_result.content == "file content"
@@ -104,20 +100,6 @@ class TestContentBlock:
         b = ContentBlock(type="thinking", text="thinking...", signature="sig123")
         assert b.type == "thinking"
         assert b.signature == "sig123"
-
-
-class TestToolCallObject:
-    def test_roundtrip_dict(self):
-        tc = ToolCall(id="tc1", name="read_file", arguments={"path": "/tmp/test.txt"})
-        d = tc.to_dict()
-        assert d["id"] == "tc1"
-        assert d["name"] == "read_file"
-        assert d["arguments"]["path"] == "/tmp/test.txt"
-
-    def test_default_dialect(self):
-        tc = ToolCall(id="t1", name="test", arguments={})
-        assert tc.dialect == ToolCallDialect.GENERIC_JSON
-        assert tc.repair.value == "none"
 
 
 class TestProtocolKind:
@@ -132,7 +114,7 @@ class TestToolRelation:
         tool = CanonicalTool(
             name="test",
             description="test tool",
-            parameters={"type": "object", "properties": {"x": {"type": "string"}}},
+            input_schema={"type": "object", "properties": {"x": {"type": "string"}}},
         )
         s = tool.to_json_schema()
         assert s["type"] == "function"

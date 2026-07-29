@@ -1,0 +1,29 @@
+schema_version: interop.model-profile.v2
+id: hermes-3-llama-ollama
+match:
+  model_patterns:
+    - "^hermes-3"
+    - "hermes-3"
+  backends:
+    - ollama
+    - openai_compatible
+tool_calling:
+  presentation:
+    mode: prompted
+  extraction:
+    # HermesExtractor matches <tool_call>...</tool_call>, which is also
+    # exactly what the rendered contract teaches — this profile was
+    # already internally consistent (unlike qwen/mistral/deepseek/llama;
+    # see their profiles for the mismatch this one didn't have).
+    parser: hermes
+    envelope: tool_call
+  choice:
+    automatic: true
+    required: true
+    named: true
+    parallel: true
+context:
+  declared_tokens: 131072
+  safe_tokens: 65536
+streaming:
+  supported: true

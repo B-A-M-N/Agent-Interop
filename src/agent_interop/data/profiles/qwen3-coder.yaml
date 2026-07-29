@@ -1,0 +1,34 @@
+schema_version: interop.model-profile.v2
+id: qwen3-coder
+match:
+  model_patterns:
+    - '^qwen3-coder\b'
+  backends:
+    - ollama
+    - openai_compatible
+tool_calling:
+  presentation:
+    mode: prompted
+  extraction:
+    # Was `parser: qwen` (QwenExtractor, which only matches <tool>...</tool>)
+    # while the rendered contract taught <tool_call>...</tool_call> — a
+    # real, previously-invisible mismatch (every profile silently got the
+    # same generic contract regardless of what its own parser expected,
+    # so nothing ever surfaced this). Switched to the extractor that
+    # actually matches what's taught; not empirically re-validated
+    # against this specific model, but the mismatch it replaces was
+    # definitely broken.
+    parser: tool_call_envelope
+    envelope: tool_call
+  choice:
+    automatic: true
+    required: true
+    named: true
+    parallel: true
+reasoning:
+  supported: true
+context:
+  declared_tokens: 131072
+  safe_tokens: 65536
+streaming:
+  supported: true
