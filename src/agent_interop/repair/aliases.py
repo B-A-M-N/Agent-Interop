@@ -15,16 +15,47 @@ in by the caller as ``FieldAliasPolicy``:
 * ``DISABLED`` — no aliasing at all.
 * ``SCHEMA_ONLY`` — only ``x-aliases`` declared on the tool's JSON
   Schema.  No compatibility-pack or universal-table aliases.
-* ``COMPATIBILITY_PACK`` — schema aliases plus aliases from an
-  approved compatibility pack.  The pack is only consulted when
-  the caller supplies a verified ``compatibility_key`` *and* the
-  ``client_id`` is non-empty; a generic client name alone is never
-  sufficient.
+* ``COMPATIBILITY_PACK`` — schema aliases plus aliases from a
+  registered compatibility pack (``compatibility_packs/<client>/``).
 
-Safety rules enforced by the pipeline (not here):
+Registered compatibility packs do NOT require ``compatibility_verified``
+evidence to activate. That flag exists for empirically-observed or
+otherwise dynamic repair behavior, where correctness for a given tuple is
+genuinely an open question the evidence store answers. A registered pack
+is a different risk category: it is maintainer-authored, static, and
+reviewed once at write time — the uncertainty "is this mapping correct"
+was already resolved by a human reading the client's real tool schemas,
+not something that needs re-proving per installation via live traffic.
+Requiring per-tuple manual verification for a table that's already the
+same on every installation adds friction without adding safety.
+
+What registered-pack activation DOES require, so it is never a loose
+``client_id`` string match:
+  - The pack is explicitly registered in code (``_PACKS`` or the
+    hardcoded ``known_packs`` import allowlist in
+    ``compatibility_packs/__init__.py`` — a client_id that doesn't name a
+    real registered pack module resolves to no aliases at all).
+  - A properly RESOLVED client identity: a populated ``CompatibilityKey``
+    naming ``client_id`` plus at least one other real dimension
+    (model/profile/backend) — see ``_is_key_sufficiently_populated`` —
+    not a bare, unauthenticated client_id string alone.
+  - The tool/schema contract still matches: the rule that actually
+    applies an alias (``rename_aliased_fields`` in ``rules.py``) only
+    fires for a field name jsonschema validation ALREADY reported as
+    missing/wrong-typed against the tool's real schema — the alias table
+    is a candidate list, never a bypass of real schema validation.
+
+If a dynamic, learned, or user-supplied alias source is ever added, it
+must be gated by ``compatibility_verified`` through a SEPARATE code path
+— this module's ``COMPATIBILITY_PACK`` branch is reserved for registered,
+static packs only.
+
+Safety rules enforced by the pipeline (not here), unaffected by which
+alias source proposed the rename:
   - Apply only when the canonical field is absent.
   - Apply only when exactly one alias is present (no ambiguity).
   - Apply only when the renamed result validates better than the original.
+  - Reject when the rename would change a discriminated-union branch.
 
 The map is also dynamically extended: if a tool's JSON Schema declares
 ``x-aliases`` on a property, those are merged in at lookup time.
@@ -93,9 +124,12 @@ def get_aliases_for_tool(
     * ``SCHEMA_ONLY`` — only property-level ``x-aliases`` declared on
       the tool's JSON Schema.  No compatibility-pack or universal-table
       aliases.
-    * ``COMPATIBILITY_PACK`` — schema aliases plus aliases from an
-      approved compatibility pack.  This source requires a fully-populated
-      ``compatibility_key`` (client_id alone is never sufficient).
+    * ``COMPATIBILITY_PACK`` — schema aliases plus aliases from a
+      registered compatibility pack.  This source requires a
+      fully-populated ``compatibility_key`` (client_id alone is never
+      sufficient) naming a client that resolves to an actually-registered
+      pack module — see the module docstring for why this does NOT also
+      require ``compatibility_verified``.
 
     Universal aliases from the curated ``_TOOL_ALIASES`` / ``_GLOBAL_ALIASES``
     tables are NOT included unless the policy explicitly allows them.
@@ -107,10 +141,9 @@ def get_aliases_for_tool(
     When a full ``compatibility_key`` is provided, resolution uses the
     exact client/model/backend/profile tuple rather than only ``client_id``.
 
-    The compatibility pack source additionally requires
-    ``compatibility_verified`` to be True — i.e. the gateway has confirmed a
-    manually-verified evidence record exists for the exact tuple. A
-    structurally well-formed key is necessary but not sufficient.
+    ``compatibility_verified`` is accepted for API stability and reserved
+    for a future dynamic/learned alias source; it is not consulted by the
+    registered-pack branch below (see module docstring).
     """
     from agent_interop.config import FieldAliasPolicy
 
@@ -136,19 +169,21 @@ def get_aliases_for_tool(
                         a for a in declared if isinstance(a, str) and a
                     ]
 
-    # 2. Compatibility pack aliases (only when policy permits AND key is present).
+    # 2. Compatibility pack aliases (only when policy permits AND a
+    #    properly resolved client identity is present).
     if policy == FieldAliasPolicy.COMPATIBILITY_PACK:
-        # Require ALL of:
-        #   - a meaningfully-populated compatibility key (client_id plus at
-        #     least one model/profile dimension), AND
-        #   - verified evidence for that exact tuple.
-        # A well-formed key merely identifies a tuple; it does NOT prove a
-        # repair is safe for that tuple. The compatibility_verified flag is
-        # only True when a manually-verified, non-revoked, non-stale evidence
-        # record with a sufficient sample base exists for the exact key.
+        # Registered packs are maintainer-authored and static — see the
+        # module docstring for why they do NOT require
+        # compatibility_verified. What they DO require is a resolved
+        # identity, not a bare client_id string: a compatibility key
+        # naming client_id plus at least one other real dimension
+        # (model/profile/backend). get_pack_aliases() itself only ever
+        # resolves a client_id that names an actually-registered pack
+        # module (see compatibility_packs/__init__.py's known_packs
+        # allowlist) — an unrecognized client_id yields no aliases
+        # regardless of how well-populated the key is.
         if (
             compatibility_key is not None
-            and compatibility_verified
             and _is_key_sufficiently_populated(compatibility_key)
         ):
             from agent_interop.compatibility_packs import get_pack_aliases

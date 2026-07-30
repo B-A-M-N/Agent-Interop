@@ -1,0 +1,8 @@
+{
+  "client": "Claude Code",
+  "client_version": "2.1.220",
+  "timestamp": "2026-07-29T23:55:46.511804+00:00",
+  "scenario": "single_tool_round_trip",
+  "passed": true,
+  "detail": "The file contains: hello from the acceptance test.\n"
+}

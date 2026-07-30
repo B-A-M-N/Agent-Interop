@@ -74,13 +74,15 @@ There are exactly two release tracks:
   that tier for it — the CLI/README can never claim more than recorded
   evidence supports, enforced mechanically rather than by convention.
 
-As of this writing, **no client has a recorded acceptance run** — the
-acceptance test harness has been written and reviewed but never executed
-against a real client binary in this development environment (there are no
-real `claude`/`codex` binaries or credentials available here). Every
-client integration therefore stays on the alpha/unverified track
-regardless of how much other work has landed, until someone actually runs
-`tests/acceptance/` for real.
+As of this writing, **Claude Code has a recorded acceptance run**:
+`acceptance/results/claude-code-2.1.220.json`, produced by an actual run
+of `tests/acceptance/test_real_client_claude.py` against the real
+`claude` binary (v2.1.220) — it launched with the exact `LaunchSpec`
+`interop run claude` builds, completed a full round trip through a live
+Interop gateway (request → tool call → tool result → final response),
+and passed. Codex and the generic-integration clients (Cline, OpenCode,
+Aider, Continue, Qwen Code) have no recorded run yet and stay on the
+alpha/unverified track until someone runs their harnesses for real.
 
 ### 2. Version bump
 

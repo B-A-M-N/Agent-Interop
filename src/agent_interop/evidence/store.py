@@ -18,7 +18,8 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
-from datetime import UTC
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from agent_interop.replay.types import (
@@ -30,8 +31,34 @@ from agent_interop.replay.types import (
 
 logger = logging.getLogger("agent_interop.evidence")
 
+
+@dataclass(frozen=True)
+class RepairStatsGroup:
+    """Aggregated `interop repair stats` numbers for one (route, model,
+    client) combination.
+
+    ``total_eligible`` is every tool-call decision the repair pipeline
+    evaluated (matches the existing ``candidate_count`` semantics on
+    ``CompatibilityResult``). The other counts partition it:
+    accepted_without_repair + accepted_after_repair + rejected ==
+    total_eligible. ``rejected_with_partial_repair`` is a SUBSET of
+    ``rejected`` (not an additional partition) — a rejected call where at
+    least one repair rule fired and made SOME progress before the call
+    still ultimately failed overall validation.
+    """
+
+    route_id: str = ""
+    model_id: str = ""
+    client_id: str = ""
+    total_eligible: int = 0
+    accepted_without_repair: int = 0
+    accepted_after_repair: int = 0
+    rejected: int = 0
+    rejected_with_partial_repair: int = 0
+    rule_counts: dict[str, int] = field(default_factory=dict)
+
 # Schema version for migrations
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 
 # Columns added in schema version 2
 _V2_COLUMNS = [
@@ -191,6 +218,33 @@ class EvidenceStore:
                     value TEXT
                 )
                 """
+            )
+            # Schema v7 — one row per tool-call decision, feeding
+            # `interop repair stats`. Deliberately a separate, append-only
+            # table from compatibility_results (which stores a single
+            # merged-counter row per compatibility tuple, with no
+            # per-rule or time-windowed breakdown at all): route/model/
+            # client grouping, per-rule-type breakdown, and --since
+            # filtering all require real per-event rows, not an
+            # aggregate counter.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS repair_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL,
+                    timestamp_iso TEXT,
+                    route_id TEXT DEFAULT '',
+                    model_id TEXT DEFAULT '',
+                    client_id TEXT DEFAULT '',
+                    tool_name TEXT DEFAULT '',
+                    outcome TEXT DEFAULT '',
+                    repair_rules TEXT DEFAULT '[]'
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_repair_events_lookup "
+                "ON repair_events (route_id, model_id, client_id, timestamp)"
             )
             conn.execute(
                 "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
@@ -618,6 +672,114 @@ class EvidenceStore:
         if hasattr(self._local, "conn") and self._local.conn is not None:
             self._local.conn.close()
             self._local.conn = None
+
+    # ── Repair stats (schema v7) ────────────────────────────────────────
+
+    def record_repair_event(
+        self,
+        *,
+        route_id: str,
+        model_id: str,
+        client_id: str,
+        tool_name: str,
+        outcome: str,
+        repair_rules: Sequence[str] = (),
+    ) -> None:
+        """Persist one row per tool-call decision — the source of truth
+        for `interop repair stats`. ``outcome`` is one of
+        "valid_unchanged" | "repaired" | "regenerated" | "rejected".
+
+        Never raises: a persistence failure here must not break the
+        request that triggered it, mirroring
+        Gateway._record_evidence_observation's own swallow-and-log
+        discipline at the call site.
+        """
+        now = time.time()
+        with self._lock:
+            with self._connection() as conn:
+                conn.execute(
+                    "INSERT INTO repair_events "
+                    "(timestamp, timestamp_iso, route_id, model_id, client_id, "
+                    "tool_name, outcome, repair_rules) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        now,
+                        datetime.fromtimestamp(now, UTC).isoformat(),
+                        route_id, model_id, client_id, tool_name, outcome,
+                        json.dumps(list(repair_rules)),
+                    ),
+                )
+
+    def query_repair_stats(
+        self,
+        *,
+        route_id: str | None = None,
+        model_id: str | None = None,
+        client_id: str | None = None,
+        since: str | None = None,
+    ) -> list[RepairStatsGroup]:
+        """Aggregate recorded repair events, grouped by (route, model,
+        client) — every filter is optional and independently composable.
+        ``since`` is an ISO-8601 timestamp lower bound (inclusive).
+
+        Never collapses distinct (route, model, client) combinations into
+        one row — same "never silently pick one record" discipline as
+        `interop evidence list` — so a caller filtering by only
+        ``route_id`` gets one group per distinct model/client pair
+        observed for that route, not a merged total.
+        """
+        query = (
+            "SELECT route_id, model_id, client_id, outcome, repair_rules "
+            "FROM repair_events WHERE 1=1"
+        )
+        params: list[Any] = []
+        if route_id:
+            query += " AND route_id = ?"
+            params.append(route_id)
+        if model_id:
+            query += " AND model_id = ?"
+            params.append(model_id)
+        if client_id:
+            query += " AND client_id = ?"
+            params.append(client_id)
+        if since:
+            query += " AND timestamp_iso >= ?"
+            params.append(since)
+
+        with self._connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+
+        acc: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for row in rows:
+            key = (row["route_id"], row["model_id"], row["client_id"])
+            g = acc.setdefault(key, {
+                "total_eligible": 0,
+                "accepted_without_repair": 0,
+                "accepted_after_repair": 0,
+                "rejected": 0,
+                "rejected_with_partial_repair": 0,
+                "rule_counts": {},
+            })
+            g["total_eligible"] += 1
+            outcome = row["outcome"]
+            try:
+                rules = json.loads(row["repair_rules"] or "[]")
+            except (json.JSONDecodeError, ValueError):
+                rules = []
+            if outcome == "valid_unchanged":
+                g["accepted_without_repair"] += 1
+            elif outcome in ("repaired", "regenerated"):
+                g["accepted_after_repair"] += 1
+            elif outcome == "rejected":
+                g["rejected"] += 1
+                if rules:
+                    g["rejected_with_partial_repair"] += 1
+            for rule in rules:
+                g["rule_counts"][rule] = g["rule_counts"].get(rule, 0) + 1
+
+        return [
+            RepairStatsGroup(route_id=k[0], model_id=k[1], client_id=k[2], **v)
+            for k, v in sorted(acc.items())
+        ]
 
 
 def capability_source(result: CompatibilityResult) -> str:

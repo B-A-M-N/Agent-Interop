@@ -131,7 +131,26 @@ class AnthropicMessagesAdapter(ClientProtocolAdapter):
                             ))
                         else:
                             user_blocks.append(CanonicalUnknownBlock(source_type=block.get("type", "unknown"), raw=block))
-                    messages.append(CanonicalMessage(role="user", content=user_blocks))
+                    # Anthropic's wire format has no dedicated "tool" role —
+                    # a tool result is a content block inside a role:"user"
+                    # message, per the real API contract (confirmed via a
+                    # live Claude Code request). Interop's own canonical
+                    # model uses a dedicated role="tool" internally (as the
+                    # OpenAI Chat decoder already does below, and as
+                    # history/reconcile.py's safety check requires) — a
+                    # pure tool-result turn is normalized to role="tool"
+                    # here so canonical messages have one consistent shape
+                    # regardless of source protocol. A message mixing a
+                    # tool_result with the user's own new text/images keeps
+                    # role="user" — that combination is a real user turn
+                    # with a tool_result attached, not a pure tool-result
+                    # message the same way an OpenAI role:"tool" message is.
+                    if user_blocks and all(
+                        isinstance(b, CanonicalToolResultBlock) for b in user_blocks
+                    ):
+                        messages.append(CanonicalMessage(role="tool", content=user_blocks))
+                    else:
+                        messages.append(CanonicalMessage(role="user", content=user_blocks))
                 else:
                     messages.append(CanonicalMessage(role="user", content=[CanonicalTextBlock(text=str(raw_content))]))
 
@@ -433,13 +452,20 @@ class AnthropicStreamEncoder(StreamEncoder):
         if event.type == "text_delta":
             if self.state.failure_pending:
                 return None
-            # Start text block if not started
+            # Start text block if not started. Anthropic's real API always
+            # opens a block with empty text and sends the actual content as
+            # a separate content_block_delta — this must never fold the
+            # first delta's text into content_block_start's hardcoded ""
+            # (that silently drops it, which is fatal for any response
+            # whose entire text arrives in a single text_delta event, e.g.
+            # the BUFFER_TEXTUAL_RESPONSE path that buffers a whole prompted-
+            # mode turn and yields it as one event).
             if not self._text_block_started:
                 idx = self._next_index
                 self._next_index += 1
                 self._current_text_index = idx
                 self._text_block_started = True
-                return self._sse("content_block_start", {
+                start_frame = self._sse("content_block_start", {
                     "type": "content_block_start",
                     "index": idx,
                     "content_block": {
@@ -447,6 +473,14 @@ class AnthropicStreamEncoder(StreamEncoder):
                         "text": "",
                     },
                 })
+                if not event.partial:
+                    return start_frame
+                delta_frame = self._sse("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {"type": "text_delta", "text": event.partial},
+                })
+                return start_frame + delta_frame
             return self._sse("content_block_delta", {
                 "type": "content_block_delta",
                 "index": self._current_text_index,
@@ -463,16 +497,46 @@ class AnthropicStreamEncoder(StreamEncoder):
                 idx = self._next_index
                 self._next_index += 1
                 self._block_indexes[key] = idx
-                return self._sse("content_block_start", {
+                start_frame = self._sse("content_block_start", {
                     "type": "content_block_start",
                     "index": idx,
                     "content_block": {
                         "type": "tool_use",
                         "id": cb.id,
                         "name": cb.name,
-                        "input": cb.arguments,
+                        # Anthropic's real streaming contract always opens
+                        # a tool_use block with an EMPTY input — the real
+                        # arguments arrive via subsequent input_json_delta
+                        # chunks that the client concatenates and parses
+                        # once the block closes. The gateway hands this
+                        # encoder the complete, already-decided call in one
+                        # shot (never a separate tool_use_delta/
+                        # content_block_stop pair for this path — see
+                        # gateway.py's _emit_batch_decision_events, the
+                        # only caller), so this single encode() call must
+                        # synthesize the full start+delta+stop sequence
+                        # itself. Found via a real live-client run: with a
+                        # fully-populated "input" here and no delta/stop
+                        # ever following, Claude Code's own SDK — which
+                        # rebuilds input purely from accumulated deltas —
+                        # got an empty, unparseable string and reported
+                        # "the model's tool call could not be parsed".
+                        "input": {},
                     },
                 })
+                delta_frame = self._sse("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(cb.arguments),
+                    },
+                })
+                stop_frame = self._sse("content_block_stop", {
+                    "type": "content_block_stop",
+                    "index": idx,
+                })
+                return start_frame + delta_frame + stop_frame
 
         if event.type == "tool_use_delta":
             if self.state.failure_pending:

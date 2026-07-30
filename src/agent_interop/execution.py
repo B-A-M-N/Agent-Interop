@@ -85,7 +85,10 @@ class InteropRequestExecution:
             tool_name=tool_name,
             candidate_id=candidate_id,
             outcome_status=outcome.status.value if outcome else "unknown",
-            repair_steps=[str(s) for s in (outcome.steps if outcome and outcome.steps else [])],
+            # Rule IDs (e.g. "rename_aliased_fields"), not a dataclass repr —
+            # this is what feeds `interop repair stats`' per-rule breakdown,
+            # so it needs to be a clean, aggregable identifier.
+            repair_steps=[s.rule for s in (outcome.steps if outcome and outcome.steps else [])],
             accepted=accepted,
         )
         self.tool_decisions.append(record)

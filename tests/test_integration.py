@@ -98,12 +98,24 @@ def test_partial_repair_rejected():
 
 
 def test_accepted_always_valid():
-    tools = _strict_tool()
+    # Matches Claude Code's REAL "Read" tool (name + canonical "file_path"
+    # field) — see compatibility_packs/claude_code. "path" is the alias a
+    # non-native model might emit instead.
+    tools = [CanonicalTool(
+        name="Read",
+        description="Read a file",
+        input_schema={
+            "type": "object",
+            "properties": {"file_path": {"type": "string"}},
+            "required": ["file_path"],
+            "additionalProperties": False,
+        },
+    )]
     schema = tools[0].input_schema
     from agent_interop.replay.types import CompatibilityKey
     compat_key = CompatibilityKey(client_id="claude_code", model_id="test-model")
     outcome = repair_one(
-        "read_file", {"file_path": "/tmp/x"}, tools,
+        "Read", {"path": "/tmp/x"}, tools,
         client_id="claude_code",
         policy=RepairPolicy(field_alias_policy=FieldAliasPolicy.COMPATIBILITY_PACK),
         compatibility_key=compat_key,

@@ -673,6 +673,25 @@ class Gateway:
         decisions = execution.tool_decisions
         n = len(decisions)
 
+        # One row per tool-call decision, for `interop repair stats`.
+        # Same opt-in gate as the rest of this method (evidence store must
+        # be configured) and the same swallow-and-log discipline —
+        # analytics persistence must never break the request that
+        # triggered it.
+        route_id = invocation.route.id if invocation.route is not None else ""
+        for d in decisions:
+            try:
+                store.record_repair_event(
+                    route_id=route_id,
+                    model_id=key.model_id,
+                    client_id=key.client_id,
+                    tool_name=d.tool_name,
+                    outcome=d.outcome_status,
+                    repair_rules=d.repair_steps,
+                )
+            except Exception:
+                logger.warning("failed to record repair event", exc_info=True)
+
         # Per-request OBSERVATION captured as COUNTERS (one unit per tool-call
         # decision), not as rates. This is what lets the merge weight each
         # call equally: a request with 10 decisions moves the aggregate 10x
@@ -1634,6 +1653,29 @@ class Gateway:
             return policy
         return replace(policy, enabled_tiers=frozenset(current))
 
+    @staticmethod
+    def _build_repair_note(decisions: list[Any]) -> str | None:
+        """Compact, model-facing note describing what the repair pipeline
+        actually changed this turn — never emitted for calls that were
+        already valid (VALID_UNCHANGED), only for ones that needed and
+        got a repair. Intent: showing the model what was normalized (e.g.
+        "old_str -> old_string") can reduce repeat mistakes of the same
+        kind within a session, the same way a compiler/lint error shown
+        back to a coding agent helps it self-correct.
+        """
+        notes: list[str] = []
+        for d in decisions:
+            outcome = getattr(d, "outcome", None)
+            if outcome is None or outcome.status != RepairStatus.REPAIRED or not outcome.steps:
+                continue
+            tool_name = outcome.call_name or getattr(d.candidate, "name", None) or "tool call"
+            step_msgs = "; ".join(step.message for step in outcome.steps if step.message)
+            if step_msgs:
+                notes.append(f"{tool_name}: {step_msgs}")
+        if not notes:
+            return None
+        return "[Interop] Normalized before executing — " + " | ".join(notes)
+
     def _assemble_response(
         self,
         decoded: DecodedModelResponse,
@@ -1652,6 +1694,16 @@ class Gateway:
 
         # Add accepted tool blocks from the transaction decision
         content.extend(batch_decision.accepted_blocks)
+
+        # Repair-note feedback: a short, structured text block naming
+        # exactly what got normalized, only when a repair actually fired.
+        # Riding along in the SAME assistant turn as the tool call means
+        # it survives into conversation history exactly the way any other
+        # assistant text does — no separate state tracking needed to
+        # resurface it to the model on a later turn.
+        repair_note = self._build_repair_note(getattr(batch_decision, "decisions", []))
+        if repair_note:
+            content.append(CanonicalTextBlock(text=repair_note))
 
         # Determine stop reason
         stop_reason = decoded.stop_reason
@@ -2136,10 +2188,26 @@ class Gateway:
                 return
 
             # GAP 6 FIX — read the public property instead of the private attr.
-            stop_reason = final_stop_reason or (
+            #
+            # coordinator.has_emitted_tool_calls MUST win over whatever the
+            # backend's terminal frame reported. Found via a real live-client
+            # run: Ollama (gpt-oss:20b-cloud) streams the tool_calls fragment
+            # in a non-terminal chunk, then closes with a `done:true` frame
+            # whose own done_reason is "stop" (mapped to END_TURN) and no
+            # tool_calls of its own — decode_stream_chunk has no cross-chunk
+            # state, so it can only see that one frame and reports END_TURN
+            # as final_stop_reason, silently overriding the correct TOOL_CALL
+            # signal `coordinator` already recorded from the earlier chunk. A
+            # response containing an emitted tool_use block is a protocol
+            # invariant that must report stop_reason=tool_use regardless of
+            # what the backend's last frame claimed — this mirrors the
+            # equivalent guard already applied on the non-streaming path
+            # (see ~line 1710: `if batch_decision.accepted_blocks and
+            # stop_reason == END_TURN: stop_reason = TOOL_CALL`).
+            stop_reason = (
                 CanonicalStopReason.TOOL_CALL
                 if coordinator.has_emitted_tool_calls
-                else CanonicalStopReason.END_TURN
+                else (final_stop_reason or CanonicalStopReason.END_TURN)
             )
 
             # Live evidence write-back at clean stream end: only when tools were

@@ -81,7 +81,11 @@ TOOLS = [
         input_schema={
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
+                # "list_files" isn't a real Claude Code tool (no
+                # compatibility_packs entry to source aliases from) —
+                # declared directly on the schema (SCHEMA_ONLY-style) so
+                # its alias-repair test cases don't depend on any pack.
+                "path": {"type": "string", "x-aliases": ["dir"]},
                 "include_hidden": {"type": "boolean"},
             },
             "required": ["path"],
@@ -102,6 +106,59 @@ TOOLS = [
     ),
 ]
 
+TOOL_MAP = {t.name: t for t in TOOLS}
+
+# Match Claude Code's REAL tool schemas (name + canonical field) — see
+# compatibility_packs/claude_code, corrected after a live acceptance run
+# against the real claude binary proved the old snake_case names
+# ("read_file", "edit_file", "search_code") never matched anything Claude
+# Code actually sends, and the file-path field direction was backwards
+# ("path" was treated as canonical when Claude Code's real schemas
+# require "file_path"). Added to TOOLS (not a separate list) so every
+# test in this file keeps resolving schemas via the same TOOLS/TOOL_MAP —
+# tests that specifically exercise pack-sourced alias repair use these by
+# name; everything else keeps using the arbitrary snake_case tools above,
+# which test repair MECHANICS in general and don't need to match any real
+# client's actual tool schema.
+REAL_READ_TOOL = CanonicalTool(
+    name="Read",
+    description="Read a file",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "file_path": {"type": "string"},
+            "offset": {"type": "integer"},
+            "limit": {"type": "integer"},
+        },
+        "required": ["file_path"],
+    },
+)
+REAL_EDIT_TOOL = CanonicalTool(
+    name="Edit",
+    description="Edit a file",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "file_path": {"type": "string"},
+            "old_string": {"type": "string"},
+            "new_string": {"type": "string"},
+        },
+        "required": ["file_path", "old_string", "new_string"],
+    },
+)
+REAL_GREP_TOOL = CanonicalTool(
+    name="Grep",
+    description="Search code",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "pattern": {"type": "string"},
+            "path": {"type": "string"},
+        },
+        "required": ["pattern"],
+    },
+)
+TOOLS = [*TOOLS, REAL_READ_TOOL, REAL_EDIT_TOOL, REAL_GREP_TOOL]
 TOOL_MAP = {t.name: t for t in TOOLS}
 
 
@@ -189,38 +246,40 @@ class TestToolNameCanonicalization:
 
 class TestAliasRename:
     def test_rename_file_path(self):
-        call = _make("read_file", file_path="/tmp/x")
+        # "Read"'s canonical field is "file_path" (matches Claude Code's
+        # real tool schema) — "path" is one of its recognized aliases.
+        call = _make("Read", path="/tmp/x")
         outcome = repair_one(call.name, call.arguments, TOOLS, policy=_PERMISSIVE_POLICY, client_id="claude_code",
                              compatibility_key=CompatibilityKey(client_id="claude_code", model_id="test-model"), compatibility_verified=True)
         assert outcome.status == RepairStatus.REPAIRED
-        assert outcome.accepted["path"] == "/tmp/x"
-        assert "file_path" not in outcome.accepted
+        assert outcome.accepted["file_path"] == "/tmp/x"
+        assert "path" not in outcome.accepted
 
     def test_rename_target_file(self):
-        call = _make("read_file", target_file="/tmp/x")
+        call = _make("Read", target_file="/tmp/x")
         outcome = repair_one(call.name, call.arguments, TOOLS, policy=_PERMISSIVE_POLICY, client_id="claude_code",
                              compatibility_key=CompatibilityKey(client_id="claude_code", model_id="test-model"), compatibility_verified=True)
         assert outcome.status == RepairStatus.REPAIRED
-        assert outcome.accepted["path"] == "/tmp/x"
+        assert outcome.accepted["file_path"] == "/tmp/x"
 
     def test_rename_camel_case(self):
-        call = _make("read_file", filePath="/tmp/x")
+        call = _make("Read", filePath="/tmp/x")
         outcome = repair_one(call.name, call.arguments, TOOLS, policy=_PERMISSIVE_POLICY, client_id="claude_code",
                              compatibility_key=CompatibilityKey(client_id="claude_code", model_id="test-model"), compatibility_verified=True)
         assert outcome.status == RepairStatus.REPAIRED
-        assert outcome.accepted["path"] == "/tmp/x"
+        assert outcome.accepted["file_path"] == "/tmp/x"
 
     def test_rename_edit_file_old_new(self):
-        call = _make("edit_file", file_path="/tmp/x", old_str="foo", new_str="bar")
+        call = _make("Edit", path="/tmp/x", old_str="foo", new_str="bar")
         outcome = repair_one(call.name, call.arguments, TOOLS, policy=_PERMISSIVE_POLICY, client_id="claude_code",
                              compatibility_key=CompatibilityKey(client_id="claude_code", model_id="test-model"), compatibility_verified=True)
         assert outcome.status == RepairStatus.REPAIRED
         assert outcome.accepted["old_string"] == "foo"
         assert outcome.accepted["new_string"] == "bar"
-        assert outcome.accepted["path"] == "/tmp/x"
+        assert outcome.accepted["file_path"] == "/tmp/x"
 
     def test_rename_search_query(self):
-        call = _make("search_code", query="TODO", dir="/src")
+        call = _make("Grep", query="TODO", dir="/src")
         outcome = repair_one(call.name, call.arguments, TOOLS, policy=_PERMISSIVE_POLICY, client_id="claude_code",
                              compatibility_key=CompatibilityKey(client_id="claude_code", model_id="test-model"), compatibility_verified=True)
         assert outcome.status == RepairStatus.REPAIRED
@@ -231,16 +290,16 @@ class TestAliasRename:
 
     def test_no_rename_when_canonical_present(self):
         # If both path and file_path are present, canonical wins, alias ignored.
-        call = _make("read_file", path="/tmp/correct", file_path="/tmp/wrong")
+        call = _make("Read", file_path="/tmp/correct", path="/tmp/wrong")
         outcome = repair_one(call.name, call.arguments, TOOLS, policy=_PERMISSIVE_POLICY, client_id="claude_code",
                              compatibility_key=CompatibilityKey(client_id="claude_code", model_id="test-model"), compatibility_verified=True)
-        assert outcome.accepted["path"] == "/tmp/correct"
+        assert outcome.accepted["file_path"] == "/tmp/correct"
 
     def test_ambiguous_aliases_skipped(self):
         # Two aliases present for same canonical — skip for safety.
-        call = _make("read_file", file_path="/a", filePath="/b")
+        call = _make("Read", path="/a", filePath="/b")
         outcome = repair_one(call.name, call.arguments, TOOLS, policy=_PERMISSIVE_POLICY, client_id="claude_code", compatibility_key=CompatibilityKey(client_id="claude_code", model_id="test-model"), compatibility_verified=True)
-        # Should still be rejected or unrepaired because path is still missing.
+        # Should still be rejected or unrepaired because file_path is still missing.
         assert outcome.status == RepairStatus.REJECTED
 
 
@@ -543,7 +602,7 @@ class TestBatchAndIdempotency:
 
     def test_idempotent(self):
         """repair(repair(call)) == repair(call)"""
-        call = _make("read_file", file_path="/tmp/x", offset="42")
+        call = _make("Read", path="/tmp/x", offset="42")
         outcome1 = repair_one(call.name, call.arguments, TOOLS, policy=_PERMISSIVE_POLICY, client_id="claude_code",
                               compatibility_key=CompatibilityKey(client_id="claude_code", model_id="test-model"), compatibility_verified=True)
         call2 = CanonicalToolCallBlock(
@@ -557,7 +616,7 @@ class TestBatchAndIdempotency:
         assert outcome2.accepted == outcome1.accepted
 
     def test_repair_provenance(self):
-        call = _make("read_file", file_path="/tmp/x")
+        call = _make("Read", path="/tmp/x")
         outcome = repair_one(call.name, call.arguments, TOOLS, policy=_PERMISSIVE_POLICY, client_id="claude_code",
                              compatibility_key=CompatibilityKey(client_id="claude_code", model_id="test-model"), compatibility_verified=True)
         assert outcome.was_repaired
@@ -730,11 +789,11 @@ class TestAcceptedInvariant:
         ("list_files", {"path": "/tmp", "include_hidden": True}, "valid with boolean"),
         ("run_command", {"command": "ls", "args": ["-l"]}, "valid with array"),
         # After repair cases — each must produce zero issues
-        ("read_file", {"file_path": "/tmp/x"}, "alias: file_path → path"),
-        ("read_file", {"target_file": "/tmp/x"}, "alias: target_file → path"),
-        ("read_file", {"filePath": "/tmp/x"}, "alias: camelCase → snake_case"),
-        ("edit_file", {"file_path": "/tmp/x", "old_str": "a", "new_str": "b"}, "alias: mixed"),
-        ("search_code", {"query": "TODO", "dir": "/src"}, "alias: search_code"),
+        ("Read", {"path": "/tmp/x"}, "alias: path → file_path"),
+        ("Read", {"target_file": "/tmp/x"}, "alias: target_file → file_path"),
+        ("Read", {"filePath": "/tmp/x"}, "alias: camelCase → snake_case"),
+        ("Edit", {"path": "/tmp/x", "old_str": "a", "new_str": "b"}, "alias: mixed"),
+        ("Grep", {"query": "TODO", "dir": "/src"}, "alias: search_code"),
         ("read_file", {"path": "/tmp/x", "offset": None}, "drop null optional"),
         ("run_command", {"command": "ls", "args": {}}, "drop empty object for array"),
         ("read_file", {"path": 123}, "coerce int to string"),
@@ -758,8 +817,8 @@ class TestAcceptedInvariant:
         )
 
     REPAIRED_CASES = [
-        ("read_file", {"file_path": "/tmp/x", "offset": "42"}, "alias + coercion"),
-        ("edit_file", {"file_path": "/tmp/x", "old_str": "a", "new_str": "b"}, "alias multi"),
+        ("Read", {"path": "/tmp/x", "offset": "42"}, "alias + coercion"),
+        ("Edit", {"path": "/tmp/x", "old_str": "a", "new_str": "b"}, "alias multi"),
         ("list_files", {"dir": "/tmp", "include_hidden": "yes"}, "alias dir + bool"),
         ("run_command", {"command": "ls", "args": None}, "drop null on array"),
     ]
@@ -784,7 +843,7 @@ class TestAcceptedInvariant:
         ("nonexistent", {"x": 1}, "tool not found"),
         ("", {"path": "/tmp/x"}, "empty name"),
         ("read_file", {"path": "/tmp/x", "offset": "42 seconds"}, "unclean numeric string"),
-        ("read_file", {"file_path": "/a", "filePath": "/b"}, "ambiguous aliases"),
+        ("Read", {"path": "/a", "filePath": "/b"}, "ambiguous aliases"),
     ]
 
     @pytest.mark.parametrize("name,kwargs,desc", REJECTED_CASES)
@@ -1005,29 +1064,29 @@ class TestMultiFieldAliasRepair:
     """Multi-field alias rename must work in a single repair pass (item 46)."""
 
     def test_rename_three_aliases(self):
-        # Use the standard edit_file tool which has compatibility aliases:
-        # file_path→path, old_str→old_string, new_str→new_string
-        call = CanonicalToolCallBlock(id="tc", name="edit_file", arguments={
-            "file_path": "/tmp/x", "old_str": "foo", "new_str": "bar",
+        # Use the real "Edit" tool which has compatibility aliases:
+        # path→file_path, old_str→old_string, new_str→new_string
+        call = CanonicalToolCallBlock(id="tc", name="Edit", arguments={
+            "path": "/tmp/x", "old_str": "foo", "new_str": "bar",
         })
         outcome = repair_one(call.name, call.arguments, TOOLS, policy=_PERMISSIVE_POLICY,
                              client_id="claude_code",
                              compatibility_key=CompatibilityKey(client_id="claude_code", model_id="test-model"), compatibility_verified=True)
         assert outcome.status == RepairStatus.REPAIRED
-        assert outcome.accepted["path"] == "/tmp/x"
+        assert outcome.accepted["file_path"] == "/tmp/x"
         assert outcome.accepted["old_string"] == "foo"
         assert outcome.accepted["new_string"] == "bar"
 
     def test_collision_handling_no_double_repair(self):
         """A rule that already fired on a path must not re-fire on the same path."""
-        # read_file has aliases: file_path, target_file, filePath → path
-        call = CanonicalToolCallBlock(id="tc", name="read_file", arguments={"file_path": "/tmp/x"})
+        # "Read" has aliases: path, target_file, filePath → file_path
+        call = CanonicalToolCallBlock(id="tc", name="Read", arguments={"path": "/tmp/x"})
         outcome = repair_one(call.name, call.arguments, TOOLS, policy=_PERMISSIVE_POLICY,
                              client_id="claude_code",
                              compatibility_key=CompatibilityKey(client_id="claude_code", model_id="test-model"), compatibility_verified=True)
         # The alias should be repaired in one pass
         assert outcome.status == RepairStatus.REPAIRED
-        assert outcome.accepted.get("path") == "/tmp/x"
+        assert outcome.accepted.get("file_path") == "/tmp/x"
         # Should not take more iterations than necessary
         assert len([s for s in outcome.steps if s.rule == "rename_aliased_fields"]) == 1
 

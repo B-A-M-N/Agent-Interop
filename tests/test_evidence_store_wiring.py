@@ -56,6 +56,21 @@ READ_FILE_TOOL = CanonicalTool(
     },
 )
 
+# Matches Claude Code's REAL "Read" tool (name + canonical "file_path"
+# field) — see compatibility_packs/claude_code. Kept separate from
+# READ_FILE_TOOL above (an arbitrary, internally-consistent fixture used
+# by every other test in this file) so only the pack-specific tests below
+# depend on the pack's actual real-world tool name and field direction.
+CLAUDE_REAL_READ_TOOL = CanonicalTool(
+    name="Read",
+    description="Read a file",
+    input_schema={
+        "type": "object",
+        "properties": {"file_path": {"type": "string"}},
+        "required": ["file_path"],
+    },
+)
+
 
 def _make_gateway(
     store: EvidenceStore | None = None,
@@ -390,40 +405,40 @@ class TestCompatibilityVerifiedPropagation:
 # ═══════════════════════════════════════════════════════════════════════
 
 
-class TestPackGatingOnVerifiedEvidence:
-    def test_pack_not_applied_without_verified_even_with_good_key(self):
-        """A structurally well-formed key is NOT sufficient — without
-        compatibility_verified=True the pack must not be applied."""
-        from agent_interop.repair.aliases import get_aliases_for_tool
-        from agent_interop.replay.types import CompatibilityKey
+class TestPackGatingOnResolvedIdentity:
+    """Registered compatibility packs (maintainer-authored, static — see
+    repair/aliases.py's module docstring) gate on a properly RESOLVED
+    client identity, not on compatibility_verified. That flag is reserved
+    for a hypothetical future dynamic/learned alias source; see
+    tests/test_alias_policy.py for the full behavior matrix."""
 
-        key = CompatibilityKey(client_id="claude_code", model_id="test-model")
+    def test_pack_not_applied_without_a_compatibility_key_at_all(self):
+        from agent_interop.repair.aliases import get_aliases_for_tool
+
         result = get_aliases_for_tool(
-            "read_file", READ_FILE_TOOL.input_schema,
+            "Read", CLAUDE_REAL_READ_TOOL.input_schema,
             client_id="claude_code",
-            compatibility_key=key,
             field_alias_policy=FieldAliasPolicy.COMPATIBILITY_PACK,
-            compatibility_verified=False,
         )
         # Only schema x-aliases should be present, never pack aliases like
-        # "file_path".
-        assert "file_path" not in result.get("path", [])
+        # "path".
+        assert "path" not in result.get("file_path", [])
 
-    def test_pack_applied_when_verified(self):
-        """With compatibility_verified=True and a populated key, the pack's
-        aliases ARE available."""
+    def test_pack_applied_with_resolved_identity_and_no_verification_flag(self):
+        """The actual gate: a sufficiently-populated key (client_id plus
+        at least one other real dimension) is enough — verification is
+        never passed here at all."""
         from agent_interop.repair.aliases import get_aliases_for_tool
         from agent_interop.replay.types import CompatibilityKey
 
         key = CompatibilityKey(client_id="claude_code", model_id="test-model")
         result = get_aliases_for_tool(
-            "read_file", READ_FILE_TOOL.input_schema,
+            "Read", CLAUDE_REAL_READ_TOOL.input_schema,
             client_id="claude_code",
             compatibility_key=key,
             field_alias_policy=FieldAliasPolicy.COMPATIBILITY_PACK,
-            compatibility_verified=True,
         )
-        assert "file_path" in result.get("path", [])
+        assert "path" in result.get("file_path", [])
 
 
 # ═══════════════════════════════════════════════════════════════════════

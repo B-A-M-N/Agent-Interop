@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -1462,6 +1462,111 @@ def _resolve_evidence_results(
         console.print(f"[red]No evidence with ID: {evidence_id}[/]")
         raise typer.Exit(1)
     return results
+
+
+repair_app = typer.Typer(help="Inspect Interop's tool-call repair pipeline.")
+app.add_typer(repair_app, name="repair")
+
+
+@repair_app.command("stats")
+def repair_stats_cmd(
+    route: str | None = typer.Option(None, "--route", help="Filter by route ID"),
+    model: str | None = typer.Option(None, "--model", help="Filter by model ID"),
+    client: str | None = typer.Option(None, "--client", help="Filter by client ID"),
+    since: str | None = typer.Option(
+        None, "--since",
+        help="Only include repair events at/after this time (ISO date or datetime, "
+        "e.g. 2026-07-01 or 2026-07-01T00:00:00)",
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON instead of a table"),
+):
+    """Repair-pipeline effectiveness, grouped by route/model/client.
+
+    Turns Interop's repair value into measured evidence rather than an
+    architectural claim: for each distinct (route, model, client) combo
+    seen in live traffic, reports how many tool-call decisions needed no
+    repair, how many were fixed and accepted, how many were rejected
+    outright, how many rejections still had a partial repair applied
+    before ultimately failing, and which repair rules fired most.
+
+    Every filter is optional and independently composable; matching
+    groups are never collapsed into one row — same "never silently pick
+    one record" discipline as 'interop evidence list'.
+    """
+    from agent_interop.evidence.store import get_default_store
+
+    since_iso: str | None = None
+    if since:
+        try:
+            parsed = datetime.fromisoformat(since)
+        except ValueError:
+            console.print(f"[red]--since {since!r} is not a valid ISO date/datetime[/]")
+            raise typer.Exit(1)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        since_iso = parsed.isoformat()
+
+    store = get_default_store()
+    groups = store.query_repair_stats(
+        route_id=route, model_id=model, client_id=client, since=since_iso,
+    )
+
+    if as_json:
+        import json as _json
+
+        console.print(_json.dumps(
+            [
+                {
+                    "route_id": g.route_id,
+                    "model_id": g.model_id,
+                    "client_id": g.client_id,
+                    "total_eligible": g.total_eligible,
+                    "accepted_without_repair": g.accepted_without_repair,
+                    "accepted_after_repair": g.accepted_after_repair,
+                    "rejected": g.rejected,
+                    "rejected_with_partial_repair": g.rejected_with_partial_repair,
+                    "rule_counts": g.rule_counts,
+                }
+                for g in groups
+            ],
+            indent=2,
+        ))
+        return
+
+    if not groups:
+        console.print("[yellow]No repair events recorded yet.[/]")
+        return
+
+    table = Table(title="Repair Pipeline Stats")
+    table.add_column("Route")
+    table.add_column("Model")
+    table.add_column("Client")
+    table.add_column("Total", justify="right")
+    table.add_column("No repair needed", justify="right")
+    table.add_column("Repaired", justify="right")
+    table.add_column("Rejected", justify="right")
+    table.add_column("Rejected (partial repair)", justify="right")
+    table.add_column("Top repair rules")
+
+    for g in groups:
+        top_rules = sorted(g.rule_counts.items(), key=lambda kv: -kv[1])[:3]
+        rules_str = ", ".join(f"{name}×{count}" for name, count in top_rules) or "-"
+
+        def _rate(n: int, total: int) -> str:
+            return f"{n} ({n / total:.0%})" if total else "0"
+
+        table.add_row(
+            g.route_id or "-",
+            g.model_id or "-",
+            g.client_id or "-",
+            str(g.total_eligible),
+            _rate(g.accepted_without_repair, g.total_eligible),
+            _rate(g.accepted_after_repair, g.total_eligible),
+            _rate(g.rejected, g.total_eligible),
+            str(g.rejected_with_partial_repair),
+            rules_str,
+        )
+    console.print(table)
 
 
 @app.command()

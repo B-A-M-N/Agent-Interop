@@ -211,6 +211,85 @@ class TestClaudeCodeLaunchContract:
 
         assert spec.env["CLAUDE_MODEL"] == "claude-interop-deepseek-local"
 
+    def test_model_passed_as_explicit_cli_flag_not_just_env_var(self) -> None:
+        """Confirmed via a real end-to-end run: the installed Claude Code
+        CLI does not honor CLAUDE_MODEL — a launch with only the env var
+        set fell back to the operator's own persisted default model and
+        got a 400 from the gateway for an unknown model. `--model` is the
+        flag the CLI actually reads, so it must be in the command argv,
+        not just the environment."""
+        integration = get_agent_integration("claude")
+        assert integration is not None
+
+        spec = integration.build_launch(self._ctx(route="qwen3-coder", model_name="qwen3-coder"))
+
+        assert spec.command is not None
+        assert "--model" in spec.command
+        idx = spec.command.index("--model")
+        assert spec.command[idx + 1] == "claude-interop-qwen3-coder"
+        assert spec.command[idx + 1] == spec.env["CLAUDE_MODEL"]
+
+    def test_explicit_cli_model_flag_precedes_user_extra_args(self) -> None:
+        """Our injected --model must appear before whatever the caller's
+        own extra_args contribute, and those args must survive unchanged
+        after it — argument placement AND preservation in one check."""
+        integration = get_agent_integration("claude")
+        assert integration is not None
+
+        ctx = AgentLaunchContext(
+            route="qwen3-coder",
+            gateway_url="http://127.0.0.1:8090",
+            model_name="qwen3-coder",
+            session_credential="test-cred-123",
+            extra_args=("--print", "hello"),
+        )
+        spec = integration.build_launch(ctx)
+
+        assert spec.command is not None
+        assert spec.command[:3] == ["claude", "--model", "claude-interop-qwen3-coder"]
+        assert spec.command[3:] == ["--print", "hello"]
+
+    def test_no_duplicate_model_flag_when_user_supplies_their_own(self) -> None:
+        """If the caller's extra_args already names --model, Interop must
+        NOT also inject its own — argv must never carry --model twice.
+        The user's explicit choice wins outright (not merely 'appears
+        later'), since a duplicate flag's precedence isn't guaranteed
+        across every possible CLI parser."""
+        integration = get_agent_integration("claude")
+        assert integration is not None
+
+        ctx = AgentLaunchContext(
+            route="qwen3-coder",
+            gateway_url="http://127.0.0.1:8090",
+            model_name="qwen3-coder",
+            session_credential="test-cred-123",
+            extra_args=("--model", "opus", "--print", "hello"),
+        )
+        spec = integration.build_launch(ctx)
+
+        assert spec.command is not None
+        assert spec.command.count("--model") == 1
+        assert spec.command == ["claude", "--model", "opus", "--print", "hello"]
+
+    def test_env_var_still_set_even_when_user_overrides_via_cli(self) -> None:
+        """CLAUDE_MODEL in the environment is harmless to keep set to
+        Interop's own alias even when the user's CLI flag wins — nothing
+        currently reads it, and if a future CLI version ever does, this
+        preserves the intended fallback rather than leaving it unset."""
+        integration = get_agent_integration("claude")
+        assert integration is not None
+
+        ctx = AgentLaunchContext(
+            route="qwen3-coder",
+            gateway_url="http://127.0.0.1:8090",
+            model_name="qwen3-coder",
+            session_credential="test-cred-123",
+            extra_args=("--model", "opus"),
+        )
+        spec = integration.build_launch(ctx)
+
+        assert spec.env["CLAUDE_MODEL"] == "claude-interop-qwen3-coder"
+
 
 # ─── Crush (configuration_required) ─────────────────────────────────────────
 

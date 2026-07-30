@@ -17,12 +17,15 @@ see each module's own skip guard. This harness:
    gate if README claims a release-tested tier without a matching file
    here).
 
-NOTE: this harness has never been executed in this development sandbox —
-there is no real `claude`/`codex` binary or credential available here. It
-is written and structurally reviewed, not proven by a real run. Whoever
-first runs it against a real client binary should expect to adjust the
-exact subprocess invocation (CLI flags/output parsing) for that binary's
-actual interface.
+NOTE: this harness has been executed for real against the installed
+`claude` binary (v2.1.220) in this development sandbox — see
+`acceptance/results/claude-code-2.1.220.json` and
+`test_real_client_claude.py`. It has not been run against a real `codex`
+binary yet; whoever first runs `test_real_client_codex.py` for real should
+expect to adjust its exact subprocess invocation (CLI flags/output
+parsing) to match that binary's actual interface, the same way
+`test_real_client_claude.py` needed `launch_spec.command` wired through
+instead of a hand-built argv once this harness was first run for real.
 """
 
 from __future__ import annotations
@@ -57,6 +60,9 @@ class ScriptedFakeTransport(UpstreamTransport):
         self._tool_arguments = tool_arguments
         self._final_text = final_text
         self.calls: list[PreparedUpstreamRequest] = []
+
+    async def close(self) -> None:
+        pass
 
     async def send(self, request: PreparedUpstreamRequest) -> UpstreamResponse:
         self.calls.append(request)

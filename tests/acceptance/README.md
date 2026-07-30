@@ -1,20 +1,23 @@
 # Real-client acceptance tests
 
-These tests are the one verification tier Interop has not yet earned for
-any client (see the root `README.md`'s "Client integration status" table
-and `RELEASE.md`'s "Alpha vs. supported release track"): an automated run
-that actually launches the real client **binary** — not just the gateway
-protocol or a hand-built launch spec — and drives one real tool-call round
-trip through it.
+These tests are the verification tier that actually launches the real
+client **binary** — not just the gateway protocol or a hand-built launch
+spec — and drives one real tool-call round trip through it (see the root
+`README.md`'s "Client integration status" table and `RELEASE.md`'s "Alpha
+vs. supported release track").
 
-**They have never been executed in this development sandbox.** There is no
-real `claude`/`codex` binary or credentials available here. They are
-written and reviewed, not proven by a real run — the first person who
-actually runs one of these against a real client binary should expect to
-adjust the exact subprocess invocation (CLI flags, output parsing) to match
-that binary's current interface; the harness (`_harness.py`) around it —
-starting a real Interop server, wiring a deterministic fake upstream, and
-writing the result record — is what's actually load-bearing and reviewed.
+**Claude Code has been executed for real** in this development sandbox
+against the installed `claude` binary (v2.1.220) — see
+`acceptance/results/claude-code-2.1.220.json`. It launched with the exact
+`LaunchSpec` `interop run claude` builds (including the `--model
+claude-interop-<route>` flag), completed the tool-call round trip, and
+passed. Codex has not been run here — no `codex` binary/credentials were
+exercised — so `test_real_client_codex.py` is still written and reviewed
+but not proven; expect to adjust its exact subprocess invocation (CLI
+flags, output parsing) the first time it's actually run. The harness
+(`_harness.py`) — starting a real Interop server, wiring a deterministic
+fake upstream, and writing the result record — is shared by both and is
+now proven working by the Claude Code run.
 
 ## Running
 

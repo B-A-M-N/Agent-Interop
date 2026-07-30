@@ -67,6 +67,20 @@ GET_WEATHER_TOOL = CanonicalTool(
 
 SAMPLE_TOOLS = [READ_FILE_TOOL, GET_WEATHER_TOOL]
 
+# Matches Claude Code's REAL "Read" tool (name + canonical "file_path"
+# field) — see compatibility_packs/claude_code. Used only by the pack-
+# specific alias-repair test below; READ_FILE_TOOL above is an arbitrary,
+# internally-consistent fixture shared by every other test in this file.
+CLAUDE_REAL_READ_TOOL = CanonicalTool(
+    name="Read",
+    description="Read a file",
+    input_schema={
+        "type": "object",
+        "properties": {"file_path": {"type": "string"}},
+        "required": ["file_path"],
+    },
+)
+
 
 # ── Phase 4 gate tests ────────────────────────────────────────────────────
 
@@ -216,14 +230,14 @@ class TestTransactionService:
         from agent_interop.replay.types import CompatibilityKey
         candidate = RawToolCallCandidate(
             id="tc_1",
-            name="read_file",
-            raw_arguments='{"file_path": "/tmp/x"}',  # alias for "path"
+            name="Read",
+            raw_arguments='{"path": "/tmp/x"}',  # alias for "file_path"
             source_protocol="openai_chat",
             source_index=0,
         )
         decision = _call_service(
             candidate,
-            tools=SAMPLE_TOOLS,
+            tools=[CLAUDE_REAL_READ_TOOL],
             context=ToolTransactionContext(
                 client_id="claude_code",
                 repair_policy=RepairPolicy(field_alias_policy=FieldAliasPolicy.COMPATIBILITY_PACK),
@@ -231,11 +245,11 @@ class TestTransactionService:
                 compatibility_verified=True,
             ),
         )
-        # The rename_aliased_fields rule should map file_path → path
+        # The rename_aliased_fields rule should map path → file_path
         assert decision.is_accepted, f"Expected accepted, got {decision.outcome.status}: {decision.outcome.error}"
         assert decision.accepted_block is not None
         assert decision.accepted_block.id == "tc_1"
-        assert decision.accepted_block.arguments == {"path": "/tmp/x"}
+        assert decision.accepted_block.arguments == {"file_path": "/tmp/x"}
 
 
 class TestToolCallDecision:

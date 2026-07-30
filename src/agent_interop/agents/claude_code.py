@@ -48,14 +48,30 @@ class ClaudeCodeIntegration(AgentIntegration):
         # Claude Code requires model IDs starting with "claude" or
         # "anthropic" for gateway discovery (see module docstring) — the
         # raw upstream/route model name (e.g. "qwen3-coder") never
-        # satisfies that on its own, so CLAUDE_MODEL must always be a
+        # satisfies that on its own, so the model alias must always be a
         # claude-prefixed alias rather than context.model_name verbatim.
         # The gateway registers this same alias for the route (see
         # server/app.py:create_app_from_env).
-        env["CLAUDE_MODEL"] = f"claude-interop-{context.route}"
+        model_alias = f"claude-interop-{context.route}"
+        env["CLAUDE_MODEL"] = model_alias
 
-        # Build CLI command
-        cmd = ["claude"]
+        # Confirmed via a real end-to-end run (not just reading the docs):
+        # the installed Claude Code CLI does NOT pick up CLAUDE_MODEL — a
+        # session launched with only the env var set fell back to the
+        # operator's own persisted default model and got a 400 from the
+        # gateway ("Unknown model: 'claude-opus-5'"). The `--model` CLI
+        # flag is what the CLI actually honors, so it's passed explicitly
+        # here; the env var is kept too in case a future/older CLI version
+        # does read it, but the CLI flag is what makes this work today.
+        #
+        # If the caller's own extra_args already specifies --model, trust
+        # their explicit choice instead of injecting ours — otherwise
+        # argv would carry two --model flags, and depending on the CLI's
+        # own parsing order that's either a silent last-wins surprise or
+        # an outright parse error, neither of which is what "the user
+        # explicitly supplied a model" should do.
+        user_supplied_model = context.extra_args and "--model" in context.extra_args
+        cmd = ["claude"] if user_supplied_model else ["claude", "--model", model_alias]
         if context.extra_args:
             cmd.extend(context.extra_args)
 

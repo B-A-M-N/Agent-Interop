@@ -121,6 +121,17 @@ class TestAnthropicMessages:
         assert assistant.content[1].name == "read_file"
 
     def test_decode_tool_result(self):
+        # Anthropic's wire format has no dedicated "tool" role — a real
+        # Claude Code turn puts the tool_result inside a role:"user"
+        # message (confirmed via a live captured request). Interop
+        # normalizes a PURE tool-result message to canonical role="tool"
+        # to match its own internal convention (same as the OpenAI Chat
+        # decoder's dedicated "tool" role, and what
+        # history/reconcile.py's safety check and upstreams/anthropic.py's
+        # outbound encoder both already expect) — a live acceptance run
+        # against Claude Code 2.1.220 found this mismatch caused Interop's
+        # OWN history-safety check to reject every real multi-turn tool
+        # call as "unsafe history".
         body = {
             "messages": [
                 {
@@ -137,10 +148,35 @@ class TestAnthropicMessages:
         }
         req = self.adapter.decode_request(body, {})
         assert len(req.messages) == 1
-        # Mixed-content user messages preserve role and all blocks in order
-        assert req.messages[0].role == "user"
+        assert req.messages[0].role == "tool"
         assert req.messages[0].content[0].tool_call_id == "toolu_abc123"
         assert req.messages[0].content[0].content == "File contents here"
+
+    def test_decode_tool_result_mixed_with_text_keeps_user_role(self):
+        """A user message that mixes a tool_result with the user's own
+        new text is a real user turn with a tool_result attached, not a
+        pure tool-result message — it must keep role="user", not be
+        force-normalized to "tool" alongside content that isn't one."""
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_abc123",
+                            "content": "File contents here",
+                        },
+                        {"type": "text", "text": "Also, what's 2+2?"},
+                    ],
+                }
+            ],
+        }
+        req = self.adapter.decode_request(body, {})
+        assert len(req.messages) == 1
+        assert req.messages[0].role == "user"
+        assert req.messages[0].content[0].tool_call_id == "toolu_abc123"
+        assert req.messages[0].content[1].text == "Also, what's 2+2?"
 
     def test_stream_event_encoding(self):
         event = CanonicalEvent(type="text_delta", index=0, partial="Hello")
