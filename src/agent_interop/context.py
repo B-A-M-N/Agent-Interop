@@ -117,6 +117,19 @@ class RequestContext:
             client_id = "continue"
         elif "aider" in user_agent:
             client_id = "aider"
+        elif lower_headers.get("x-interop-client"):
+            # Generic self-assertion path for clients with no distinguishing
+            # header/User-Agent of their own (e.g. hermes-agent, which wraps
+            # the stock OpenAI SDK and sends nothing hermes-specific to a
+            # custom/local endpoint — confirmed by reading its source, not
+            # assumed). Interop's own launch integration for such a client
+            # configures it to send this header via whatever mechanism the
+            # client supports (e.g. hermes-agent's `model.default_headers`
+            # config field), rather than Interop guessing identity from
+            # generic-SDK fingerprints. Trusted the same way the other
+            # branches above are: this only ever runs against a route
+            # Interop itself launched and pointed at its own gateway.
+            client_id = lower_headers["x-interop-client"]
 
         return cls(
             request_id=request_id,

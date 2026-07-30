@@ -6,6 +6,20 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- hermes-agent integration (`agents/hermes_agent.py`) and compatibility
+  pack (`compatibility_packs/hermes_agent`), with real tool names/fields
+  read from hermes-agent's own source rather than assumed
+  (`read_file(path)`, `write_file(path, content)`,
+  `patch(path, old_string, new_string)`, `search_files(pattern, path)`,
+  `terminal(command)`). hermes-agent sends no distinguishing header to a
+  custom/local endpoint (confirmed by reading its client-construction
+  code), so the integration configures a session-scoped `HERMES_HOME`
+  (a real env var hermes-agent already respects) with a `config.yaml`
+  setting `model.default_headers` to self-assert identity — the generic
+  `x-interop-client` header `RequestContext.from_headers` now checks for
+  any client with no fingerprint of its own. Live-verified: a real
+  `hermes -z` run through a live gateway against a real Ollama-hosted
+  model completed a full tool-call round trip over the OpenAI Chat wire.
 - `agent_interop.testing.levels`: wires the real conformance test battery to
   L0-L4 capability levels, with explicit battery-versioning and
   infra-vs-behavioral failure classification (`interop test --repair/--no-repair`).
@@ -59,6 +73,15 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   warn-and-skip behavior for forward compatibility).
 - `interop status` documented as installer/shim status only; compatibility
   evidence is queried via `interop evidence list --route/--model`.
+- `RepairConfig.field_aliases` now defaults to `compatibility_pack`
+  instead of `schema_only`. A registered pack only ever activates for a
+  resolved, sufficiently-populated client identity (see
+  `repair/aliases.py`'s module docstring) — it's maintainer-authored and
+  reviewed, not learned or dynamic, so there was nothing an unknown or
+  unresolved client could inherit by enabling this. Previously the
+  correctly-mapped `claude_code`/`hermes_agent` packs did nothing for a
+  route unless an operator discovered and set this per route; now they
+  apply out of the box.
 
 ### Fixed
 - `interop doctor` now always closes its Gateway, including when startup

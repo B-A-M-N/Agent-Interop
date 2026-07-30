@@ -33,7 +33,7 @@ def get_pack_aliases(client_id: str, tool_name: str) -> dict[str, list[str]]:
 
     # Fallback: try lazy import of known pack modules
     # Only safe client_ids are attempted (validated against known identifiers)
-    known_packs = {"claude_code", "codex", "cline", "opencode"}
+    known_packs = {"claude_code", "codex", "cline", "opencode", "hermes_agent"}
     if client_id in known_packs:
         return _lazy_load_pack(client_id, tool_name)
 

@@ -116,7 +116,16 @@ class RepairConfig:
     max_repair_input_bytes: int = 65536
     malformed_json: str = "safe"
     unknown_tool: str = "safe_normalization"
-    field_aliases: str = "schema_only"
+    # COMPATIBILITY_PACK, not SCHEMA_ONLY, is the default: a registered
+    # pack only ever activates for a resolved, sufficiently-populated
+    # client identity (see repair/aliases.py's module docstring and
+    # _is_key_sufficiently_populated) — it is maintainer-authored and
+    # reviewed, not learned/dynamic, so there is nothing for an unknown or
+    # unresolved client to inherit by enabling this. Turning it on by
+    # default is what makes the field-alias repairs Interop ships for
+    # claude_code/hermes_agent/etc. actually apply out of the box, instead
+    # of requiring every operator to discover and set this per route.
+    field_aliases: str = "compatibility_pack"
     batch_policy: str = "atomic"
 
 

@@ -135,3 +135,40 @@ class TestRequestContextForwardableHeaders:
         )
         assert ctx.client_id == "claude_code"
         assert ctx.client_version == "1.2.3"
+
+    def test_generic_x_interop_client_header_self_asserts_identity(self):
+        """Clients with no distinguishing header/User-Agent of their own
+        (e.g. hermes-agent, which wraps the stock OpenAI SDK) can self-
+        assert identity via a header Interop's own launch integration
+        configures them to send — see agents/hermes_agent.py."""
+        ctx = RequestContext.from_headers(
+            {"x-interop-client": "hermes_agent"},
+            ProtocolKind.OPENAI_CHAT,
+        )
+        assert ctx.client_id == "hermes_agent"
+
+    def test_x_interop_client_header_case_insensitive(self):
+        ctx = RequestContext.from_headers(
+            {"X-Interop-Client": "hermes_agent"},
+            ProtocolKind.OPENAI_CHAT,
+        )
+        assert ctx.client_id == "hermes_agent"
+
+    def test_known_client_signals_take_priority_over_x_interop_client(self):
+        """A real Claude Code session header must win even if some
+        intermediate proxy also happened to set x-interop-client."""
+        ctx = RequestContext.from_headers(
+            {
+                "x-claude-code-session-id": "sess-1",
+                "x-interop-client": "hermes_agent",
+            },
+            ProtocolKind.ANTHROPIC_MESSAGES,
+        )
+        assert ctx.client_id == "claude_code"
+
+    def test_empty_x_interop_client_header_is_ignored(self):
+        ctx = RequestContext.from_headers(
+            {"x-interop-client": ""},
+            ProtocolKind.OPENAI_CHAT,
+        )
+        assert ctx.client_id == ""

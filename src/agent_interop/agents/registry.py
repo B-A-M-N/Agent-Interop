@@ -6,6 +6,7 @@ from agent_interop.agents.base import AgentIntegration
 from agent_interop.agents.claude_code import ClaudeCodeIntegration
 from agent_interop.agents.codex import CodexIntegration
 from agent_interop.agents.crush import CrushIntegration
+from agent_interop.agents.hermes_agent import HermesAgentIntegration
 from agent_interop.agents.openai_compatible import GenericOpenAICompatibleIntegration
 
 _REGISTRY: dict[str, AgentIntegration] = {}
@@ -28,6 +29,7 @@ register(GenericOpenAICompatibleIntegration("aider", "aider"))
 register(GenericOpenAICompatibleIntegration("continue", "continue"))
 register(GenericOpenAICompatibleIntegration("qwen-code", "qwen"))
 register(CrushIntegration())
+register(HermesAgentIntegration())
 
 
 __all__ = [

@@ -43,6 +43,7 @@ the gateway-protocol or launch-spec level.
 | Client | Backend | Verified as |
 |--------|---------|-------------|
 | Claude Code | Ollama | Reproducibly release-tested client (v2.1.220) |
+| hermes-agent | Ollama | Manually tested client (v0.19.0) |
 | Codex | Ollama / OpenAI-compatible (vLLM, llama.cpp) | Gateway-tested protocol |
 | Crush | Manual configuration | Unit-tested integration (no automatic launch) |
 | Cline, OpenCode, Aider, Continue, Qwen Code | — | Unit-tested integration |
@@ -60,6 +61,11 @@ Verification tiers, weakest to strongest:
   encode — but not through the actual client binary.
 - **Manually tested client** — a developer has run the real client
   binary against Interop by hand and confirmed the tool loop works.
+  Currently earned by hermes-agent (v0.19.0): a real `hermes -z` run
+  through a live Interop gateway against a real Ollama-hosted model
+  completed a full tool-call round trip (`read_file` → real file content
+  → correct final answer) via the OpenAI Chat wire — not yet backed by an
+  automated, checked-in acceptance test the way Claude Code's is.
 - **Reproducibly release-tested client** — an automated, opt-in
   acceptance test invokes the real client binary end-to-end and is part
   of the release gate. Currently earned by Claude Code only — see
