@@ -5,19 +5,44 @@
 Interop sits between a coding agent and a local inference backend and
 translates between the wire formats each side expects.
 
+### Why this exists
+
+The trigger for this project was simple: pointing Claude Code, Codex, and
+other coding agents at a local model through Ollama, and watching tool
+calls fail — not because the model couldn't reason about the task, but
+because it was speaking a slightly different tool-calling dialect than the
+agent expected. A malformed JSON argument here, a missing envelope tag
+there, a model that emits `<tool_call>` when the agent is listening for a
+native function-call block. The task would stall or silently do the wrong
+thing.
+
+That's a real problem, not a cosmetic one: the entire point of running a
+model locally — privacy, cost, control, no API bill — evaporates if the
+agent built around it can't actually get anything done. A local model that
+can't reliably call tools isn't a lighter-weight alternative to a hosted
+one; it's just broken for agentic use, which is most of what coding agents
+are for.
+
+Interop exists to close that gap: it sits between the agent and the
+backend, translates protocols, normalizes and repairs tool calls within
+bounded and auditable limits, and is honest — via conformance testing and
+declared-vs-verified capability reporting — about which models it can
+actually make reliable and which ones it can't. See "Conformance levels"
+and "Capability state" below for what that honesty looks like in practice.
+
 ### Client integration status (MVP)
 
 Verification claims here are deliberately layered — "the gateway handles
 this protocol correctly" and "this exact client binary works against it"
 are different, separately-earned claims, and collapsing them into one
 "Supported" label previously overstated what the test suite actually
-proves. None of the tiers below currently include a test that launches
-and drives the real `claude` or `codex` binary end-to-end; that is the
-one verification level this project has not yet done for any client.
+proves. Claude Code is the one client with a test that launches and
+drives the real binary end-to-end and passed; every other client stops at
+the gateway-protocol or launch-spec level.
 
 | Client | Backend | Verified as |
 |--------|---------|-------------|
-| Claude Code | Ollama | Gateway-tested protocol |
+| Claude Code | Ollama | Reproducibly release-tested client (v2.1.220) |
 | Codex | Ollama / OpenAI-compatible (vLLM, llama.cpp) | Gateway-tested protocol |
 | Crush | Manual configuration | Unit-tested integration (no automatic launch) |
 | Cline, OpenCode, Aider, Continue, Qwen Code | — | Unit-tested integration |
@@ -35,10 +60,11 @@ Verification tiers, weakest to strongest:
   encode — but not through the actual client binary.
 - **Manually tested client** — a developer has run the real client
   binary against Interop by hand and confirmed the tool loop works.
-  (Not currently claimed for any client here — see below.)
 - **Reproducibly release-tested client** — an automated, opt-in
   acceptance test invokes the real client binary end-to-end and is part
-  of the release gate. (Not currently implemented — see "Known gaps.")
+  of the release gate. Currently earned by Claude Code only — see
+  `acceptance/results/claude-code-2.1.220.json` and
+  `tests/acceptance/test_real_client_claude.py`.
 
 MVP scope is Linux, Python 3.11+, loopback ingress, and one route per
 process. Multi-route operation, remote ingress exposure, and any client
@@ -47,10 +73,11 @@ code paths exist but haven't been proven at a higher tier.
 
 ### Known gaps
 
-- No test in this repository launches or drives a real `claude` or
-  `codex` binary. Everything under "Client integration status" above is
-  verified at the launch-spec or gateway-protocol level, not against the
-  actual client process.
+- No test in this repository launches or drives a real `codex` binary.
+  Codex, Crush, and the generic-integration clients are verified at the
+  launch-spec or gateway-protocol level, not against the actual client
+  process — see `tests/acceptance/test_real_client_codex.py` for the
+  written-but-unrun harness.
 
 ### Quick start
 
@@ -80,14 +107,12 @@ front of PATH. If you'd rather not modify PATH resolution at all, use
 Contributing to Interop itself (not just using it) needs the dev extras —
 see [Development](#development) below.
 
-### Why
-
-Local models fail in coding agents because of format mismatches. Interop
-translates supported coding-agent protocols, presents tools in a
-model-compatible form, and repairs bounded, unambiguous tool-call defects.
-Conformance testing reports capabilities that cannot be recovered safely —
-effectiveness varies by model. Use `interop test <model>` to check
-conformance (experimental — see "Evidence and certification" below).
+Not every model can be made fully reliable this way — some tool-call
+defects are ambiguous and Interop deliberately won't guess at them (see
+"Known gaps" and the extraction-safety notes throughout this file), so
+effectiveness still varies by model. Use `interop test <model>` to check a
+given model's conformance level (experimental — see "Evidence and
+certification" below) instead of assuming.
 
 ### Architecture
 
@@ -287,3 +312,28 @@ round-trip, CLI smoke tests):
 
 (`--check` allows a dirty working tree for local iteration; drop the flag to
 run the exact gate a real release requires.)
+
+### Acknowledgements
+
+Some of the development work on this project — testing changes against
+real local models, iterating on tool-call parsing across the different
+dialects Interop supports — used inference capacity provided by
+[FreeInference.org](https://freeinference.org).
+
+FreeInference did not commission, direct, fund, or pay me for this work.
+No representative of FreeInference reviewed or approved this contribution,
+and this acknowledgment does not indicate sponsorship, partnership, or
+endorsement by FreeInference or any affiliated organization.
+
+I'm acknowledging the service because access to capable inference
+infrastructure can make meaningful open-source development more
+accessible to developers and researchers who don't have the hardware or
+budget to run these models themselves. Their inference meaningfully
+contributed to the production of this work.
+
+Organizations able to provide GPU capacity, hardware, cloud credits,
+research funding, or other infrastructure resources should consider
+supporting FreeInference so it can keep making this kind of capability
+available for open-source development, research, and education. That's
+the point of this note — not to send free-tier traffic their way, but to
+direct attention toward supporting what makes work like this possible.

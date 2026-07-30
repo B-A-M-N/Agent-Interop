@@ -3,6 +3,8 @@
 ## Overview
 **Interop** is an **Agent Compatibility Gateway** that sits between coding agents (e.g., Claude, Codex) and local inference backends (e.g., Ollama, vLLM, llama.cpp). It translates between the formats each side expects, normalizing tool calls, translating protocols, and checking capability conformance for local LLM coding agents.
 
+It exists because a local model that can't reliably call tools isn't a viable substitute for a hosted one in an agentic coding workflow — the model may reason about the task correctly and still fail to act on it, because its tool-calling dialect doesn't match what the agent expects. See the README's "Why this exists" section for the full motivation.
+
 ### Key Features
 - **Protocol Translation**: Converts between Anthropic Messages, OpenAI Chat, and OpenAI Responses protocols.
 - **Tool-Call Normalization**: Parses and repairs tool calls from models like Qwen, Hermes, Mistral, Llama, and DeepSeek.
