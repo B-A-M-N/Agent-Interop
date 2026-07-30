@@ -66,7 +66,7 @@ Local model
 ## Code Organization
 ### Directory Structure
 ```
-/home/bamn/Interop/
+Interop/
 ├── src/
 │   └── agent_interop/          # PyPI dist "agent-interop"; import name "agent_interop"; CLI command "interop"
 │       ├── __init__.py

@@ -18,5 +18,11 @@ htmlcov/
 .claude/
 .gemini_security/
 
+# Secrets — never committed here, but guard against it anyway
+.env
+.env.*
+*.pem
+*.key
+
 # Stray local benchmark artifacts (not release inputs)
 benchmark_results_*.json
