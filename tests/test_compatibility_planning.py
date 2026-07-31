@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 from agent_interop.abi import (
@@ -339,6 +340,28 @@ def test_context_compaction_keeps_unknown_tool_output_verbatim() -> None:
     adapted = compact_safe_tool_results(request, exchanges=reconcile_history(request.messages).exchanges, plan=plan)
     assert not adapted.changed
     assert adapted.request.messages[1].content[0].content == "x\n" * 100
+
+
+def test_context_compaction_reduces_only_known_json_query_results_structurally() -> None:
+    old = CanonicalToolCallBlock(id="query", name="json_query", arguments={"path": "large.json"})
+    result = json.dumps({"items": [{"index": index, "value": f"value-{index}"} for index in range(32)]})
+    request = CanonicalRequest(messages=[
+        CanonicalMessage(role="assistant", content=[old]),
+        CanonicalMessage(role="tool", content=[CanonicalToolResultBlock(tool_call_id="query", content=result)]),
+        CanonicalMessage(role="user", content=[CanonicalTextBlock(text="continue")]),
+        CanonicalMessage(role="assistant", content=[CanonicalToolCallBlock(id="latest", name="read_file")]),
+        CanonicalMessage(role="tool", content=[CanonicalToolResultBlock(tool_call_id="latest", content="current")]),
+        CanonicalMessage(role="user", content=[CanonicalTextBlock(text="make a change")]),
+    ])
+    plan = ContextBudgetPlanner().plan(request, runtime_limit_tokens=200)
+    adapted = compact_safe_tool_results(request, exchanges=reconcile_history(request.messages).exchanges, plan=plan)
+    assert adapted.changed
+    compacted = adapted.request.messages[1].content[0]
+    assert isinstance(compacted, CanonicalToolResultBlock)
+    parsed = json.loads(compacted.content)
+    assert parsed["items"][0] == {"index": 0, "value": "value-0"}
+    assert parsed["items"][-1] == {"index": 31, "value": "value-31"}
+    assert any("__interop_compacted__" in item for item in parsed["items"] if isinstance(item, dict))
 
 
 def test_gateway_replans_after_safe_context_adaptation() -> None:
