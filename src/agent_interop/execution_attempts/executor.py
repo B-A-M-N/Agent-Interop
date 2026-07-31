@@ -67,6 +67,11 @@ class CompatibilityAttemptExecutor:
         plan = invocation.compatibility_plan
         attempts = plan.attempts if plan is not None else ()
         if not attempts:
+            # Preparation can intentionally return a planless invocation for
+            # unsafe history.  It still needs the gateway's ordinary
+            # structured history error, never an empty successful response.
+            if getattr(invocation, "invocation_plan", None) is None:
+                return await execute_attempt(invocation)
             return CanonicalResponse(error=getattr(invocation, "unavailable_error", None))
         latest: CanonicalResponse | None = None
         for attempt in attempts:

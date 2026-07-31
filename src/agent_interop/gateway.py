@@ -1495,15 +1495,20 @@ class Gateway:
         )
         if not should_capture or policy.capture == "off":
             return
-        from dataclasses import asdict
+        from dataclasses import asdict, is_dataclass
 
         from agent_interop.build_info import get_build_info
         from agent_interop.replay.capture import capture_case
+
+        def metadata(value: Any) -> dict[str, Any]:
+            return asdict(value) if value is not None and is_dataclass(value) else {}
 
         def plan_metadata() -> dict[str, Any]:
             compatibility = invocation.compatibility_plan
             surface = invocation.tool_surface_plan
             context = invocation.context_plan
+            if compatibility is None or surface is None or context is None:
+                return {"path": "unavailable", "reason": "preflight_failed"}
             return {
                 "path": getattr(compatibility.path, "value", str(compatibility.path)),
                 "planner_revision": compatibility.planner_revision,
@@ -1517,8 +1522,8 @@ class Gateway:
 
         diagnostics = {
             "build": asdict(get_build_info()),
-            "runtime": asdict(invocation.runtime_capabilities),
-            "requirements": asdict(invocation.request_requirements),
+            "runtime": metadata(invocation.runtime_capabilities),
+            "requirements": metadata(invocation.request_requirements),
             "plan": plan_metadata(),
             "execution": execution.to_sanitized_dict(),
             "response": {
