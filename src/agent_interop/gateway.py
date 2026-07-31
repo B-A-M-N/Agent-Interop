@@ -1707,7 +1707,10 @@ class Gateway:
         execution remains with the client; controller-generated calls are
         explicitly provenance-labelled before leaving Interop.
         """
-        from agent_interop.controller.policy import mark_controller_provenance
+        from agent_interop.controller.policy import (
+            mark_controller_provenance,
+            missing_controller_result_ids,
+        )
         from agent_interop.controller.prompts import CONTROLLER_SYSTEM_PROMPT
         from agent_interop.controller.types import ControllerSessionState
 
@@ -1767,16 +1770,21 @@ class Gateway:
                         details={"path": "controlled", "responsible": "controller", "next": "abort_session"},
                     ),
                 )
-            has_tool_result = any(
-                isinstance(block, CanonicalToolResultBlock)
-                for message in invocation.reconciled_request.messages for block in message.content
+            missing_result_ids = missing_controller_result_ids(
+                invocation.reconciled_request.messages,
+                prior_state.pending_tool_call_ids,
             )
-            if prior_state.pending_tool_call_ids and not has_tool_result:
+            if missing_result_ids:
                 return CanonicalResponse(
                     error=CanonicalError(
                         code=InteropErrorCode.CONTROLLER_LOOP_DETECTED,
-                        message="Controller session repeated before the pending tool result arrived",
-                        details={"path": "controlled", "responsible": "client", "next": "return_tool_result"},
+                        message="Controller session resumed before every pending tool result arrived",
+                        details={
+                            "path": "controlled",
+                            "responsible": "client",
+                            "missing_tool_result_ids": list(missing_result_ids),
+                            "next": "return_tool_result",
+                        },
                     ),
                 )
 

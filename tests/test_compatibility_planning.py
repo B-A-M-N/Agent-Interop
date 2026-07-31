@@ -41,6 +41,7 @@ from agent_interop.context_budget import ContextBudgetPlanner, effective_context
 from agent_interop.context_budget.compaction import compact_safe_tool_results
 from agent_interop.context_budget.types import TokenEstimate
 from agent_interop.controller import CompatibilityController, ControllerAction, ControllerDecision
+from agent_interop.controller.policy import missing_controller_result_ids
 from agent_interop.evidence import has_confident_capability
 from agent_interop.execution import InteropRequestExecution
 from agent_interop.execution_attempts import CompatibilityAttemptExecutor
@@ -390,6 +391,14 @@ def test_controller_calls_have_controller_provenance() -> None:
         ControllerDecision(action=ControllerAction.TOOL_CALL, tool_calls=(call,))
     )
     assert decision.tool_calls[0].provenance.source == "compatibility_controller"
+
+
+def test_controller_continuation_requires_the_exact_pending_result_ids() -> None:
+    messages = [CanonicalMessage(
+        role="tool",
+        content=[CanonicalToolResultBlock(tool_call_id="call_a", content="done")],
+    )]
+    assert missing_controller_result_ids(messages, ("call_a", "call_b")) == ("call_b",)
 
 
 def test_bootstrap_qualifier_uses_only_bounded_synthetic_probes() -> None:
