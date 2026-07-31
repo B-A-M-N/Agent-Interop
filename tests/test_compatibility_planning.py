@@ -38,6 +38,7 @@ from agent_interop.config import (
 )
 from agent_interop.context import RequestContext
 from agent_interop.context_budget import ContextBudgetPlanner, effective_context_limit
+from agent_interop.context_budget.compaction import compact_safe_tool_results
 from agent_interop.context_budget.types import TokenEstimate
 from agent_interop.controller import CompatibilityController, ControllerAction, ControllerDecision
 from agent_interop.evidence import has_confident_capability
@@ -45,6 +46,7 @@ from agent_interop.execution import InteropRequestExecution
 from agent_interop.execution_attempts import CompatibilityAttemptExecutor
 from agent_interop.execution_attempts.budget import AttemptBudget
 from agent_interop.gateway import Gateway, ResolvedInvocation
+from agent_interop.history import reconcile_history
 from agent_interop.planning import (
     BehavioralCapabilities,
     CompatibilityPath,
@@ -204,6 +206,82 @@ def test_context_plan_accounts_for_tool_surface_reduction_before_adaptation() ->
     )
     assert plan.before.tool_schema_tokens > plan.after.tool_schema_tokens
     assert "reduce_tool_surface" in plan.transformations
+
+
+def test_context_compaction_only_reduces_old_pageable_results() -> None:
+    old_call = CanonicalToolCallBlock(id="old", name="read_file", arguments={"path": "old.py"})
+    current_call = CanonicalToolCallBlock(id="current", name="run_tests", arguments={"command": "pytest"})
+    old_output = "".join(f"old line {index}\n" for index in range(80))
+    current_output = "current failure detail\n" * 20
+    request = CanonicalRequest(messages=[
+        CanonicalMessage(role="assistant", content=[old_call]),
+        CanonicalMessage(role="tool", content=[CanonicalToolResultBlock(tool_call_id="old", content=old_output)]),
+        CanonicalMessage(role="user", content=[CanonicalTextBlock(text="continue")]),
+        CanonicalMessage(role="assistant", content=[current_call]),
+        CanonicalMessage(role="tool", content=[CanonicalToolResultBlock(tool_call_id="current", content=current_output, is_error=True)]),
+        CanonicalMessage(role="user", content=[CanonicalTextBlock(text="fix the failure")]),
+    ])
+    history = reconcile_history(request.messages)
+    plan = ContextBudgetPlanner().plan(request, runtime_limit_tokens=200)
+    assert plan.compaction_required
+    adapted = compact_safe_tool_results(request, exchanges=history.exchanges, plan=plan)
+    assert adapted.changed
+    old_result = adapted.request.messages[1].content[0]
+    current_result = adapted.request.messages[4].content[0]
+    assert isinstance(old_result, CanonicalToolResultBlock)
+    assert isinstance(current_result, CanonicalToolResultBlock)
+    assert "[interop: compacted" in old_result.content
+    assert old_result.content.startswith("old line 0\n")
+    assert current_result.content == current_output
+
+
+def test_context_compaction_keeps_unknown_tool_output_verbatim() -> None:
+    call = CanonicalToolCallBlock(id="shell", name="shell", arguments={"command": "x"})
+    request = CanonicalRequest(messages=[
+        CanonicalMessage(role="assistant", content=[call]),
+        CanonicalMessage(role="tool", content=[CanonicalToolResultBlock(tool_call_id="shell", content="x\n" * 100)]),
+        CanonicalMessage(role="user", content=[CanonicalTextBlock(text="new turn")]),
+        CanonicalMessage(role="assistant", content=[CanonicalToolCallBlock(id="latest", name="read_file")]),
+        CanonicalMessage(role="tool", content=[CanonicalToolResultBlock(tool_call_id="latest", content="current")]),
+        CanonicalMessage(role="user", content=[CanonicalTextBlock(text="continue")]),
+    ])
+    plan = ContextBudgetPlanner().plan(request, runtime_limit_tokens=200)
+    adapted = compact_safe_tool_results(request, exchanges=reconcile_history(request.messages).exchanges, plan=plan)
+    assert not adapted.changed
+    assert adapted.request.messages[1].content[0].content == "x\n" * 100
+
+
+def test_gateway_replans_after_safe_context_adaptation() -> None:
+    route = _route()
+    route.context = ContextConfig(output_reserve_tokens=16)
+    gateway = Gateway(InteropServerConfig(default_route_id="local", routes={"local": route}))
+
+    async def inspect(_route):
+        return ModelRuntimeCapabilities(
+            backend_kind=UpstreamKind.OLLAMA,
+            model_name="unknown:latest",
+            effective_context_tokens=800,
+        )
+
+    gateway._inspect_model_runtime = inspect  # type: ignore[method-assign]
+    old = "".join(f"line {index}\n" for index in range(180))
+    request = CanonicalRequest(
+        model=CanonicalModelReference(requested_name="local"),
+        messages=[
+            CanonicalMessage(role="assistant", content=[CanonicalToolCallBlock(id="old", name="read_file")]),
+            CanonicalMessage(role="tool", content=[CanonicalToolResultBlock(tool_call_id="old", content=old)]),
+            CanonicalMessage(role="user", content=[CanonicalTextBlock(text="continue")]),
+            CanonicalMessage(role="assistant", content=[CanonicalToolCallBlock(id="current", name="read_file")]),
+            CanonicalMessage(role="tool", content=[CanonicalToolResultBlock(tool_call_id="current", content="current")]),
+            CanonicalMessage(role="user", content=[CanonicalTextBlock(text="make a change")]),
+        ],
+        tools=[_tool("read_file", "read")],
+    )
+    invocation = asyncio.run(gateway._prepare_invocation_async(
+        request, RequestContext(), False, InteropRequestExecution(),
+    ))
+    assert invocation.context_plan.fits_directly
+    assert "[interop: compacted" in invocation.reconciled_request.messages[1].content[0].content
 
 
 def test_controller_calls_have_controller_provenance() -> None:

@@ -1009,7 +1009,26 @@ class Gateway:
         )
         context_plan = compatibility_plan.context_plan
         tool_surface_plan = compatibility_plan.tool_surface_plan
+        # An oversized request may gain an adapted path after deterministic
+        # old-result compaction in ``_prepare_invocation_async``.  Defer the
+        # unavailable-path error for that one case; all ordinary impossible
+        # requests keep the historical preflight failure.
         if not compatibility_plan.attempts:
+            if compatibility_plan.context_plan.compaction_required:
+                # The caller will apply only deterministic safe adaptation,
+                # then invoke this resolver again.  No presentation plan or
+                # evidence key may be created for a request known not to fit.
+                return (
+                    backend_metadata,
+                    model_profile,
+                    RepairPolicy.from_config(route.repair),
+                    None,
+                    None,
+                    runtime_capabilities,
+                    behavioral,
+                    compatibility_plan,
+                    context_plan,
+                )
             raise ValueError(
                 "REQUEST_PLAN_UNAVAILABLE: no direct, adapted, or configured controller path "
                 f"can satisfy {', '.join(compatibility_plan.missing_capabilities) or 'this request'}"
@@ -1285,6 +1304,45 @@ class Gateway:
                 inspect_runtime=inspect_runtime,
             )
         )
+        if context_plan.compaction_required:
+            # Planning alone is not capacity enforcement.  Apply the narrowly
+            # safe, deterministic adaptation (only historical pageable tool
+            # output), then re-plan against the exact request we will render.
+            # Nothing else is discarded or summarized implicitly.
+            from agent_interop.context_budget import (
+                ContextLimitExceededError,
+                compact_safe_tool_results,
+            )
+
+            adaptation = compact_safe_tool_results(
+                reconciled_request,
+                exchanges=history_result.exchanges,
+                plan=context_plan,
+            )
+            if adaptation.changed:
+                reconciled_request = adaptation.request
+                execution.record_compatibility_event(
+                    "context_adaptation:" + ",".join(adaptation.transformations)
+                )
+                (
+                    backend_metadata, model_profile, repair_policy, plan,
+                    compat_key, runtime_capabilities, behavioral,
+                    compatibility_plan, context_plan,
+                ) = await self._resolve_invocation_plan_and_key_async(
+                    route, reconciled_request, context, streaming,
+                    inspect_runtime=inspect_runtime,
+                )
+            if context_plan.compaction_required:
+                attempted = tuple(dict.fromkeys(
+                    (*context_plan.transformations, *adaptation.transformations)
+                ))
+                execution.record_compatibility_event("context_limit_exceeded")
+                raise ContextLimitExceededError(context_plan, attempted)
+        if not compatibility_plan.attempts:
+            raise ValueError(
+                "REQUEST_PLAN_UNAVAILABLE: no direct, adapted, or configured controller path "
+                f"can satisfy {', '.join(compatibility_plan.missing_capabilities) or 'this request'}"
+            )
         execution.invocation_plan = plan
         execution.compatibility_key = compat_key
 
@@ -1396,6 +1454,17 @@ class Gateway:
             exec_record.finalize_cancelled()
             raise
         except Exception as exc:
+            from agent_interop.context_budget import ContextLimitExceededError
+
+            if isinstance(exc, ContextLimitExceededError):
+                error = CanonicalError(
+                    code=InteropErrorCode.CONTEXT_LIMIT_EXCEEDED,
+                    message="Request does not fit the model's effective context limit after safe adaptation",
+                    details=exc.details(),
+                )
+                result = CanonicalResponse(error=error)
+                exec_record.finalize_response(result)
+                return result
             exc_err = CanonicalError(code="HANDLE_ERROR", message=str(exc)) if not isinstance(exc, CanonicalError) else exc
             exec_record.finalize_error(exc_err)
             raise
@@ -2613,7 +2682,16 @@ class Gateway:
             exec_record.finalize_cancelled()
             raise
         except Exception as exc:
-            exc_err = CanonicalError(code="STREAM_ERROR", message=str(exc)) if not isinstance(exc, CanonicalError) else exc
+            from agent_interop.context_budget import ContextLimitExceededError
+
+            if isinstance(exc, ContextLimitExceededError):
+                exc_err = CanonicalError(
+                    code=InteropErrorCode.CONTEXT_LIMIT_EXCEEDED,
+                    message="Request does not fit the model's effective context limit after safe adaptation",
+                    details=exc.details(),
+                )
+            else:
+                exc_err = CanonicalError(code="STREAM_ERROR", message=str(exc)) if not isinstance(exc, CanonicalError) else exc
             exec_record.finalize_error(exc_err)
             yield CanonicalEvent(type="error", error=exc_err)
             yield CanonicalEvent(type="message_stop")

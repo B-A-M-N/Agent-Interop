@@ -31,6 +31,29 @@ def _context_from_options(*sources: dict[str, Any]) -> int:
     return 0
 
 
+def _headers(route: ModelRoute) -> dict[str, str]:
+    """Build the same static/API-key header shape as normal upstream calls."""
+    from agent_interop.auth import UpstreamAuthConfig, UpstreamAuthMode, build_upstream_headers
+
+    raw = route.upstream.auth
+    if raw:
+        try:
+            mode = UpstreamAuthMode(raw.get("mode", "none"))
+        except ValueError:
+            mode = UpstreamAuthMode.NONE
+        auth = UpstreamAuthConfig(
+            mode=mode,
+            api_key=raw.get("token") or raw.get("api_key"),
+            api_key_header=raw.get("api_key_header", "Authorization"),
+            env_key=raw.get("env_key"),
+        )
+    elif route.upstream.api_key_env:
+        auth = UpstreamAuthConfig(mode=UpstreamAuthMode.API_KEY, env_key=route.upstream.api_key_env)
+    else:
+        auth = UpstreamAuthConfig(mode=UpstreamAuthMode.NONE)
+    return build_upstream_headers({}, auth, route.upstream.static_headers)
+
+
 class OllamaInspector:
     """Read Ollama's model/runtime metadata without creating an httpx client."""
 
@@ -41,7 +64,7 @@ class OllamaInspector:
         response = await transport.send(PreparedUpstreamRequest(
             method=method,
             url=f"{route.upstream.base_url.rstrip('/')}{path}",
-            headers=dict(route.upstream.static_headers),
+            headers=_headers(route),
             body=body or {},
             stream=False,
             timeout_seconds=min(route.upstream.timeout_seconds, 15.0),
@@ -53,6 +76,26 @@ class OllamaInspector:
         except (json.JSONDecodeError, UnicodeDecodeError):
             return {}
         return payload if isinstance(payload, dict) else {}
+
+    async def _probe(
+        self, transport: UpstreamTransport, route: ModelRoute, body: dict[str, Any],
+    ) -> tuple[bool, dict[str, Any]]:
+        """Run one bounded, side-effect-free /api/chat feature probe."""
+        response = await transport.send(PreparedUpstreamRequest(
+            method="POST",
+            url=f"{route.upstream.base_url.rstrip('/')}/api/chat",
+            headers=_headers(route),
+            body=body,
+            stream=False,
+            timeout_seconds=min(route.upstream.timeout_seconds, 15.0),
+        ))
+        if response.transport_failed or response.status_code >= 400:
+            return False, {}
+        try:
+            payload = response.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            payload = {}
+        return True, payload if isinstance(payload, dict) else {}
 
     async def inspect(
         self, route: ModelRoute, transport: UpstreamTransport,
@@ -74,6 +117,46 @@ class OllamaInspector:
         effective = min((limit for limit in (architecture_limit, configured_limit) if limit > 0), default=architecture_limit or configured_limit)
         declared_tools = "tools" in capabilities
         declared_images = "vision" in capabilities or "images" in capabilities
+        # Metadata says what Ollama believes a model advertises.  These probes
+        # establish only transport acceptance/shape, never automatic tool
+        # selection or task competence (those require qualification evidence).
+        probe_base = {
+            "model": route.upstream_model,
+            "stream": False,
+            "options": {"temperature": 0},
+        }
+        synthetic_tool = {
+            "type": "function",
+            "function": {
+                "name": "interop_probe",
+                "description": "Return marker only; no side effects.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"marker": {"type": "string"}},
+                    "required": ["marker"],
+                },
+            },
+        }
+        tools_ok, tool_payload = await self._probe(transport, route, {
+            **probe_base,
+            "messages": [{"role": "user", "content": "Call interop_probe with marker runtime."}],
+            "tools": [synthetic_tool],
+        })
+        json_ok, _ = await self._probe(transport, route, {
+            **probe_base,
+            "messages": [{"role": "user", "content": "Return exactly an empty JSON object."}],
+            "format": "json",
+        })
+        schema_ok, _ = await self._probe(transport, route, {
+            **probe_base,
+            "messages": [{"role": "user", "content": "Return a JSON object with marker runtime."}],
+            "format": {
+                "type": "object",
+                "properties": {"marker": {"type": "string"}},
+                "required": ["marker"],
+            },
+        })
+        tool_calls = tool_payload.get("message", {}).get("tool_calls", [])
         return ModelRuntimeCapabilities(
             backend_kind=route.upstream.kind,
             backend_version=str(version.get("version", "")),
@@ -87,13 +170,17 @@ class OllamaInspector:
             effective_context_tokens=effective,
             chat_template=template,
             chat_template_digest=_digest(template),
-            accepts_native_tools=CapabilityState.DECLARED if declared_tools else CapabilityState.UNSUPPORTED,
-            returns_native_tool_calls=CapabilityState.DECLARED if declared_tools else CapabilityState.UNSUPPORTED,
+            accepts_native_tools=(CapabilityState.PROBED if tools_ok else
+                                  CapabilityState.DECLARED if declared_tools else CapabilityState.UNSUPPORTED),
+            returns_native_tool_calls=(CapabilityState.PROBED if isinstance(tool_calls, list) and tool_calls else
+                                       CapabilityState.DECLARED if declared_tools else CapabilityState.UNSUPPORTED),
             accepts_named_tool_choice=CapabilityState.UNSUPPORTED,
             accepts_required_tool_choice=CapabilityState.UNSUPPORTED,
             accepts_parallel_tool_flag=CapabilityState.UNSUPPORTED,
-            supports_json_schema=CapabilityState.DECLARED if "structured_output" in capabilities else CapabilityState.UNSUPPORTED,
-            supports_json_mode=CapabilityState.DECLARED if "structured_output" in capabilities else CapabilityState.UNSUPPORTED,
+            supports_json_schema=(CapabilityState.PROBED if schema_ok else
+                                  CapabilityState.DECLARED if "structured_output" in capabilities else CapabilityState.UNSUPPORTED),
+            supports_json_mode=(CapabilityState.PROBED if json_ok else
+                                CapabilityState.DECLARED if "structured_output" in capabilities else CapabilityState.UNSUPPORTED),
             supports_grammar=CapabilityState.UNSUPPORTED,
             supports_streaming=CapabilityState.PROBED,
             supports_images=CapabilityState.DECLARED if declared_images else CapabilityState.UNSUPPORTED,

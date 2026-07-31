@@ -7,9 +7,34 @@ silently discarded during planning.
 
 from __future__ import annotations
 
-from agent_interop.abi import CanonicalRequest
+from agent_interop.abi import CanonicalRequest, CanonicalToolCallBlock, CanonicalToolResultBlock
 from agent_interop.context_budget.estimator import estimate_request_context
 from agent_interop.context_budget.types import ContextPlan
+
+
+class ContextLimitExceededError(ValueError):
+    """Structured preflight failure after safe adaptation is exhausted."""
+
+    def __init__(self, plan: ContextPlan, attempted_strategies: tuple[str, ...]) -> None:
+        self.plan = plan
+        self.attempted_strategies = attempted_strategies
+        super().__init__(
+            f"context requires {plan.after.total_required_tokens} tokens; "
+            f"safe limit is {plan.safe_limit_tokens}"
+        )
+
+    def details(self) -> dict[str, int | list[str]]:
+        breakdown = self.plan.after
+        return {
+            "runtime_limit": self.plan.runtime_limit_tokens,
+            "safe_limit": self.plan.safe_limit_tokens,
+            "required": breakdown.total_required_tokens,
+            "system": breakdown.system_tokens,
+            "tools": breakdown.tool_schema_tokens,
+            "history": breakdown.message_tokens,
+            "output_reserve": breakdown.output_reserve_tokens,
+            "attempted_strategies": list(self.attempted_strategies),
+        }
 
 
 def effective_context_limit(
@@ -58,11 +83,28 @@ class ContextBudgetPlanner:
                 transformations=("reduce_tool_surface",) if after.tool_schema_tokens < before.tool_schema_tokens else (),
             )
 
-        # Preserve the latest user message and every current tool result. The
-        # concrete compactor may reduce older tool result payloads first.
+        # Preserve required constraints, the latest user turn, and the most
+        # recent complete tool exchange.  Older pageable tool output may be
+        # reduced by the explicit compactor, but unknown/error output never is.
         protected: set[int] = set()
+        latest_user = max((index for index, message in enumerate(request.messages)
+                           if message.role == "user"), default=-1)
+        if latest_user >= 0:
+            protected.add(latest_user)
+        latest_result = max((index for index, message in enumerate(request.messages)
+                             if any(isinstance(block, CanonicalToolResultBlock) for block in message.content)), default=-1)
+        if latest_result >= 0:
+            protected.add(latest_result)
+            # A matching assistant call is action-critical to its result.
+            result_ids = {block.tool_call_id for block in request.messages[latest_result].content
+                          if isinstance(block, CanonicalToolResultBlock)}
+            for index in range(latest_result - 1, -1, -1):
+                if any(isinstance(block, CanonicalToolCallBlock) and block.id in result_ids
+                       for block in request.messages[index].content):
+                    protected.add(index)
+                    break
         for index, message in enumerate(request.messages):
-            if message.role == "user" or any(getattr(block, "type", "") == "tool_result" for block in message.content):
+            if message.role in {"system", "developer"}:
                 protected.add(index)
         if request.messages:
             protected.add(len(request.messages) - 1)
