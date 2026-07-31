@@ -55,6 +55,7 @@ from agent_interop.planning import (
 )
 from agent_interop.planning.types import AttemptKind, CompatibilityAttempt
 from agent_interop.qualification import BootstrapQualifier, QualificationRecord, QualificationState
+from agent_interop.qualification.store import QualificationStore
 from agent_interop.repair.invocation import build_invocation_plan
 from agent_interop.replay.capture import sanitize_body
 from agent_interop.replay.store import DiagnosticCaseStore
@@ -303,6 +304,19 @@ def test_bootstrap_qualifier_uses_only_bounded_synthetic_probes() -> None:
 
     record = asyncio.run(BootstrapQualifier().qualify("sha256:abc", execute))
     assert record.state == QualificationState.SEQUENTIAL_AGENT
+
+
+def test_qualification_store_restores_digest_scoped_safe_facts(tmp_path) -> None:
+    store = QualificationStore(tmp_path / "qualification.json")
+    record = QualificationRecord(
+        model_digest="sha256:qualified",
+        state=QualificationState.SEQUENTIAL_AGENT,
+        native_forced_tool=True,
+        continuation=True,
+    )
+    store.put(record)
+    restored = QualificationStore(tmp_path / "qualification.json").get("sha256:qualified")
+    assert restored == record
 
 
 def test_gateway_uses_only_bootstrap_proven_qualification_capabilities() -> None:

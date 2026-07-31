@@ -224,6 +224,14 @@ class Gateway:
         # it never enables semantic/coercive repair on its own.
         self._qualification_records: dict[str, Any] = {}
         self._qualification_locks: dict[str, asyncio.Lock] = {}
+        # New schema-v2 configurations opt into durable diagnostics/state;
+        # legacy programmatic setups retain the historical in-memory scope.
+        self._qualification_store: Any | None = None
+        if config.diagnostics.persist:
+            from agent_interop.paths import qualification_file
+            from agent_interop.qualification import QualificationStore
+
+            self._qualification_store = QualificationStore(qualification_file())
         from agent_interop.backends.runtime_cache import RuntimeCapabilityCache
 
         self._runtime_capability_cache = RuntimeCapabilityCache()
@@ -1791,7 +1799,7 @@ class Gateway:
     async def _controller_route_is_qualified(self, route: ModelRoute, minimum_level: str) -> bool:
         """Check a controller against the bounded bootstrap qualification state."""
         runtime = await self._inspect_model_runtime(route)
-        record = self._qualification_records.get(self._qualification_key(runtime))
+        record = self._qualification_record_for_runtime(runtime)
         if record is None:
             return False
         from agent_interop.qualification import QualificationState
@@ -2262,20 +2270,41 @@ class Gateway:
 
     @staticmethod
     def _qualification_key(runtime: Any) -> str:
-        return getattr(runtime, "model_digest", "") or getattr(runtime, "model_name", "")
+        # Tags are mutable aliases. Persisting their outcome could apply a
+        # previous model's qualification after a tag is repointed.
+        return getattr(runtime, "model_digest", "")
 
     def record_qualification(self, record: Any) -> None:
         """Store bounded bootstrap results for future safe planning decisions."""
         key = getattr(record, "model_digest", "")
         if key:
             self._qualification_records[key] = record
+            if self._qualification_store is not None:
+                self._qualification_store.put(record)
+
+    def _qualification_record_for_runtime(self, runtime: Any) -> Any | None:
+        """Restore only digest-keyed safe facts from the durable cache."""
+        key = self._qualification_key(runtime)
+        # Legacy in-memory callers may explicitly seed a qualification before
+        # runtime probing is enabled.  That ephemeral compatibility path is
+        # never persisted and therefore cannot survive a mutable tag change.
+        if not key and self._qualification_store is None:
+            key = getattr(runtime, "model_name", "")
+        if not key:
+            return None
+        record = self._qualification_records.get(key)
+        if record is None and self._qualification_store is not None:
+            record = self._qualification_store.get(key)
+            if record is not None:
+                self._qualification_records[key] = record
+        return record
 
     def _behavioral_capabilities(self, runtime: Any) -> Any:
         """Return only behavior proven by the synthetic bootstrap battery."""
         from agent_interop.planning import BehavioralCapabilities
         from agent_interop.qualification import QualificationState
 
-        record = self._qualification_records.get(self._qualification_key(runtime))
+        record = self._qualification_record_for_runtime(runtime)
         if record is None:
             return BehavioralCapabilities()
         forced = bool(getattr(record, "native_forced_tool", False) or getattr(record, "prompted_forced_tool", False))
@@ -2307,11 +2336,13 @@ class Gateway:
         ):
             return False
         key = self._qualification_key(invocation.runtime_capabilities)
-        if not key or key in self._qualification_records:
+        if not key or not qualification.cache_by_digest:
+            return False
+        if self._qualification_record_for_runtime(invocation.runtime_capabilities) is not None:
             return False
         lock = self._qualification_locks.setdefault(key, asyncio.Lock())
         async with lock:
-            if key in self._qualification_records:
+            if self._qualification_record_for_runtime(invocation.runtime_capabilities) is not None:
                 return False
             from agent_interop.qualification import BootstrapQualifier
 

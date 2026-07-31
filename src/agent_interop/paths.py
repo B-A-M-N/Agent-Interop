@@ -52,3 +52,8 @@ def evidence_file() -> Path:
 def diagnostic_cases_dir() -> Path:
     """Directory for bounded, sanitized live diagnostic replay cases."""
     return state_dir() / "replay-cases"
+
+
+def qualification_file() -> Path:
+    """Durable, digest-keyed bootstrap qualification cache."""
+    return state_dir() / "qualifications.json"
