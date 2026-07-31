@@ -1761,6 +1761,15 @@ class Gateway:
         client_id = invocation.request_context.client_id
         prior_state = self._controller_state.get(session_id, client_id, invocation.route.id)
         if prior_state is not None:
+            if prior_state.primary_turn_count >= effective_controller.max_primary_turns:
+                self._controller_state.remove(session_id, client_id, invocation.route.id)
+                return CanonicalResponse(
+                    error=CanonicalError(
+                        code=InteropErrorCode.CONTROLLER_LOOP_DETECTED,
+                        message="Primary worker exceeded its bounded delegation turn budget",
+                        details={"path": "controlled", "responsible": "primary", "next": "abort_session"},
+                    ),
+                )
             if prior_state.controller_turn_count >= effective_controller.max_controller_turns:
                 self._controller_state.remove(session_id, client_id, invocation.route.id)
                 return CanonicalResponse(

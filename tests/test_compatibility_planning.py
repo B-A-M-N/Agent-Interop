@@ -42,6 +42,8 @@ from agent_interop.context_budget.compaction import compact_safe_tool_results
 from agent_interop.context_budget.types import TokenEstimate
 from agent_interop.controller import CompatibilityController, ControllerAction, ControllerDecision
 from agent_interop.controller.policy import missing_controller_result_ids
+from agent_interop.controller.state import ControllerStateStore
+from agent_interop.controller.types import ControllerSessionState
 from agent_interop.evidence import has_confident_capability
 from agent_interop.execution import InteropRequestExecution
 from agent_interop.execution_attempts import CompatibilityAttemptExecutor
@@ -399,6 +401,19 @@ def test_controller_continuation_requires_the_exact_pending_result_ids() -> None
         content=[CanonicalToolResultBlock(tool_call_id="call_a", content="done")],
     )]
     assert missing_controller_result_ids(messages, ("call_a", "call_b")) == ("call_b",)
+
+
+def test_controller_state_ledger_tracks_primary_turns_separately() -> None:
+    store = ControllerStateStore()
+    state = ControllerSessionState(
+        session_id="session", route_id="primary", client_id="client",
+        controller_route_id="controller", primary_route_id="primary",
+        primary_turn_count=3, controller_turn_count=1,
+    )
+    store.put(state)
+    restored = store.get("session", "client", "primary")
+    assert restored is not None
+    assert restored.primary_turn_count == 3
 
 
 def test_bootstrap_qualifier_uses_only_bounded_synthetic_probes() -> None:
