@@ -73,6 +73,7 @@ class BehavioralCapabilities:
     parallel_tool_use: bool = False
     tool_result_continuation: bool = False
     streaming: bool = False
+    chat_only: bool = False
     sample_count: int = 0
 
 

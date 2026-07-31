@@ -177,6 +177,27 @@ def test_adapted_ladder_keeps_controller_as_final_bounded_fallback() -> None:
     assert plan.attempts[-1].kind == AttemptKind.CONTROLLER_MEDIATED
 
 
+def test_qualified_chat_only_model_selects_controller_path() -> None:
+    route = _route()
+    route.controller = ControllerConfig(route_id="controller")
+    request = CanonicalRequest(
+        model=CanonicalModelReference(requested_name="local"),
+        messages=[CanonicalMessage(role="user", content=[CanonicalTextBlock(text="read file")])],
+        tools=[_tool("read_file", "read")],
+    )
+    plan = asyncio.run(RequestCompatibilityPlanner().plan(
+        request=request,
+        context=RequestContext(),
+        route=route,
+        client_requirements=object(),
+        codec_capabilities=CodecCapabilities(supports_native_tools=True),
+        runtime_capabilities=ModelRuntimeCapabilities(backend_kind=UpstreamKind.OLLAMA, effective_context_tokens=8192),
+        behavioral_capabilities=BehavioralCapabilities(chat_only=True),
+    ))
+    assert plan.path == CompatibilityPath.CONTROLLED
+    assert plan.attempts[0].kind == AttemptKind.CONTROLLER_MEDIATED
+
+
 def test_context_plan_preserves_current_tool_result_and_latest_message() -> None:
     request = CanonicalRequest(
         messages=[

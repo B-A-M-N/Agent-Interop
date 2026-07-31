@@ -24,6 +24,11 @@ def direct_attempts(requirements: RequestRequirements, codec, runtime, behavior)
 def adapted_attempts(requirements: RequestRequirements, profile, runtime, behavior) -> tuple[CompatibilityAttempt, ...]:
     if not requirements.tools_present:
         return ()
+    # A completed bootstrap battery can positively identify a chat-only
+    # worker.  Rendering another textual contract would only waste an agent
+    # turn; controller mode is the compatible path when available.
+    if getattr(behavior, "chat_only", False):
+        return ()
     attempts = [CompatibilityAttempt(
         AttemptKind.PROMPTED_TOOLS,
         ToolMode.PROMPTED,

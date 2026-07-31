@@ -2317,6 +2317,7 @@ class Gateway:
             sequential_tool_use=sequential,
             tool_result_continuation=sequential,
             streaming=(getattr(record, "state", None) == QualificationState.ADVANCED_AGENT),
+            chat_only=(getattr(record, "state", None) == QualificationState.CHAT_ONLY),
             sample_count=1,
         )
 
