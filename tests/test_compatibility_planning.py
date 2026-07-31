@@ -40,7 +40,7 @@ from agent_interop.config import (
 from agent_interop.context import RequestContext
 from agent_interop.context_budget import ContextBudgetPlanner, effective_context_limit
 from agent_interop.context_budget.compaction import compact_safe_tool_results
-from agent_interop.context_budget.types import TokenEstimate
+from agent_interop.context_budget.types import ContextPlan, TokenEstimate
 from agent_interop.controller import CompatibilityController, ControllerAction, ControllerDecision
 from agent_interop.controller.policy import (
     CONTROLLER_DELEGATE_TOOL_NAME,
@@ -362,6 +362,27 @@ def test_context_compaction_reduces_only_known_json_query_results_structurally()
     assert parsed["items"][0] == {"index": 0, "value": "value-0"}
     assert parsed["items"][-1] == {"index": 31, "value": "value-31"}
     assert any("__interop_compacted__" in item for item in parsed["items"] if isinstance(item, dict))
+
+
+def test_controller_summary_replaces_only_planner_approved_old_history() -> None:
+    request = CanonicalRequest(
+        system=[CanonicalTextBlock(text="Keep this system constraint")],
+        messages=[
+            CanonicalMessage(role="user", content=[CanonicalTextBlock(text="old request")]),
+            CanonicalMessage(role="assistant", content=[CanonicalTextBlock(text="old response")]),
+            CanonicalMessage(role="tool", content=[CanonicalToolResultBlock(tool_call_id="current", content="current")]),
+            CanonicalMessage(role="user", content=[CanonicalTextBlock(text="latest request")]),
+        ],
+    )
+    summarized = Gateway._replace_compacted_history_with_controller_summary(
+        request,
+        ContextPlan(compacted_message_indices=(0, 1), preserved_message_indices=(2, 3)),
+        "The old request was investigated but remains unresolved.",
+    )
+    assert [message.role for message in summarized.messages] == ["tool", "user"]
+    assert summarized.messages[0].content[0].content == "current"
+    assert "Keep this system constraint" in summarized.system[0].text
+    assert "old request was investigated" in summarized.system[-1].text
 
 
 def test_gateway_replans_after_safe_context_adaptation() -> None:

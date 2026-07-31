@@ -1214,6 +1214,132 @@ class Gateway:
             raise RuntimeError("offline preparation unexpectedly suspended")
         return prepared
 
+    @staticmethod
+    def _replace_compacted_history_with_controller_summary(
+        request: CanonicalRequest,
+        context_plan: Any,
+        summary: str,
+    ) -> CanonicalRequest:
+        """Replace only planner-approved old turns with an explicit summary.
+
+        The context planner has already excluded system/developer messages,
+        the latest user turn, and the current tool exchange from its compacted
+        indices.  Keeping this mutation here makes the lossy step visible and
+        auditable, instead of allowing a controller response to silently
+        overwrite arbitrary canonical history.
+        """
+        compacted = set(context_plan.compacted_message_indices)
+        messages = [
+            message for index, message in enumerate(request.messages)
+            if index not in compacted
+        ]
+        system = [*request.system, CanonicalTextBlock(
+            text=(
+                "Interop controller summary of older conversation history. "
+                "It is incomplete; retain and prioritize all unsummarized "
+                "system/developer instructions and current tool results.\n\n"
+                f"{summary.strip()}"
+            ),
+        )]
+        return replace(request, system=system, messages=messages)
+
+    async def _summarize_old_history_with_controller(
+        self,
+        *,
+        route: ModelRoute,
+        request: CanonicalRequest,
+        context: Any,
+        context_plan: Any,
+        inspect_runtime: bool,
+    ) -> CanonicalRequest | None:
+        """Ask a qualified, sufficiently large controller to summarize old turns.
+
+        This is deliberately an opt-in *last* context adaptation.  It runs
+        only after deterministic safe tool-result reduction failed, only when
+        the controller can hold the original no-tool request itself, and only
+        replaces message indices the context planner already marked as old.
+        Unknown capacity, an unqualified controller, a controller error, or
+        an empty/non-text summary all leave the request untouched.
+        """
+        effective_controller = route.controller or self.config.controller
+        if not (
+            route.context.allow_controller_decomposition
+            and effective_controller.enabled
+            and context_plan.compacted_message_indices
+        ):
+            return None
+        controller_route = await self._select_controller_route(route, effective_controller)
+        if controller_route is None:
+            return None
+
+        from agent_interop.context_budget import effective_context_limit
+        from agent_interop.context_budget.estimator import estimate_request_context
+
+        controller_runtime = (
+            await self._inspect_model_runtime(controller_route)
+            if inspect_runtime else self._static_runtime_capabilities(controller_route)
+        )
+        controller_limit = effective_context_limit(
+            controller_runtime.architecture_context_tokens,
+            controller_runtime.configured_context_tokens,
+            controller_route.context.context_limit_tokens,
+            controller_runtime.effective_context_tokens,
+        )
+        # No observed capacity means no proof that a summary call is safe.
+        if not controller_limit:
+            return None
+
+        summary_generation = replace(
+            request.generation,
+            stream=False,
+            max_output_tokens=min(512, max(64, request.generation.max_output_tokens)),
+        )
+        summary_request = replace(
+            request,
+            model=replace(request.model, requested_name=controller_route.id),
+            system=[*request.system, CanonicalTextBlock(
+                text=(
+                    "Summarize only the older conversation history for a later "
+                    "coding-model turn. Preserve file paths, tool-call IDs, error "
+                    "outcomes, edits, and unresolved requirements. Do not claim any "
+                    "tool was executed. Return concise plain text only."
+                ),
+            )],
+            tools=[],
+            tool_choice=CanonicalToolChoice.none(),
+            generation=summary_generation,
+        )
+        summary_required = estimate_request_context(
+            summary_request,
+            visible_tools=(),
+            output_reserve_tokens=summary_generation.max_output_tokens,
+        ).total_required_tokens
+        if summary_required > int(controller_limit * 0.90):
+            return None
+
+        summary_context = replace(context, route_id=controller_route.id)
+        summary_execution = InteropRequestExecution(context=summary_context)
+        try:
+            summary_invocation = await self._prepare_invocation_async(
+                summary_request,
+                summary_context,
+                streaming=False,
+                execution=summary_execution,
+                inspect_runtime=inspect_runtime,
+                allow_controller_summary=False,
+            )
+            response = await self._handle_request_send(summary_invocation, summary_execution)
+        except (ValueError, RuntimeError):
+            return None
+        if response.error is not None:
+            return None
+        text = "\n".join(
+            block.text for block in response.content if isinstance(block, CanonicalTextBlock)
+        ).strip()
+        if not text:
+            return None
+        return self._replace_compacted_history_with_controller_summary(request, context_plan, text)
+
     async def _prepare_invocation_async(
         self,
         request: CanonicalRequest,
@@ -1222,6 +1348,7 @@ class Gateway:
         execution: InteropRequestExecution,
         *,
         inspect_runtime: bool = True,
+        allow_controller_summary: bool = True,
     ) -> ResolvedInvocation:
         """Prepare a resolved invocation for one request (P0.1).
 
@@ -1340,6 +1467,30 @@ class Gateway:
                     route, reconciled_request, context, streaming,
                     inspect_runtime=inspect_runtime,
                 )
+            if context_plan.compaction_required and allow_controller_summary:
+                summarized_request = await self._summarize_old_history_with_controller(
+                    route=route,
+                    request=reconciled_request,
+                    context=context,
+                    context_plan=context_plan,
+                    inspect_runtime=inspect_runtime,
+                )
+                if summarized_request is not None:
+                    reconciled_request = summarized_request
+                    execution.record_compatibility_event("context_adaptation:controller_summary_old_history")
+                    history_result = reconcile_history(
+                        reconciled_request.messages,
+                        session_id=getattr(context, "session_id", "") or "",
+                        request_id=getattr(context, "request_id", "") or request.request_id or "",
+                    )
+                    (
+                        backend_metadata, model_profile, repair_policy, plan,
+                        compat_key, runtime_capabilities, behavioral,
+                        compatibility_plan, context_plan,
+                    ) = await self._resolve_invocation_plan_and_key_async(
+                        route, reconciled_request, context, streaming,
+                        inspect_runtime=inspect_runtime,
+                    )
             if context_plan.compaction_required:
                 attempted = tuple(dict.fromkeys(
                     (*context_plan.transformations, *adaptation.transformations)
