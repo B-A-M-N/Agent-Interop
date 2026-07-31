@@ -41,7 +41,12 @@ from agent_interop.context_budget import ContextBudgetPlanner, effective_context
 from agent_interop.context_budget.compaction import compact_safe_tool_results
 from agent_interop.context_budget.types import TokenEstimate
 from agent_interop.controller import CompatibilityController, ControllerAction, ControllerDecision
-from agent_interop.controller.policy import missing_controller_result_ids
+from agent_interop.controller.policy import (
+    CONTROLLER_DELEGATE_TOOL_NAME,
+    controller_delegate_tool,
+    missing_controller_result_ids,
+    primary_delegation_prompt,
+)
 from agent_interop.controller.state import ControllerStateStore
 from agent_interop.controller.types import ControllerSessionState
 from agent_interop.evidence import has_confident_capability
@@ -416,6 +421,18 @@ def test_controller_state_ledger_tracks_primary_turns_separately() -> None:
     assert restored.primary_turn_count == 3
 
 
+def test_private_controller_delegation_requires_one_bounded_prompt() -> None:
+    call = CanonicalToolCallBlock(
+        id="internal", name=CONTROLLER_DELEGATE_TOOL_NAME,
+        arguments={"prompt": "Inspect the call site before choosing a tool."},
+    )
+    assert primary_delegation_prompt(call) == "Inspect the call site before choosing a tool."
+    assert controller_delegate_tool().name == CONTROLLER_DELEGATE_TOOL_NAME
+    assert primary_delegation_prompt(CanonicalToolCallBlock(
+        name=CONTROLLER_DELEGATE_TOOL_NAME, arguments={"prompt": "x" * 4097},
+    )) is None
+
+
 def test_bootstrap_qualifier_uses_only_bounded_synthetic_probes() -> None:
     async def execute(probe) -> bool:
         assert probe.name in {
@@ -730,3 +747,102 @@ def test_controlled_execution_labels_controller_tool_calls() -> None:
     gateway._prepare_invocation = fake_prepare  # type: ignore[method-assign]
     response = asyncio.run(gateway._execute_controller_attempt(invocation, invocation.execution_record))
     assert response.content[0].provenance.source == "compatibility_controller"
+
+
+def test_controlled_execution_restores_client_named_tool_constraint() -> None:
+    primary = _route(allow_adapted=False, allow_direct=False, allow_controlled=True)
+    primary.id = "primary"
+    primary.client_model_aliases = ["primary"]
+    primary.controller = ControllerConfig(route_id="controller")
+    controller = _route(allow_adapted=True, allow_direct=False, allow_controlled=False)
+    controller.id = "controller"
+    controller.client_model_aliases = ["controller"]
+    gateway = Gateway(InteropServerConfig(default_route_id="primary", routes={"primary": primary, "controller": controller}))
+    context = RequestContext(session_id="named", client_id="test")
+    request = CanonicalRequest(
+        model=CanonicalModelReference(requested_name="primary"),
+        messages=[CanonicalMessage(role="user", content=[CanonicalTextBlock(text="edit a file")])],
+        tools=[_tool("read_file", "read"), _tool("edit_file", "edit")],
+        tool_choice=CanonicalToolChoice.named("edit_file"),
+    )
+    base_plan = build_invocation_plan([], CanonicalToolChoice.none(), ToolMode.DISABLED)
+    invocation = ResolvedInvocation(
+        context, request, request, primary, object(), object(), object(), base_plan, object(), object(), None, None,
+        InteropRequestExecution(context=context),
+        tool_surface_plan=type("Surface", (), {"fingerprint": "tools"})(),
+    )
+    sent = 0
+
+    async def fake_send(inv, record):
+        nonlocal sent
+        sent += 1
+        if sent == 1:
+            return CanonicalResponse(content=[CanonicalTextBlock(text="use edit_file")])
+        return CanonicalResponse(content=[CanonicalToolCallBlock(
+            id="wrong", name="read_file", arguments={"path": "a.py"},
+        )])
+
+    gateway._handle_request_send = fake_send  # type: ignore[method-assign]
+    response = asyncio.run(gateway._execute_controller_attempt(invocation, invocation.execution_record))
+    assert response.error is not None
+    assert response.error.code == "TOOL_CHOICE_VIOLATION"
+    assert response.error.details["responsible"] == "controller"
+
+
+def test_controlled_execution_consumes_private_delegation_before_client_response() -> None:
+    primary = _route(allow_adapted=False, allow_direct=False, allow_controlled=True)
+    primary.id = "primary"
+    primary.client_model_aliases = ["primary"]
+    primary.controller = ControllerConfig(route_id="controller", max_primary_turns=3, max_controller_turns=3)
+    controller = _route(allow_adapted=True, allow_direct=False, allow_controlled=False)
+    controller.id = "controller"
+    controller.client_model_aliases = ["controller"]
+    gateway = Gateway(InteropServerConfig(default_route_id="primary", routes={"primary": primary, "controller": controller}))
+    context = RequestContext(session_id="delegation", client_id="test")
+    request = CanonicalRequest(
+        model=CanonicalModelReference(requested_name="primary"),
+        messages=[CanonicalMessage(role="user", content=[CanonicalTextBlock(text="inspect a file")])],
+        tools=[_tool("read_file", "read a file")],
+        tool_choice=CanonicalToolChoice.required(),
+    )
+    base_plan = build_invocation_plan([], CanonicalToolChoice.none(), ToolMode.DISABLED)
+    invocation = ResolvedInvocation(
+        context, request, request, primary, object(), object(), object(), base_plan, object(), object(), None, None,
+        InteropRequestExecution(context=context),
+        tool_surface_plan=type("Surface", (), {"fingerprint": "tools"})(),
+    )
+    sent = 0
+
+    async def fake_send(inv, record):
+        nonlocal sent
+        sent += 1
+        if sent == 1:
+            return CanonicalResponse(content=[CanonicalTextBlock(text="First analysis")])
+        if sent == 2:
+            return CanonicalResponse(content=[CanonicalToolCallBlock(
+                id="internal_1", name=CONTROLLER_DELEGATE_TOOL_NAME,
+                arguments={"prompt": "Check the exact filename needed."},
+            )])
+        if sent == 3:
+            assert any(
+                "Check the exact filename needed." in block.text
+                for block in inv.reconciled_request.system
+                if isinstance(block, CanonicalTextBlock)
+            )
+            return CanonicalResponse(content=[CanonicalTextBlock(text="Refined analysis")])
+        return CanonicalResponse(content=[CanonicalToolCallBlock(
+            id="client_1", name="read_file", arguments={"path": "a.py"},
+        )])
+
+    gateway._handle_request_send = fake_send  # type: ignore[method-assign]
+    response = asyncio.run(gateway._execute_controller_attempt(invocation, invocation.execution_record))
+    assert sent == 4
+    assert [block.name for block in response.content if isinstance(block, CanonicalToolCallBlock)] == ["read_file"]
+    assert all(
+        block.name != CONTROLLER_DELEGATE_TOOL_NAME
+        for block in response.content if isinstance(block, CanonicalToolCallBlock)
+    )
+    state = gateway._controller_state.get("delegation", "test", "primary")
+    assert state is not None
+    assert (state.primary_turn_count, state.controller_turn_count) == (2, 2)
+    assert "controller_delegated_primary" in invocation.execution_record.compatibility_events

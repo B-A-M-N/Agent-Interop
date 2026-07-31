@@ -1684,6 +1684,52 @@ class Gateway:
         replanned = replace(invocation, tool_surface_plan=surface)
         return self._invocation_for_attempt(replanned, invocation.compatibility_attempt)
 
+    def _controller_invocation_with_delegate_tool(
+        self, invocation: ResolvedInvocation,
+    ) -> ResolvedInvocation:
+        """Expose the private delegation tool only on a controller request.
+
+        Tool-surface planning deliberately knows only about client-declared
+        tools.  The controller's refinement request is an Interop control
+        message, so add it after normal preparation and rebuild the exact
+        invocation plan used for rendering/validation.  It never alters the
+        outer client request or its validation registry.
+        """
+        from agent_interop.config import ToolSurfaceConfig, ToolSurfaceMode
+        from agent_interop.controller.policy import controller_delegate_tool
+        from agent_interop.repair.invocation import build_invocation_plan
+        from agent_interop.tool_surface import ToolSurfacePlanner
+
+        delegate_tool = controller_delegate_tool()
+        tools = tuple(invocation.reconciled_request.tools)
+        if not any(tool.name == delegate_tool.name for tool in tools):
+            tools = (*tools, delegate_tool)
+        canonical = replace(invocation.reconciled_request, tools=list(tools))
+        original_plan = invocation.invocation_plan
+        plan = build_invocation_plan(
+            tools=None,
+            tool_choice=canonical.tool_choice,
+            route_mode=original_plan.effective_tool_mode,
+            model_profile=invocation.model_profile,
+            repair_policy=invocation.repair_policy,
+            codec_capabilities=getattr(original_plan, "codec_capabilities", None),
+            upstream_tools=tools,
+            validation_tools=tools,
+        )
+        return replace(
+            invocation,
+            original_request=canonical,
+            reconciled_request=canonical,
+            invocation_plan=plan,
+            # This request is already an intentionally reduced controller
+            # surface. Re-selecting it dynamically could hide a tool that the
+            # controller was explicitly permitted to choose and would turn a
+            # valid decision into a misleading "withheld" failure.
+            tool_surface_plan=ToolSurfacePlanner().plan(
+                canonical, ToolSurfaceConfig(mode=ToolSurfaceMode.TRANSPARENT),
+            ),
+        )
+
     async def _execute_compatibility_attempt(
         self,
         invocation: ResolvedInvocation,
@@ -1798,73 +1844,196 @@ class Gateway:
                 )
 
         # The primary worker may reason/code, but cannot emit tool calls. Its
-        # output is treated as untrusted advisory text to the controller.
-        primary_request = replace(
-            invocation.reconciled_request,
-            tools=[],
-            tool_choice=CanonicalToolChoice.none(),
+        # output is untrusted advisory text to the controller.  A controller
+        # may request a focused refinement through one private tool; Interop
+        # consumes that request and never returns it to the coding client.
+        from agent_interop.controller.policy import (
+            CONTROLLER_DELEGATE_TOOL_NAME,
+            primary_delegation_prompt,
         )
-        primary_plan = replace(
-            invocation.invocation_plan,
-            effective_tool_mode=ToolMode.DISABLED,
-            upstream_tools=(),
-            prompt_contract="",
-            parser_id=None,
-        )
-        primary_invocation = replace(
-            invocation,
-            reconciled_request=primary_request,
-            invocation_plan=primary_plan,
-        )
-        primary = await self._handle_request_send(primary_invocation, exec_record)
-        if primary.error is not None:
-            return primary
 
-        primary_text = "\n".join(
-            block.text for block in primary.content if isinstance(block, CanonicalTextBlock)
-        )
-        controller_system = list(invocation.reconciled_request.system)
-        controller_system.append(CanonicalTextBlock(
-            text=f"{CONTROLLER_SYSTEM_PROMPT}\n\nPrimary worker work product:\n{primary_text}",
-        ))
-        controller_request = replace(
-            invocation.reconciled_request,
-            model=replace(invocation.reconciled_request.model, requested_name=controller_route.id),
-            system=controller_system,
-        )
+        primary_turns = prior_state.primary_turn_count if prior_state else 0
+        controller_turns = prior_state.controller_turn_count if prior_state else 0
+        work_products: list[str] = []
         controller_context = replace(invocation.request_context, route_id=controller_route.id)
-        controller_invocation = await self._prepare_invocation_async(
-            controller_request,
-            controller_context,
-            streaming=False,
-            execution=exec_record,
-        )
-        # The controller is a second model call; keep it visible in the
-        # request's efficiency record rather than hiding it behind a single
-        # compatibility attempt.
-        exec_record.record_attempt(controller_tokens=(len(primary_text) + 3) // 4)
-        response = await self._handle_request_send(controller_invocation, exec_record)
-        if response.error is not None:
-            return response
-        calls = tuple(
-            mark_controller_provenance(block)
-            if isinstance(block, CanonicalToolCallBlock) else block
-            for block in response.content
-        )
-        pending = tuple(block.id for block in calls if isinstance(block, CanonicalToolCallBlock))
-        self._controller_state.put(ControllerSessionState(
-            session_id=controller_context.session_id,
-            route_id=invocation.route.id,
-            client_id=controller_context.client_id,
-            controller_route_id=controller_route.id,
-            primary_route_id=invocation.route.id,
-            phase="awaiting_tool_result" if pending else "final_text",
-            visible_tool_fingerprint=invocation.tool_surface_plan.fingerprint,
-            pending_tool_call_ids=pending,
-            primary_turn_count=(prior_state.primary_turn_count + 1) if prior_state else 1,
-            controller_turn_count=(prior_state.controller_turn_count + 1) if prior_state else 1,
-        ))
-        return replace(response, content=list(calls))
+
+        def loop_error(message: str, *, responsible: str) -> CanonicalResponse:
+            self._controller_state.remove(session_id, client_id, invocation.route.id)
+            return CanonicalResponse(
+                error=CanonicalError(
+                    code=InteropErrorCode.CONTROLLER_LOOP_DETECTED,
+                    message=message,
+                    details={"path": "controlled", "responsible": responsible, "next": "abort_session"},
+                ),
+            )
+
+        async def ask_primary(refinement_prompt: str = "") -> CanonicalResponse | None:
+            nonlocal primary_turns
+            if primary_turns >= effective_controller.max_primary_turns:
+                return loop_error(
+                    "Primary worker exceeded its bounded delegation turn budget",
+                    responsible="primary",
+                )
+            primary_system = list(invocation.reconciled_request.system)
+            if refinement_prompt:
+                primary_system.append(CanonicalTextBlock(
+                    text=(
+                        "The compatibility controller needs this focused follow-up. "
+                        "Do not claim to execute tools; provide only reasoning or a "
+                        f"work product.\n\n{refinement_prompt}"
+                    ),
+                ))
+            primary_request = replace(
+                invocation.reconciled_request,
+                system=primary_system,
+                tools=[],
+                tool_choice=CanonicalToolChoice.none(),
+            )
+            primary_plan = replace(
+                invocation.invocation_plan,
+                effective_tool_mode=ToolMode.DISABLED,
+                upstream_tools=(),
+                prompt_contract="",
+                parser_id=None,
+            )
+            primary_invocation = replace(
+                invocation,
+                reconciled_request=primary_request,
+                invocation_plan=primary_plan,
+            )
+            primary = await self._handle_request_send(primary_invocation, exec_record)
+            if primary.error is not None:
+                return primary
+            primary_turns += 1
+            work_products.append("\n".join(
+                block.text for block in primary.content if isinstance(block, CanonicalTextBlock)
+            ))
+            return None
+
+        refinement_prompt = ""
+        while True:
+            primary_failure = await ask_primary(refinement_prompt)
+            if primary_failure is not None:
+                return primary_failure
+            refinement_prompt = ""
+            if controller_turns >= effective_controller.max_controller_turns:
+                return loop_error(
+                    "Controller exceeded its bounded turn budget", responsible="controller",
+                )
+            rendered_work_products = "\n\n".join(
+                f"[primary turn {index}]\n{work_product}"
+                for index, work_product in enumerate(work_products, start=1)
+            )
+            controller_system = list(invocation.reconciled_request.system)
+            controller_system.append(CanonicalTextBlock(
+                text=f"{CONTROLLER_SYSTEM_PROMPT}\n\nPrimary worker work product:\n{rendered_work_products}",
+            ))
+            # The controller gets only the selected client surface plus the
+            # private refinement action. A client named-tool requirement must
+            # not prevent it from obtaining necessary worker reasoning.
+            visible_tools = tuple(getattr(
+                invocation.tool_surface_plan, "visible_tools", invocation.reconciled_request.tools,
+            ))
+            controller_request = replace(
+                invocation.reconciled_request,
+                model=replace(invocation.reconciled_request.model, requested_name=controller_route.id),
+                system=controller_system,
+                tools=list(visible_tools),
+                tool_choice=CanonicalToolChoice.auto(),
+            )
+            controller_invocation = await self._prepare_invocation_async(
+                controller_request,
+                controller_context,
+                streaming=False,
+                execution=exec_record,
+            )
+            controller_invocation = self._controller_invocation_with_delegate_tool(controller_invocation)
+            # The controller is a second model call; keep it visible in the
+            # request's efficiency record rather than hiding it behind a single
+            # compatibility attempt.
+            exec_record.record_attempt(controller_tokens=(len(rendered_work_products) + 3) // 4)
+            response = await self._handle_request_send(controller_invocation, exec_record)
+            if response.error is not None:
+                return response
+            controller_turns += 1
+
+            raw_calls = tuple(
+                block for block in response.content if isinstance(block, CanonicalToolCallBlock)
+            )
+            delegation_calls = tuple(
+                call for call in raw_calls if call.name == CONTROLLER_DELEGATE_TOOL_NAME
+            )
+            if delegation_calls:
+                # A delegation is control flow, not a client-visible parallel
+                # tool batch. Mixing it with a real tool call is ambiguous and
+                # fails closed instead of granting an unintended action.
+                if len(delegation_calls) != 1 or len(raw_calls) != 1:
+                    return loop_error(
+                        "Controller mixed a primary-refinement request with client tool calls",
+                        responsible="controller",
+                    )
+                refinement_prompt = primary_delegation_prompt(delegation_calls[0])
+                if refinement_prompt is None:
+                    return loop_error(
+                        "Controller emitted an invalid primary-refinement request",
+                        responsible="controller",
+                    )
+                exec_record.record_compatibility_event("controller_delegated_primary")
+                # The next loop iteration performs exactly one additional
+                # worker turn and one controller decision, with both budgets
+                # checked before dispatch.
+                continue
+
+            # The controller used ``auto`` internally so it could request
+            # worker refinement even for a client named-tool request. Before
+            # its response crosses back to the client boundary, restore and
+            # enforce the client's original tool-choice contract.
+            outer_choice = invocation.reconciled_request.tool_choice
+            call_names = tuple(call.name for call in raw_calls)
+            choice_violation = ""
+            if outer_choice.mode == ToolChoiceMode.NONE and raw_calls:
+                choice_violation = "tool_choice=none forbids controller tool calls"
+            elif outer_choice.mode == ToolChoiceMode.REQUIRED and not raw_calls:
+                choice_violation = "tool_choice=required requires a controller tool call"
+            elif outer_choice.mode == ToolChoiceMode.NAMED and (
+                not raw_calls or any(name != outer_choice.name for name in call_names)
+            ):
+                choice_violation = (
+                    f"tool_choice=named requires only {outer_choice.name!r}, got {list(call_names)!r}"
+                )
+            if choice_violation:
+                self._controller_state.remove(session_id, client_id, invocation.route.id)
+                return CanonicalResponse(
+                    error=CanonicalError(
+                        code=InteropErrorCode.TOOL_CHOICE_VIOLATION,
+                        message=choice_violation,
+                        details={
+                            "path": "controlled",
+                            "responsible": "controller",
+                            "next": "retry_with_qualified_controller",
+                        },
+                    ),
+                )
+
+            calls = tuple(
+                mark_controller_provenance(block)
+                if isinstance(block, CanonicalToolCallBlock) else block
+                for block in response.content
+            )
+            pending = tuple(block.id for block in calls if isinstance(block, CanonicalToolCallBlock))
+            self._controller_state.put(ControllerSessionState(
+                session_id=controller_context.session_id,
+                route_id=invocation.route.id,
+                client_id=controller_context.client_id,
+                controller_route_id=controller_route.id,
+                primary_route_id=invocation.route.id,
+                phase="awaiting_tool_result" if pending else "final_text",
+                visible_tool_fingerprint=invocation.tool_surface_plan.fingerprint,
+                pending_tool_call_ids=pending,
+                primary_turn_count=primary_turns,
+                controller_turn_count=controller_turns,
+            ))
+            return replace(response, content=list(calls))
 
     async def _select_controller_route(self, primary_route: ModelRoute, config: Any) -> ModelRoute | None:
         """Select an explicitly configured or verified installed controller."""
