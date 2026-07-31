@@ -258,6 +258,30 @@ class TestUnregisteredAgentRejected:
 
 
 class TestStartGatewayConcurrencyConfigurable:
+    def test_context_setting_reaches_managed_gateway_environment(self, monkeypatch, tmp_path):
+        gw = launcher.ManagedGateway(ollama_num_ctx=16384)
+        monkeypatch.setattr("agent_interop.paths.log_file", lambda: tmp_path / "interop.log")
+        captured_kwargs = {}
+
+        class FakeProcess:
+            stderr = None
+
+            def poll(self):
+                return None
+
+        def fake_popen(cmd, **kwargs):
+            captured_kwargs.update(kwargs)
+            return FakeProcess()
+
+        monkeypatch.setattr(launcher.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(launcher.httpx, "get", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no server")))
+        monkeypatch.setattr(launcher.atexit, "register", lambda fn: None)
+
+        with pytest.raises(RuntimeError, match="did not start"):
+            gw.start_gateway(timeout=0.1)
+
+        assert captured_kwargs["env"]["INTEROP_OLLAMA_NUM_CTX"] == "16384"
+
     def test_concurrency_limit_is_configurable_not_hardcoded(self, monkeypatch, tmp_path):
         gw = launcher.ManagedGateway()
         monkeypatch.setattr("agent_interop.paths.log_file", lambda: tmp_path / "interop.log")

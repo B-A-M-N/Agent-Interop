@@ -273,6 +273,7 @@ class ManagedGateway:
         port: int = 0,
         backend_type: str = "ollama",
         auto_pull: bool = True,
+        ollama_num_ctx: int = 0,
     ) -> None:
         self.model = model
         self.ollama_url = ollama_url.rstrip("/")
@@ -280,6 +281,7 @@ class ManagedGateway:
         self.port = port or find_free_port()
         self.backend_type = backend_type
         self.auto_pull = auto_pull
+        self.ollama_num_ctx = ollama_num_ctx
 
         self._session_credential = f"interop_{uuid.uuid4().hex[:24]}"
         self._gateway_url = f"http://{self.host}:{self.port}"
@@ -346,6 +348,8 @@ class ManagedGateway:
         env["INTEROP_BACKEND_URL"] = self.ollama_url
         env["INTEROP_BACKEND_TYPE"] = self.backend_type
         env["INTEROP_MODEL"] = self.model
+        if self.ollama_num_ctx:
+            env["INTEROP_OLLAMA_NUM_CTX"] = str(self.ollama_num_ctx)
         env["INTEROP_PORT"] = str(self.port)
         env["INTEROP_SESSION_CREDENTIAL"] = self._session_credential
 
@@ -751,17 +755,21 @@ class ManagedGateway:
 
 def run(agent: str = "claude", model: str = "qwen3-coder",
         ollama_url: str = OLLAMA_DEFAULT_URL, extra_args: list[str] | None = None,
-        assume_protocol: str | None = None) -> int:
+        assume_protocol: str | None = None, ollama_num_ctx: int = 0) -> int:
     """High-level: ensure Ollama → start Interop → launch agent → wait → cleanup.
 
     This is the pipeline that makes local models work in coding agents:
     Ollama handles model inference, Interop handles the protocol mismatch.
     """
-    gateway = ManagedGateway(model=model, ollama_url=ollama_url)
+    gateway = ManagedGateway(
+        model=model, ollama_url=ollama_url, ollama_num_ctx=ollama_num_ctx,
+    )
 
     print("Interop — local LLM compatibility layer")
     print(f"  Model:   {model}")
     print(f"  Backend: Ollama ({ollama_url})")
+    if ollama_num_ctx:
+        print(f"  Context: {ollama_num_ctx} tokens")
     print(f"  Agent:   {agent}")
     print()
 

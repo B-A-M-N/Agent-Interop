@@ -271,6 +271,7 @@ def create_app_from_env() -> FastAPI:
     - INTEROP_BACKEND_URL: upstream base URL
     - INTEROP_BACKEND_TYPE: upstream kind (ollama, vllm, etc.)
     - INTEROP_MODEL: model name
+    - INTEROP_OLLAMA_NUM_CTX: requested Ollama context window (optional)
     - INTEROP_PORT: port to bind
     - INTEROP_SESSION_CREDENTIAL: session token for ingress auth
     - INTEROP_DEFAULT_ROUTE: optional route ID (defaults to the only route)
@@ -291,6 +292,12 @@ def create_app_from_env() -> FastAPI:
     backend_url = os.environ.get("INTEROP_BACKEND_URL", "http://127.0.0.1:11434")
     backend_type = os.environ.get("INTEROP_BACKEND_TYPE", "ollama")
     model = os.environ.get("INTEROP_MODEL", "qwen3-coder")
+    try:
+        ollama_num_ctx = int(os.environ.get("INTEROP_OLLAMA_NUM_CTX", "0"))
+    except ValueError as exc:
+        raise ValueError("INTEROP_OLLAMA_NUM_CTX must be a nonnegative integer") from exc
+    if ollama_num_ctx < 0:
+        raise ValueError("INTEROP_OLLAMA_NUM_CTX must be a nonnegative integer")
     port = int(os.environ.get("INTEROP_PORT", "8090"))
     session_credential = os.environ.get("INTEROP_SESSION_CREDENTIAL", "")
     default_route = os.environ.get("INTEROP_DEFAULT_ROUTE", "default")
@@ -336,6 +343,7 @@ def create_app_from_env() -> FastAPI:
                     kind=kind,
                     base_url=backend_url,
                     wire_protocol=wire_protocol,
+                    ollama_num_ctx=ollama_num_ctx,
                 ),
                 tool_mode=ToolMode.AUTO,
                 translation_mode=TranslationMode.CANONICAL,

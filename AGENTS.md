@@ -57,6 +57,7 @@ Local model
 | `--backend` | Backend type (`ollama`, `vllm`, `llamacpp`, `openai`, `anthropic`, `openai_compatible`). | `ollama` |
 | `--backend-url` | Backend server URL. | `http://127.0.0.1:11434` |
 | `--model` | Model name to use. | `qwen3-coder` |
+| `--ollama-num-ctx` | Requested Ollama context window for a managed launch (`0` keeps the server default). | `0` |
 | `--probe/--no-probe` | Probe backend on startup. | `True` |
 | `--log-level` | Log level (`debug`, `info`, `warn`, `error`). | `info` |
 | `--backend-timeout` | Backend request timeout (seconds). | `120.0` |

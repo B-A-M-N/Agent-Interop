@@ -113,6 +113,10 @@ class UpstreamConfig:
     static_headers: dict[str, str] = field(default_factory=dict)
     timeout_seconds: float = 120.0
     auth: dict[str, str] = field(default_factory=dict)
+    # Ollama's context allocation is request-scoped.  Keep this as an
+    # explicit route setting so a managed coding-agent launch does not get
+    # silently reset to the server's small default context by a probe.
+    ollama_num_ctx: int = 0
 
 
 @dataclass
@@ -502,6 +506,8 @@ def validate_config(config: InteropServerConfig) -> list[str]:
             issues.append(f"Route '{route_id}': upstream URL must start with http:// or https://")
         if route.upstream.timeout_seconds <= 0:
             issues.append(f"Route '{route_id}': timeout_seconds must be positive")
+        if route.upstream.ollama_num_ctx < 0:
+            issues.append(f"Route '{route_id}': ollama_num_ctx must be nonnegative")
 
         # Validate upstream kind/protocol combination
         supported_protocols = _supported_kind_protocol.get(route.upstream.kind, set())
@@ -730,6 +736,7 @@ def load_config_from_dict(data: dict[str, Any]) -> InteropServerConfig:
             static_headers=upstream_data.get("static_headers", {}),
             timeout_seconds=upstream_data.get("timeout_seconds", 120.0),
             auth=upstream_data.get("auth", {}),
+            ollama_num_ctx=upstream_data.get("ollama_num_ctx", 0),
         )
         repair_data = rd.get("repair", {})
         repair = RepairConfig(

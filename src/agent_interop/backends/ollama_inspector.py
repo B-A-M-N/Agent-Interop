@@ -120,10 +120,13 @@ class OllamaInspector:
         # Metadata says what Ollama believes a model advertises.  These probes
         # establish only transport acceptance/shape, never automatic tool
         # selection or task competence (those require qualification evidence).
+        probe_options: dict[str, Any] = {"temperature": 0}
+        if route.upstream.ollama_num_ctx:
+            probe_options["num_ctx"] = route.upstream.ollama_num_ctx
         probe_base = {
             "model": route.upstream_model,
             "stream": False,
-            "options": {"temperature": 0},
+            "options": probe_options,
         }
         synthetic_tool = {
             "type": "function",
@@ -156,6 +159,26 @@ class OllamaInspector:
                 "required": ["marker"],
             },
         })
+        # ``/api/ps`` sampled concurrently with the probes may describe the
+        # old default allocation.  Re-read it after the explicit-num_ctx
+        # probes so planning is based on the runtime this route will use.
+        if route.upstream.ollama_num_ctx:
+            running = await self._request(transport, route, "GET", "/api/ps")
+            loaded = next(
+                (item for item in running.get("models", []) if item.get("name") == route.upstream_model),
+                {},
+            )
+            configured_limit = _context_from_options(
+                loaded,
+                loaded.get("details", {}) if isinstance(loaded.get("details"), dict) else {},
+            )
+            # A successful context-configured probe establishes a route
+            # request constraint even when a backend omits it from /api/ps.
+            configured_limit = configured_limit or route.upstream.ollama_num_ctx
+            effective = min(
+                (limit for limit in (architecture_limit, configured_limit) if limit > 0),
+                default=architecture_limit or configured_limit,
+            )
         tool_calls = tool_payload.get("message", {}).get("tool_calls", [])
         return ModelRuntimeCapabilities(
             backend_kind=route.upstream.kind,

@@ -2577,7 +2577,19 @@ class Gateway:
             rendered.pop("tools", None)
             rendered.pop("tool_choice", None)
 
+        self._apply_route_runtime_options(rendered, route)
         return rendered
+
+    @staticmethod
+    def _apply_route_runtime_options(rendered: dict[str, Any], route: ModelRoute) -> None:
+        """Apply route-owned inference settings without overriding client controls."""
+        from agent_interop.config import UpstreamKind
+
+        if route.upstream.kind != UpstreamKind.OLLAMA or not route.upstream.ollama_num_ctx:
+            return
+        options = rendered.setdefault("options", {})
+        if isinstance(options, dict):
+            options.setdefault("num_ctx", route.upstream.ollama_num_ctx)
 
     def _inject_prompt_contract(self, rendered: dict[str, Any], contract: str) -> dict[str, Any]:
         """Inject the prompt contract into the system message."""

@@ -947,6 +947,10 @@ def run(
     ),
     model: str = typer.Option("qwen3-coder", "--model", "-m",
                                help="Model name to use for the agent"),
+    ollama_num_ctx: int = typer.Option(
+        0, "--ollama-num-ctx", min=0,
+        help="Requested Ollama context window for this launch (0 uses the server default)",
+    ),
     assume_protocol: str | None = typer.Option(
         None, "--assume-protocol",
         help=(
@@ -985,6 +989,7 @@ def run(
         ollama_url=backend_url,
         extra_args=extra_args or [],
         assume_protocol=assume_protocol,
+        ollama_num_ctx=ollama_num_ctx,
     )
     raise typer.Exit(exit_code)
 

@@ -135,6 +135,12 @@ def compute_extraction_confidence(
 _TOOL_CALL_RE = re.compile(r"<tool_call\b[^>]*>(.*?)</tool_call>", re.DOTALL | re.IGNORECASE)
 # Fallback for unclosed envelopes
 _TOOL_CALL_UNCLOSED_RE = re.compile(r"<tool_call\b[^>]*>(.*?)$", re.DOTALL | re.IGNORECASE)
+_TOOL_CALL_OPENING_RE = re.compile(r"<tool_call\b(?P<attributes>[^>]*)>", re.IGNORECASE)
+_XML_NAME_ATTRIBUTE_RE = re.compile(
+    r"\bname\s*=\s*(?:\"(?P<double>[^\"]*)\"|'(?P<single>[^']*)'|(?P<bare>[^\s>]+))",
+    re.IGNORECASE,
+)
+_XML_ARGUMENTS_ATTRIBUTE_RE = re.compile(r"\barguments\s*=\s*", re.IGNORECASE)
 # Matches fenced code blocks (```...``` or ~~~...~~~).  These
 # regions are excluded from tool-call extraction to avoid matching
 # example tool invocations in literal code.
@@ -308,8 +314,13 @@ class ToolCallEnvelopeExtractor:
 
                 raw_payload = match.group(1).strip()
 
-                # Extract name and arguments from the raw payload
+                # Extract name and arguments from the raw payload. Llama 3.2
+                # can put both on an otherwise-empty opening XML tag.
                 name, arguments = _extract_name_and_args_from_raw(raw_payload)
+                source_text = raw_payload
+                if not raw_payload and not name:
+                    name, arguments = _extract_name_and_args_from_tag_attributes(match.group(0))
+                    source_text = match.group(0)
 
                 if name and tool_names and name not in tool_names:
                     # Unknown tool — emit candidate anyway for rejection with diagnostics
@@ -318,7 +329,7 @@ class ToolCallEnvelopeExtractor:
                         raw_arguments=arguments if arguments is not None else raw_payload,
                         source_protocol="tool_call_envelope",
                         source_index=block_idx,
-                        source_text=raw_payload,
+                        source_text=source_text,
                         raw_name=name,
                         provenance=_make_provenance(
                             "model_output",
@@ -338,7 +349,7 @@ class ToolCallEnvelopeExtractor:
                         raw_arguments=arguments if arguments is not None else raw_payload,
                         source_protocol="tool_call_envelope",
                         source_index=block_idx,
-                        source_text=raw_payload,
+                        source_text=source_text,
                         raw_name=name,
                         provenance=_make_provenance(
                             "model_output",
@@ -418,6 +429,32 @@ def _extract_name_and_args_from_raw(raw_payload: str) -> tuple[str | None, Any]:
         return name, arguments_raw
 
     return name, raw_payload
+
+
+def _extract_name_and_args_from_tag_attributes(opening_tag: str) -> tuple[str | None, str | None]:
+    """Recover a complete call encoded on an empty ``<tool_call>`` tag."""
+    opening = _TOOL_CALL_OPENING_RE.match(opening_tag)
+    if opening is None:
+        return None, None
+    attributes = opening.group("attributes")
+    name_match = _XML_NAME_ATTRIBUTE_RE.search(attributes)
+    name = None
+    if name_match is not None:
+        name = next(
+            (value for value in name_match.group("double", "single", "bare") if value is not None),
+            None,
+        )
+    arguments_match = _XML_ARGUMENTS_ATTRIBUTE_RE.search(attributes)
+    if arguments_match is None:
+        return name, None
+
+    from agent_interop.parsing.json_scan import BalancedJsonScanner
+
+    trailing = attributes[arguments_match.end():].lstrip()
+    spans = BalancedJsonScanner().scan(trailing)
+    if spans and spans[0].start == 0:
+        return name, spans[0].text
+    return name, None
 
 
 # ─── Native structured candidate passthrough ───────────────────────────────

@@ -364,6 +364,24 @@ def test_envelope_extractor_malformed_arguments_trailing_comma():
     assert raw == '{"path":"x",}'
 
 
+def test_envelope_extractor_accepts_empty_xml_attribute_call_from_llama():
+    extractor = ToolCallEnvelopeExtractor()
+    workflow = _make_tool(
+        "Workflow",
+        {"type": "object", "properties": {"key": {"type": "string"}, "value": {"type": "string"}}},
+    )
+    result = extractor.extract(
+        [CanonicalTextBlock(
+            text='<tool_call name="Workflow" arguments={"key":"read_file","value":"/tmp/x"}></tool_call>',
+        )],
+        tools=[workflow],
+        envelope="tool_call",
+    )
+    assert len(result.candidates) == 1
+    assert result.candidates[0].name == "Workflow"
+    assert result.candidates[0].raw_arguments == '{"key":"read_file","value":"/tmp/x"}'
+
+
 def test_envelope_extractor_malformed_wrapper_valid_args():
     """Wrapper malformed but arguments recoverable."""
     extractor = ToolCallEnvelopeExtractor()
