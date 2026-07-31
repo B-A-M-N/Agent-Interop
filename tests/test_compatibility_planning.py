@@ -353,6 +353,22 @@ def test_gateway_replans_after_safe_context_adaptation() -> None:
     assert "[interop: compacted" in invocation.reconciled_request.messages[1].content[0].content
 
 
+def test_gateway_returns_structured_error_when_no_compatibility_path_exists() -> None:
+    route = _route(allow_direct=False, allow_adapted=False, allow_controlled=False)
+    gateway = Gateway(InteropServerConfig(
+        default_route_id="local", routes={"local": route}, probe_on_startup=False,
+    ))
+    request = CanonicalRequest(
+        model=CanonicalModelReference(requested_name="local"),
+        messages=[CanonicalMessage(role="user", content=[CanonicalTextBlock(text="read")])],
+        tools=[_tool("read_file", "read")],
+    )
+    response = asyncio.run(gateway.handle_request(request, RequestContext()))
+    assert response.error is not None
+    assert response.error.code == "REQUEST_PLAN_UNAVAILABLE"
+    assert response.error.details["path"] == "unavailable"
+
+
 def test_controller_calls_have_controller_provenance() -> None:
     call = CanonicalToolCallBlock(
         id="call_1", name="read_file", arguments={"path": "a.py"}

@@ -1462,14 +1462,8 @@ class Gateway:
             exec_record.finalize_cancelled()
             raise
         except Exception as exc:
-            from agent_interop.context_budget import ContextLimitExceededError
-
-            if isinstance(exc, ContextLimitExceededError):
-                error = CanonicalError(
-                    code=InteropErrorCode.CONTEXT_LIMIT_EXCEEDED,
-                    message="Request does not fit the model's effective context limit after safe adaptation",
-                    details=exc.details(),
-                )
+            error = self._preflight_error(exc)
+            if error is not None:
                 result = CanonicalResponse(error=error)
                 exec_record.finalize_response(result)
                 return result
@@ -1480,6 +1474,31 @@ class Gateway:
     def diagnostic_case(self, case_id: str) -> Any:
         """Retrieve an in-memory sanitized diagnostic case by ID."""
         return self._diagnostic_cases.get(case_id)
+
+    @staticmethod
+    def _preflight_error(exc: Exception) -> CanonicalError | None:
+        """Translate known planning preflight failures to canonical errors."""
+        from agent_interop.context_budget import ContextLimitExceededError
+
+        if isinstance(exc, ContextLimitExceededError):
+            return CanonicalError(
+                code=InteropErrorCode.CONTEXT_LIMIT_EXCEEDED,
+                message="Request does not fit the model's effective context limit after safe adaptation",
+                details=exc.details(),
+            )
+        message = str(exc)
+        if message.startswith("REQUEST_PLAN_UNAVAILABLE:"):
+            return CanonicalError(
+                code=InteropErrorCode.REQUEST_PLAN_UNAVAILABLE,
+                message="No direct, adapted, or controller path can satisfy this request",
+                details={
+                    "path": "unavailable",
+                    "responsible": "model_or_controller",
+                    "reason": message.removeprefix("REQUEST_PLAN_UNAVAILABLE:").strip(),
+                    "next": "configure a qualified controller or select a compatible route",
+                },
+            )
+        return None
 
     def _capture_diagnostic_case(
         self,
@@ -2731,15 +2750,8 @@ class Gateway:
             exec_record.finalize_cancelled()
             raise
         except Exception as exc:
-            from agent_interop.context_budget import ContextLimitExceededError
-
-            if isinstance(exc, ContextLimitExceededError):
-                exc_err = CanonicalError(
-                    code=InteropErrorCode.CONTEXT_LIMIT_EXCEEDED,
-                    message="Request does not fit the model's effective context limit after safe adaptation",
-                    details=exc.details(),
-                )
-            else:
+            exc_err = self._preflight_error(exc)
+            if exc_err is None:
                 exc_err = CanonicalError(code="STREAM_ERROR", message=str(exc)) if not isinstance(exc, CanonicalError) else exc
             exec_record.finalize_error(exc_err)
             yield CanonicalEvent(type="error", error=exc_err)
