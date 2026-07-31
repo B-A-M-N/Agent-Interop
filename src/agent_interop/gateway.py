@@ -1758,7 +1758,7 @@ class Gateway:
             missing_controller_result_ids,
         )
         from agent_interop.controller.prompts import CONTROLLER_SYSTEM_PROMPT
-        from agent_interop.controller.types import ControllerSessionState
+        from agent_interop.controller.types import ControllerAction, ControllerSessionState
 
         effective_controller = invocation.route.controller or self.config.controller
         controller_route = await self._select_controller_route(
@@ -1847,10 +1847,7 @@ class Gateway:
         # output is untrusted advisory text to the controller.  A controller
         # may request a focused refinement through one private tool; Interop
         # consumes that request and never returns it to the coding client.
-        from agent_interop.controller.policy import (
-            CONTROLLER_DELEGATE_TOOL_NAME,
-            primary_delegation_prompt,
-        )
+        from agent_interop.controller import CompatibilityController
 
         primary_turns = prior_state.primary_turn_count if prior_state else 0
         controller_turns = prior_state.controller_turn_count if prior_state else 0
@@ -1961,32 +1958,24 @@ class Gateway:
                 return response
             controller_turns += 1
 
-            raw_calls = tuple(
-                block for block in response.content if isinstance(block, CanonicalToolCallBlock)
-            )
-            delegation_calls = tuple(
-                call for call in raw_calls if call.name == CONTROLLER_DELEGATE_TOOL_NAME
-            )
-            if delegation_calls:
-                # A delegation is control flow, not a client-visible parallel
-                # tool batch. Mixing it with a real tool call is ambiguous and
-                # fails closed instead of granting an unintended action.
-                if len(delegation_calls) != 1 or len(raw_calls) != 1:
-                    return loop_error(
-                        "Controller mixed a primary-refinement request with client tool calls",
-                        responsible="controller",
-                    )
-                refinement_prompt = primary_delegation_prompt(delegation_calls[0])
-                if refinement_prompt is None:
-                    return loop_error(
-                        "Controller emitted an invalid primary-refinement request",
-                        responsible="controller",
-                    )
+            decision = CompatibilityController().decide(response.content)
+            if decision.action == ControllerAction.FAIL:
+                diagnostic = decision.diagnostics[0] if decision.diagnostics else "invalid_controller_decision"
+                message = (
+                    "Controller mixed a primary-refinement request with client tool calls"
+                    if diagnostic == "mixed_private_delegation_and_client_calls"
+                    else "Controller emitted an invalid primary-refinement request"
+                )
+                return loop_error(message, responsible="controller")
+            if decision.action == ControllerAction.DELEGATE_PRIMARY:
                 exec_record.record_compatibility_event("controller_delegated_primary")
                 # The next loop iteration performs exactly one additional
                 # worker turn and one controller decision, with both budgets
                 # checked before dispatch.
+                refinement_prompt = decision.primary_prompt
                 continue
+
+            raw_calls = decision.tool_calls
 
             # The controller used ``auto`` internally so it could request
             # worker refinement even for a client named-tool request. Before

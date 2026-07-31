@@ -433,6 +433,19 @@ def test_private_controller_delegation_requires_one_bounded_prompt() -> None:
     )) is None
 
 
+def test_controller_decision_keeps_private_delegation_out_of_client_tool_calls() -> None:
+    controller = CompatibilityController()
+    delegation = CanonicalToolCallBlock(
+        id="internal", name=CONTROLLER_DELEGATE_TOOL_NAME,
+        arguments={"prompt": "Inspect the error before choosing a client tool."},
+    )
+    decision = controller.decide([delegation])
+    assert decision.action is ControllerAction.DELEGATE_PRIMARY
+    assert decision.primary_prompt.startswith("Inspect the error")
+    mixed = controller.decide([delegation, CanonicalToolCallBlock(name="read_file")])
+    assert mixed.action is ControllerAction.FAIL
+
+
 def test_bootstrap_qualifier_uses_only_bounded_synthetic_probes() -> None:
     async def execute(probe) -> bool:
         assert probe.name in {
