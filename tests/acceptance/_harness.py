@@ -31,13 +31,15 @@ instead of a hand-built argv once this harness was first run for real.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from agent_interop.build_info import get_build_info
 from agent_interop.transport.http import (
     PreparedUpstreamRequest,
     UpstreamResponse,
@@ -152,6 +154,13 @@ def write_acceptance_result(
     passed: bool,
     scenario: str,
     detail: str = "",
+    argv: list[str] | None = None,
+    configuration_strategy: str = "",
+    protocol: str = "",
+    compatibility_path: str = "not_observed",
+    controller_used: bool = False,
+    model_digest: str = "",
+    verification: dict[str, bool] | None = None,
 ) -> Path:
     """Write acceptance/results/<client>-<version>.json.
 
@@ -159,8 +168,6 @@ def write_acceptance_result(
     grounds for a "release-tested" claim in README.md — see that script
     and RELEASE.md's "Alpha vs. supported release track" section.
     """
-    import datetime
-
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     record = {
         "client": client,
@@ -169,6 +176,23 @@ def write_acceptance_result(
         "scenario": scenario,
         "passed": passed,
         "detail": detail,
+        # Required acceptance provenance. A false check is intentionally more
+        # useful than a missing field: it prevents a single read-only smoke
+        # test from being presented as an edit/recovery certification.
+        "argv": list(argv or ()),
+        "configuration_strategy": configuration_strategy,
+        "protocol": protocol,
+        "build": asdict(get_build_info()),
+        "compatibility_path": compatibility_path,
+        "controller_used": controller_used,
+        "model_digest": model_digest,
+        "verification": {
+            "read_test": bool((verification or {}).get("read_test", False)),
+            "edit_test": bool((verification or {}).get("edit_test", False)),
+            "tool_error_recovery": bool((verification or {}).get("tool_error_recovery", False)),
+            "multi_turn_continuation": bool((verification or {}).get("multi_turn_continuation", False)),
+            "cleanup_verification": bool((verification or {}).get("cleanup_verification", False)),
+        },
     }
     slug = "".join(c if c.isalnum() else "-" for c in client.lower()).strip("-")
     out_path = RESULTS_DIR / f"{slug}-{client_version}.json"

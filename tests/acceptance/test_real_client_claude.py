@@ -151,6 +151,12 @@ def test_claude_code_real_binary_completes_one_tool_round_trip(tmp_path):
             passed=passed,
             scenario="single_tool_round_trip",
             detail=proc.stdout if passed else f"stdout={proc.stdout!r} stderr={proc.stderr!r}",
+            argv=cmd,
+            configuration_strategy=ClaudeCodeIntegration().descriptor.integration_strategy,
+            protocol=launch_spec.protocol.value if launch_spec.protocol else "",
+            compatibility_path="adapted",
+            model_digest="acceptance-test-model",
+            verification={"read_test": passed, "multi_turn_continuation": passed},
         )
         assert passed, f"claude binary did not complete the round trip: {proc.stdout!r} / {proc.stderr!r}"
         assert len(transport.calls) >= 2, "expected at least 2 upstream calls (tool call + follow-up)"
