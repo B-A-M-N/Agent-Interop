@@ -1661,29 +1661,18 @@ class Gateway:
         execution remains with the client; controller-generated calls are
         explicitly provenance-labelled before leaving Interop.
         """
-        from agent_interop.controller.companion import ControllerRegistry
         from agent_interop.controller.policy import mark_controller_provenance
         from agent_interop.controller.prompts import CONTROLLER_SYSTEM_PROMPT
         from agent_interop.controller.types import ControllerSessionState
 
-        controller_route = ControllerRegistry().select(self.config, invocation.route)
-        if controller_route is None or controller_route.id == invocation.route.id:
-            return CanonicalResponse(
-                model=CanonicalModelReference(
-                    requested_name=invocation.reconciled_request.model.requested_name,
-                    resolved_name=invocation.route.upstream_model,
-                ),
-                error=CanonicalError(
-                    code=InteropErrorCode.CONTROLLER_UNAVAILABLE,
-                    message="No distinct configured controller route is available",
-                    details={"path": "controlled", "responsible": "controller"},
-                ),
-            )
         effective_controller = invocation.route.controller or self.config.controller
-        if (
-            effective_controller.require_verified
-            and not await self._controller_route_is_qualified(controller_route, effective_controller.minimum_controller_level)
-        ):
+        controller_route = await self._select_controller_route(
+            invocation.route, effective_controller,
+        )
+        if controller_route is None:
+            from agent_interop.controller.companion import ControllerRegistry
+
+            candidates = ControllerRegistry().candidates(self.config, invocation.route)
             return CanonicalResponse(
                 model=CanonicalModelReference(
                     requested_name=invocation.reconciled_request.model.requested_name,
@@ -1691,12 +1680,15 @@ class Gateway:
                 ),
                 error=CanonicalError(
                     code=InteropErrorCode.CONTROLLER_UNAVAILABLE,
-                    message="Configured controller has not passed the required qualification level",
+                    message=(
+                        "No configured controller route has passed the required qualification level"
+                        if candidates else "No distinct configured controller route is available"
+                    ),
                     details={
                         "path": "controlled",
                         "responsible": "controller",
                         "minimum_controller_level": effective_controller.minimum_controller_level,
-                        "next": "run interop qualify for the controller route",
+                        "next": "run interop qualify for a controller route" if candidates else "configure_controller_route",
                     },
                 ),
             )
@@ -1795,6 +1787,26 @@ class Gateway:
             controller_turn_count=(prior_state.controller_turn_count + 1) if prior_state else 1,
         ))
         return replace(response, content=list(calls))
+
+    async def _select_controller_route(self, primary_route: ModelRoute, config: Any) -> ModelRoute | None:
+        """Select an explicitly configured or verified installed controller."""
+        from agent_interop.controller.companion import ControllerRegistry
+
+        if not config.enabled:
+            return None
+        registry = ControllerRegistry()
+        candidates = registry.candidates(self.config, primary_route)
+        explicit_id = config.route_id
+        for candidate in candidates:
+            is_explicit = bool(explicit_id and candidate.id == explicit_id)
+            # Automatic selection must never promote an arbitrary installed
+            # route. Explicit legacy configuration may still opt out of the
+            # qualification gate for backwards compatibility.
+            if await self._controller_route_is_qualified(candidate, config.minimum_controller_level):
+                return candidate
+            if is_explicit and not config.require_verified:
+                return candidate
+        return None
 
     async def _controller_route_is_qualified(self, route: ModelRoute, minimum_level: str) -> bool:
         """Check a controller against the bounded bootstrap qualification state."""

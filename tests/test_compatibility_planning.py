@@ -198,6 +198,30 @@ def test_qualified_chat_only_model_selects_controller_path() -> None:
     assert plan.attempts[0].kind == AttemptKind.CONTROLLER_MEDIATED
 
 
+def test_auto_controller_selection_uses_a_verified_distinct_route() -> None:
+    primary = _route()
+    first = _route()
+    first.id, first.client_model_aliases, first.upstream_model = "first", ["first"], "first-model"
+    verified = _route()
+    verified.id, verified.client_model_aliases, verified.upstream_model = "verified", ["verified"], "verified-model"
+    gateway = Gateway(InteropServerConfig(
+        default_route_id="local",
+        routes={"local": primary, "first": first, "verified": verified},
+        controller=ControllerConfig(auto_select_route=True, require_verified=True),
+        probe_on_startup=False,
+    ))
+    gateway.record_qualification(QualificationRecord(
+        model_digest="verified-model",
+        state=QualificationState.SEQUENTIAL_AGENT,
+        prompted_forced_tool=True,
+        continuation=True,
+    ))
+    selected = asyncio.run(gateway._select_controller_route(
+        primary, gateway.config.controller,
+    ))
+    assert selected is verified
+
+
 def test_context_plan_preserves_current_tool_result_and_latest_message() -> None:
     request = CanonicalRequest(
         messages=[

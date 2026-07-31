@@ -70,7 +70,12 @@ class RequestCompatibilityPlanner:
                 use_controller=True,
                 reason="fallback_after_direct_or_adapted_attempts",
             )
-            if allow.allow_controlled and route.controller is not None and route.controller.enabled and route.controller.route_id
+            if (
+                allow.allow_controlled
+                and route.controller is not None
+                and route.controller.enabled
+                and (route.controller.route_id or route.controller.auto_select_route)
+            )
             else None
         )
         attempts: tuple[CompatibilityAttempt, ...]
