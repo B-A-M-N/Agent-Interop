@@ -704,7 +704,7 @@ class Gateway:
         execution: InteropRequestExecution,
         store: EvidenceStore,
     ) -> None:
-        key = invocation.compatibility_key
+        key = self._selected_evidence_key(invocation, execution)
         if key is None:
             return
 
@@ -1476,6 +1476,28 @@ class Gateway:
         return self._diagnostic_cases.get(case_id)
 
     @staticmethod
+    def _selected_evidence_key(
+        invocation: ResolvedInvocation,
+        execution: InteropRequestExecution,
+    ) -> Any:
+        """Use an enriched key only when a controller actually selected it."""
+        original = invocation.compatibility_key
+        selected = execution.compatibility_key
+        if selected is None or original is None:
+            return selected or original
+        controller_dimensions = (
+            "controller_model_id",
+            "controller_model_digest",
+            "controller_profile_revision",
+        )
+        if any(
+            getattr(selected, field, "") != getattr(original, field, "")
+            for field in controller_dimensions
+        ):
+            return selected
+        return original
+
+    @staticmethod
     def _preflight_error(exc: Exception) -> CanonicalError | None:
         """Translate known planning preflight failures to canonical errors."""
         from agent_interop.context_budget import ContextLimitExceededError
@@ -1565,7 +1587,7 @@ class Gateway:
             canonical_request=canonical,
             upstream_request={"route": invocation.route.id, "model": invocation.route.upstream_model},
             tool_registry=invocation.reconciled_request.tools,
-            compatibility_key=invocation.compatibility_key,
+            compatibility_key=self._selected_evidence_key(invocation, execution),
             diagnostics=diagnostics,
         )
         execution.diagnostic_case_id = case.case_id
@@ -1715,6 +1737,21 @@ class Gateway:
                         "next": "run interop qualify for a controller route" if candidates else "configure_controller_route",
                     },
                 ),
+            )
+
+        # Controller-mediated observations must identify the actual served
+        # controller, not merely the primary request's route.  These fields
+        # are part of the immutable evidence key and isolate controller
+        # upgrades, profile changes, and tag repoints.
+        controller_runtime = await self._inspect_model_runtime(controller_route)
+        controller_metadata = self._backend_metadata_from_runtime(controller_runtime)
+        controller_profile = self._resolve_profile(controller_route, controller_metadata)
+        if exec_record.compatibility_key is not None:
+            exec_record.compatibility_key = replace(
+                exec_record.compatibility_key,
+                controller_model_id=controller_route.upstream_model,
+                controller_model_digest=controller_runtime.model_digest,
+                controller_profile_revision=getattr(controller_profile, "profile_revision", ""),
             )
 
         session_id = invocation.request_context.session_id

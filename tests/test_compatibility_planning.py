@@ -59,7 +59,7 @@ from agent_interop.qualification.store import QualificationStore
 from agent_interop.repair.invocation import build_invocation_plan
 from agent_interop.replay.capture import sanitize_body
 from agent_interop.replay.store import DiagnosticCaseStore
-from agent_interop.replay.types import ReplayCase
+from agent_interop.replay.types import CompatibilityKey, ReplayCase
 from agent_interop.tool_surface import ToolSurfacePlanner
 from agent_interop.upstreams.codec import CodecCapabilities
 
@@ -243,6 +243,19 @@ def test_auto_controller_selection_uses_a_verified_distinct_route() -> None:
         primary, gateway.config.controller,
     ))
     assert selected is verified
+
+
+def test_controller_evidence_key_isolated_from_primary_tuple() -> None:
+    primary = CompatibilityKey(compatibility_path="controlled", controller_model_id="controller-route")
+    selected = CompatibilityKey(
+        compatibility_path="controlled",
+        controller_model_id="controller-model",
+        controller_model_digest="sha256:controller",
+        controller_profile_revision="2",
+    )
+    execution = InteropRequestExecution(compatibility_key=selected)
+    invocation = SimpleNamespace(compatibility_key=primary)
+    assert Gateway._selected_evidence_key(invocation, execution) == selected
 
 
 def test_context_plan_preserves_current_tool_result_and_latest_message() -> None:
