@@ -88,9 +88,12 @@ Interop/
 │       ├── request_validation.py
 │       ├── agents/             # Agent-specific adapters (claude_code, codex)
 │       ├── backends/           # Ollama admin/shim helpers (routing lives in upstreams/ + model/registry.py)
+│       ├── context_budget/     # Runtime-aware token estimation and compaction planning
+│       ├── controller/         # Compatibility-controller contracts and bounded state
 │       ├── compatibility_packs/ # Per-agent compatibility shims
 │       ├── data/profiles/      # Single source of truth for model profiles (YAML)
 │       ├── evidence/           # Evidence store for conformance tracking
+│       ├── execution_attempts/ # Bounded direct/adapted/controller fallback ladder
 │       ├── history/            # History ledger and reconciliation
 │       ├── mcp/                # MCP diagnostics and schemas
 │       ├── model/              # Model profile registry and rendering
@@ -99,6 +102,7 @@ Interop/
 │       │   └── registry.py     # Profile resolution registry
 │       ├── parsing/            # JSON scanning and parsing utilities
 │       ├── plugin/             # Plugin system for extensibility
+│       ├── planning/           # Direct/adapted/controlled request compatibility planning
 │       ├── protocols/          # Client protocol adapters
 │       │   ├── anthropic_messages.py
 │       │   ├── base.py
@@ -106,6 +110,7 @@ Interop/
 │       │   ├── openai_responses.py
 │       │   └── registry.py
 │       ├── repair/             # Schema validation and repair pipeline
+│       ├── qualification/      # Side-effect-free bootstrap model qualification
 │       ├── replay/             # Request replay and comparison
 │       ├── schemas/            # JSON schemas
 │       ├── server/             # FastAPI server for the gateway
@@ -117,6 +122,7 @@ Interop/
 │       │   ├── fake_upstream.py
 │       │   └── runner.py       # RealConformanceRunner + the real 12-test battery
 │       ├── tool/               # Tool-call normalization
+│       ├── tool_surface/       # Deterministic model-visible tool selection
 │       ├── transport/          # HTTP, NDJSON, SSE transport
 │       └── upstreams/          # Upstream codec interfaces (routing/backend resolution lives here)
 │           ├── anthropic.py
@@ -139,9 +145,13 @@ Interop/
 | **Model Profiles** (`model/profiles_v2.py`, `data/profiles/`) | Declarative YAML definitions for supported models. `data/profiles/` is the single source of truth. |
 | **Protocol Adapters** (`protocols/`) | Client protocol adapters for Anthropic Messages, OpenAI Chat, and OpenAI Responses. |
 | **Upstream Codecs / Backend Adapters** (`upstreams/`) | Per-backend codecs (Ollama, vLLM, llama.cpp, OpenAI-compatible, Anthropic) that render requests and decode responses, preserving raw tool-call arguments; `backends/` itself only holds Ollama shim/admin helpers now. |
+| **Compatibility Planning** (`planning/`, `context_budget/`, `tool_surface/`) | Builds direct/adapted/controlled path candidates from client requirements, live runtime facts, bootstrap qualification evidence, context capacity, and deterministic tool visibility. |
+| **Runtime Inspection** (`backends/`) | Backend inspectors collect model digest, template, context allocation, and capability states without treating codec support as model proof. |
+| **Embeddable Runtime** (`plugin/runtime.py`) | `InteropRuntime` exposes the gateway's inspect, plan, generate, stream, qualify, explain, and replay operations for in-process integrations. |
+| **Diagnostics & Replay** (`replay/`, `paths.py`) | Failed/repaired requests can retain bounded, recursively-sanitized replay metadata in memory or schema-v2 durable state, retrievable by case ID. |
 | **Tool-Call Extraction** (`extraction.py`, `parsing/`) | Extracts tool calls from model output (Hermes, Qwen, Mistral, etc.). |
 | **Validation & Repair** (`repair/`) | Schema validation and bounded repair of malformed tool calls. |
-| **Conformance Tests** (`testing/`) | Verifies that a model/profile combination meets cumulative capability requirements (L0-L4). |
+| **Conformance Tests** (`testing/`) | Keeps the direct-model L0-L4 battery and adds bounded path suites (`testing/suites.py`) for adapted, controller, primary-worker, and client-contract validation. |
 | **Transport** (`transport/`) | HTTP, NDJSON, and SSE transport layer. |
 | **Streaming** (`streaming/`) | Streaming coordinator for multi-protocol streaming responses. |
 

@@ -428,6 +428,7 @@ class CanonicalToolCallBlock:
     raw_arguments: str | dict[str, Any] | list[Any] | None = None
     arguments_validated: bool = True
     provider_metadata: ProviderMetadata | None = None
+    provenance: ToolCallProvenance = field(default_factory=ToolCallProvenance)
 
 
 @dataclass
@@ -597,6 +598,10 @@ class RequestedCapabilities:
     reasoning: bool = False
     images: bool = False
     structured_output: bool = False
+    tool_result_continuation: bool = False
+    sequential_tools: bool = False
+    exact_named_tool: bool = False
+    client_managed_execution: bool = True
 
 
 @dataclass
@@ -905,6 +910,10 @@ def abi_json_schema() -> dict[str, Any]:
                     "reasoning": {"type": "boolean"},
                     "images": {"type": "boolean"},
                     "structuredOutput": {"type": "boolean"},
+                    "toolResultContinuation": {"type": "boolean"},
+                    "sequentialTools": {"type": "boolean"},
+                    "exactNamedTool": {"type": "boolean"},
+                    "clientManagedExecution": {"type": "boolean"},
                 },
             },
         },

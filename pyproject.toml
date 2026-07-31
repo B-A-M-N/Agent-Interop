@@ -59,6 +59,16 @@ dev = [
 [project.scripts]
 interop = "agent_interop.cli:app"
 
+[project.entry-points."agent_interop.backends"]
+
+[project.entry-points."agent_interop.agents"]
+
+[project.entry-points."agent_interop.tool_selectors"]
+
+[project.entry-points."agent_interop.controllers"]
+
+[project.entry-points."agent_interop.tokenizers"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

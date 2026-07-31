@@ -48,6 +48,25 @@ class CompatibilityKey:
     template_revision: str = ""
     backend_serving_config: str = ""
 
+    # Compatibility-planning identity. Evidence from one path/tool surface
+    # must never be reused for another merely because model/profile match.
+    interop_build_commit: str = ""
+    interop_build_dirty: bool | None = None
+    planner_revision: str = ""
+    runtime_context_tokens: int = 0
+    runtime_capability_digest: str = ""
+    compatibility_path: str = ""
+    attempt_kind: str = ""
+    controller_model_id: str = ""
+    controller_model_digest: str = ""
+    controller_profile_revision: str = ""
+    tool_surface_mode: str = ""
+    visible_tool_fingerprint: str = ""
+    tool_selector_revision: str = ""
+    context_strategy: str = ""
+    context_plan_revision: str = ""
+    streaming_policy: str = ""
+
 
 @dataclass(frozen=True)
 class CompatibilityQuirk:
@@ -163,6 +182,7 @@ class ReplayCase:
 
     tool_registry: tuple[CanonicalTool, ...] = ()
     expected_invariants: tuple[ReplayInvariant, ...] = ()
+    diagnostics: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

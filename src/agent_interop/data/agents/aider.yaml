@@ -1,0 +1,8 @@
+schema_version: interop.agent-integration.v1
+id: aider
+binaries: [aider]
+protocols: [openai_chat]
+preferred_protocol: openai_chat
+version: {command: [aider, --version]}
+launch: {strategy: environment}
+requirements: {tool_result_continuation: true}

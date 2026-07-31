@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,8 +29,226 @@ app = typer.Typer(
     help="Agent Compatibility Gateway — protocol translation for local LLM coding agents.",
     no_args_is_help=True,
 )
+agents_app = typer.Typer(help="Inspect installed coding-agent integrations.")
+app.add_typer(agents_app, name="agents")
+inspect_app = typer.Typer(help="Inspect configured models and runtime facts.")
+app.add_typer(inspect_app, name="inspect")
+controller_app = typer.Typer(help="Inspect compatibility-controller configuration.")
+app.add_typer(controller_app, name="controller")
 
 console = Console()
+
+
+def _gateway_from_config_path(path: str):
+    """Load a gateway for offline planning or bounded runtime inspection."""
+    import yaml
+
+    from agent_interop.config import load_config_from_dict
+    from agent_interop.gateway import Gateway
+
+    try:
+        data = yaml.safe_load(Path(path).read_text())
+    except FileNotFoundError:
+        console.print(f"[red]Configuration file not found:[/] {path}")
+        raise typer.Exit(1)
+    except yaml.YAMLError as exc:
+        console.print(f"[red]Invalid configuration:[/] {exc}")
+        raise typer.Exit(1)
+    if not isinstance(data, dict):
+        console.print("[red]Configuration must be a mapping.[/]")
+        raise typer.Exit(1)
+    return Gateway(load_config_from_dict(data))
+
+
+def _canonical_request_from_json(value: dict[str, Any]):
+    """Read the documented compact canonical request JSON for ``explain``."""
+    from agent_interop.abi import (
+        CanonicalMessage,
+        CanonicalModelReference,
+        CanonicalRequest,
+        CanonicalTextBlock,
+        CanonicalTool,
+        CanonicalToolChoice,
+    )
+
+    raw_model = value.get("model", "")
+    model = CanonicalModelReference(
+        requested_name=raw_model if isinstance(raw_model, str) else raw_model.get("requested_name", ""),
+    )
+    messages = []
+    for raw_message in value.get("messages", []):
+        content = raw_message.get("content", "")
+        if isinstance(content, list):
+            blocks = [CanonicalTextBlock(text=str(item.get("text", item))) if isinstance(item, dict)
+                      else CanonicalTextBlock(text=str(item)) for item in content]
+        else:
+            blocks = [CanonicalTextBlock(text=str(content))]
+        messages.append(CanonicalMessage(role=raw_message.get("role", "user"), content=blocks))
+    tools = []
+    for raw_tool in value.get("tools", []):
+        function = raw_tool.get("function", raw_tool)
+        tools.append(CanonicalTool(
+            name=function.get("name", ""),
+            description=function.get("description", ""),
+            input_schema=function.get("parameters", function.get("input_schema", {"type": "object"})),
+        ))
+    choice = value.get("tool_choice", "auto")
+    if isinstance(choice, dict) and choice.get("name"):
+        tool_choice = CanonicalToolChoice.named(choice["name"])
+    elif choice == "required":
+        tool_choice = CanonicalToolChoice.required()
+    elif choice == "none":
+        tool_choice = CanonicalToolChoice.none()
+    else:
+        tool_choice = CanonicalToolChoice.auto()
+    return CanonicalRequest(model=model, messages=messages, tools=tools, tool_choice=tool_choice)
+
+
+@inspect_app.command("model")
+def inspect_model(
+    model: str = typer.Argument(help="Configured route ID or model alias"),
+    path: str = typer.Option("./interop.yaml", "--path", "-p", help="Configuration path"),
+) -> None:
+    """Inspect bounded runtime metadata for one configured model."""
+    import asyncio
+    from dataclasses import asdict
+
+    gateway = _gateway_from_config_path(path)
+    from agent_interop.abi import CanonicalModelReference, CanonicalRequest
+
+    route = gateway._resolve_route(CanonicalRequest(model=CanonicalModelReference(requested_name=model)))
+    runtime = asyncio.run(gateway._inspect_model_runtime(route))
+    console.print_json(json.dumps(asdict(runtime), default=str, sort_keys=True))
+
+
+@app.command()
+def explain(
+    request: str = typer.Option(..., "--request", help="Canonical request JSON file"),
+    path: str = typer.Option("./interop.yaml", "--path", "-p", help="Configuration path"),
+) -> None:
+    """Show a compatibility plan without submitting an inference request."""
+    import asyncio
+
+    try:
+        request_data = json.loads(Path(request).read_text())
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        console.print(f"[red]Cannot read request:[/] {exc}")
+        raise typer.Exit(1)
+    if not isinstance(request_data, dict):
+        console.print("[red]Request JSON must be an object.[/]")
+        raise typer.Exit(1)
+    canonical = _canonical_request_from_json(request_data)
+    gateway = _gateway_from_config_path(path)
+    from agent_interop.context import RequestContext
+    from agent_interop.execution import InteropRequestExecution
+
+    context = RequestContext()
+    invocation = asyncio.run(gateway._prepare_invocation_async(
+        canonical, context, streaming=canonical.generation.stream,
+        execution=InteropRequestExecution(context=context), inspect_runtime=False,
+    ))
+    plan = invocation.compatibility_plan
+    console.print(f"[bold]Selected path:[/] {plan.path.value}")
+    console.print(f"Tool surface: {len(plan.tool_surface_plan.validation_tools)} → {len(plan.tool_surface_plan.visible_tools)}")
+    console.print(f"Context strategy: {plan.context_plan.selected_strategy}")
+    console.print(f"Attempts: {', '.join(item.kind.value for item in plan.attempts)}")
+    if plan.missing_capabilities:
+        console.print(f"Missing capability evidence: {', '.join(plan.missing_capabilities)}")
+
+
+@app.command()
+def qualify(
+    model: str = typer.Argument(help="Configured route ID or model alias"),
+    path: str = typer.Option("./interop.yaml", "--path", "-p", help="Configuration path"),
+) -> None:
+    """Run the bounded, side-effect-free bootstrap qualification battery."""
+    import asyncio
+
+    from agent_interop.plugin import InteropRuntime
+
+    async def run_qualification() -> Any:
+        runtime = InteropRuntime()
+        gateway = _gateway_from_config_path(path)
+        try:
+            await runtime.start(gateway.config)
+            return await runtime.qualify(model)
+        finally:
+            await runtime.close()
+
+    record = asyncio.run(run_qualification())
+    console.print(f"Model digest: {record.model_digest}")
+    console.print(f"Qualification: {record.state.value}")
+    console.print(f"Native forced tool: {record.native_forced_tool}")
+    console.print(f"Prompted forced tool: {record.prompted_forced_tool}")
+    console.print(f"Tool-result continuation: {record.continuation}")
+
+
+@controller_app.command("status")
+def controller_status(
+    path: str = typer.Option("./interop.yaml", "--path", "-p", help="Configuration path"),
+) -> None:
+    """Show whether a compatibility-controller route is configured."""
+    gateway = _gateway_from_config_path(path)
+    controller = gateway.config.controller
+    console.print(f"Enabled: {controller.enabled}")
+    console.print(f"Route: {controller.route_id or 'not configured'}")
+    console.print(f"Minimum level: {controller.minimum_controller_level}")
+
+
+@agents_app.command("list")
+def agents_list() -> None:
+    """List each registered integration once, including manifest aliases."""
+    from agent_interop.agents.registry import list_agent_integrations
+
+    table = Table(title="Agent Integrations")
+    table.add_column("ID", style="cyan")
+    table.add_column("Aliases")
+    table.add_column("Protocol")
+    table.add_column("Strategy")
+    for integration in list_agent_integrations():
+        descriptor = integration.descriptor
+        table.add_row(
+            descriptor.canonical_id,
+            ", ".join(descriptor.aliases) or "—",
+            descriptor.preferred_protocol.value if descriptor.preferred_protocol else "—",
+            descriptor.integration_strategy,
+        )
+    console.print(table)
+
+
+@agents_app.command("inspect")
+def agents_inspect(agent: str = typer.Argument(help="Canonical ID or registered alias")) -> None:
+    """Show the integration contract required by an agent."""
+    from agent_interop.agents.registry import get_agent_descriptor
+
+    descriptor = get_agent_descriptor(agent)
+    if descriptor is None:
+        console.print(f"[red]Unknown agent integration:[/] {agent}")
+        raise typer.Exit(1)
+    console.print(f"[bold]{descriptor.display_name or descriptor.canonical_id}[/]")
+    console.print(f"  ID: {descriptor.canonical_id}")
+    console.print(f"  Aliases: {', '.join(descriptor.aliases) or '—'}")
+    console.print(f"  Protocols: {', '.join(item.value for item in descriptor.protocols) or '—'}")
+    console.print(f"  Strategy: {descriptor.integration_strategy}")
+    requirements = descriptor.required_capabilities
+    console.print(f"  Tool-result continuation: {requirements.requires_tool_result_continuation}")
+    console.print(f"  Stable tool IDs: {requirements.requires_stable_tool_ids}")
+
+
+@agents_app.command("test")
+def agents_test(agent: str = typer.Argument(help="Canonical ID or registered alias")) -> None:
+    """Check whether an integration binary is discoverable on this host."""
+    from agent_interop.agents.registry import get_agent_integration
+
+    integration = get_agent_integration(agent)
+    if integration is None:
+        console.print(f"[red]Unknown agent integration:[/] {agent}")
+        raise typer.Exit(1)
+    installation = integration.discover()
+    if not installation.found:
+        console.print(f"[yellow]Not installed:[/] {integration.descriptor.canonical_id}")
+        raise typer.Exit(1)
+    console.print(f"[green]✓[/] {integration.descriptor.canonical_id}: {installation.path}")
 
 
 def _systemd_quote(arg: str) -> str:
@@ -450,6 +669,13 @@ def test(
             "production traffic actually runs)."
         ),
     ),
+    suite: str = typer.Option(
+        "direct", "--suite", help="Conformance path: direct, adapted, controller, primary_worker, client_contract",
+    ),
+    test_timeout: float = typer.Option(120.0, "--test-timeout", help="Per-test timeout in seconds"),
+    suite_timeout: float = typer.Option(900.0, "--suite-timeout", help="Whole-suite timeout in seconds"),
+    max_turns: int = typer.Option(0, "--max-turns", help="Optional maximum turns per test"),
+    result_json: str = typer.Option("", "--result-json", help="Atomically write suite status JSON here"),
 ) -> None:
     """Run conformance tests against a model.
 
@@ -505,6 +731,53 @@ def test(
             ),
         },
     )
+
+    # Path-specific runs are intentionally separate from the historical
+    # repair-on/off direct battery: only a completed direct suite contributes
+    # a model-level L0-L4 verdict. Adapted/controller/worker suites describe
+    # the selected compatibility path instead.
+    if suite != "direct" or test_timeout != 120.0 or suite_timeout != 900.0 or max_turns > 0 or result_json:
+        from agent_interop.testing.suites import (
+            ConformancePath,
+            SuiteRunStatus,
+            get_path_suite,
+            run_path_suite,
+        )
+
+        try:
+            path_kind = ConformancePath(suite)
+        except ValueError:
+            console.print(f"[red]Unknown conformance suite:[/] {suite}")
+            raise typer.Exit(1)
+
+        async def _run_path_suite() -> Any:
+            runner = RealConformanceRunner(base_config, client_id=client_profile.replace("-", "_"))
+            await runner.start()
+            try:
+                with tempfile.TemporaryDirectory(prefix="interop-conformance-") as workspace:
+                    path_suite = get_path_suite(path_kind, Path(workspace))
+                    return await run_path_suite(
+                        runner,
+                        path_suite,
+                        model_name=model,
+                        route=base_config.routes["test"],
+                        test_timeout=test_timeout,
+                        suite_timeout=suite_timeout,
+                        max_turns=max_turns or None,
+                        result_json=Path(result_json) if result_json else None,
+                    )
+            finally:
+                await runner.close()
+
+        suite_result = asyncio.run(_run_path_suite())
+        console.print(f"[bold]Suite:[/] {suite_result.path.value}")
+        console.print(f"[bold]Status:[/] {suite_result.status.value}")
+        console.print(f"Passed: {sum(item.passed for item in suite_result.results)}/{len(suite_result.results)}")
+        if suite_result.error:
+            console.print(f"[red]{suite_result.error}[/]")
+        if suite_result.status != SuiteRunStatus.COMPLETED or not suite_result.passed:
+            raise typer.Exit(2 if suite_result.status == SuiteRunStatus.INFRASTRUCTURE_INCONCLUSIVE else 1)
+        return
 
     async def _run_once(
         run_config: InteropServerConfig,
@@ -1571,7 +1844,7 @@ def repair_stats_cmd(
 
 @app.command()
 def replay(
-    file: str = typer.Argument(help="Path to replay case file (.json)"),
+    file: str = typer.Argument(help="Replay case file (.json) or captured case ID"),
     policy: str | None = typer.Option(
         None, "--policy", "-p",
         help="Run a single named policy (default: run all and compare)",
@@ -1598,22 +1871,33 @@ def replay(
         summarize_comparisons,
     )
 
-    try:
-        with open(file) as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        console.print(f"[red]File not found:[/] {file}")
-        raise typer.Exit(1)
-    except json.JSONDecodeError as exc:
-        console.print(f"[red]Invalid JSON:[/] {exc}")
-        raise typer.Exit(1)
+    path = Path(file)
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text())
+        except json.JSONDecodeError as exc:
+            console.print(f"[red]Invalid JSON:[/] {exc}")
+            raise typer.Exit(1)
+        case = ReplayCase(**{k: v for k, v in data.items() if k in ReplayCase.__dataclass_fields__})
+    else:
+        from agent_interop.paths import diagnostic_cases_dir
+        from agent_interop.replay.store import DiagnosticCaseStore
 
-    case = ReplayCase(**{k: v for k, v in data.items() if k in ReplayCase.__dataclass_fields__})
+        case = DiagnosticCaseStore(directory=diagnostic_cases_dir()).get(file)
+        if case is None:
+            console.print(f"[red]Replay case not found:[/] {file}")
+            raise typer.Exit(1)
     console.print(f"[bold]Replay Case:[/] {case.case_id or 'unknown'}")
     console.print(f"  Client: {case.client_protocol}")
     console.print(f"  Upstream: {case.upstream_protocol}")
     console.print(f"  Invariants: {len(case.expected_invariants)}")
     console.print()
+
+    if case.canonical_request is None and case.diagnostics:
+        console.print("[yellow]Metadata-only diagnostic case; no prompt/tool payload was retained for replay.[/]")
+        if case.diagnostics:
+            console.print_json(json.dumps(case.diagnostics, default=str, sort_keys=True))
+        return
 
     # Single-policy mode: replay with just one named policy.
     if policy is not None:
@@ -1743,8 +2027,18 @@ def logs(
 
 
 @app.command()
-def version():
-    """Show version information."""
+def version(
+    as_json: bool = typer.Option(False, "--json", help="Emit build provenance as JSON"),
+):
+    """Show version and build provenance."""
+    if as_json:
+        import json
+        from dataclasses import asdict
+
+        from agent_interop.build_info import get_build_info
+
+        console.print_json(json.dumps(asdict(get_build_info()), sort_keys=True))
+        return
     from agent_interop import __version__
 
     console.print(f"Interop v[green]{__version__}[/]")

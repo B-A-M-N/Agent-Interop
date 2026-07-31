@@ -1,0 +1,7 @@
+schema_version: interop.agent-integration.v1
+id: continue
+binaries: [continue]
+protocols: [openai_chat]
+preferred_protocol: openai_chat
+launch: {strategy: configurable_endpoint}
+requirements: {tool_result_continuation: true}

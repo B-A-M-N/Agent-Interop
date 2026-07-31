@@ -25,6 +25,7 @@ from agent_interop.abi import (
     CanonicalUnknownBlock,
     MetadataForwardingPolicy,
     ProviderMetadata,
+    RequestedCapabilities,
     canonical_tool_choice,
     tool_from_openai,
 )
@@ -211,6 +212,16 @@ class OpenAIChatAdapter(ClientProtocolAdapter):
                 top_p=self.validate_top_p(body.get("top_p")),
                 stop=self.validate_stop(body.get("stop")),
                 stream=body.get("stream", False),
+            ),
+            requested_capabilities=RequestedCapabilities(
+                tools=bool(tools),
+                parallel_tools=bool(body.get("parallel_tool_calls")),
+                reasoning=bool(body.get("reasoning_effort") or body.get("reasoning")),
+                images=any(getattr(block, "type", "") == "image" for message in messages for block in message.content),
+                structured_output=bool(body.get("response_format")),
+                tool_result_continuation=any(getattr(block, "type", "") == "tool_result" for message in messages for block in message.content),
+                sequential_tools=any(getattr(block, "type", "") == "tool_result" for message in messages for block in message.content),
+                exact_named_tool=tool_choice.mode.value == "named",
             ),
         )
 

@@ -41,6 +41,8 @@ from agent_interop.abi import (
     CanonicalStopReason,
     CanonicalTextBlock,
     CanonicalToolCallBlock,
+    CanonicalToolChoice,
+    CanonicalToolResultBlock,
     CanonicalUsage,
     RawToolCallCandidate,
     RepairStatus,
@@ -122,6 +124,15 @@ class ResolvedInvocation:
     evidence_record: Any | None  # EvidenceRecord when one exists
     repair_budget: Any  # RepairBudget
     execution_record: Any  # InteropRequestExecution
+    # P0 compatibility-planning facts are intentionally retained alongside
+    # the legacy backend metadata/InvocationPlan fields during migration.
+    runtime_capabilities: Any | None = None
+    behavioral_capabilities: Any | None = None
+    request_requirements: Any | None = None
+    compatibility_plan: Any | None = None
+    context_plan: Any | None = None
+    tool_surface_plan: Any | None = None
+    compatibility_attempt: Any | None = None
 
 
 def _canonicalize_json_ish(value: Any) -> str:
@@ -205,6 +216,25 @@ class Gateway:
         # see _probe_routes()'s ttl handling.
         self._probe_last_run: float = 0.0
         self._probe_lock = asyncio.Lock()
+        from agent_interop.controller import ControllerStateStore
+
+        self._controller_state = ControllerStateStore()
+        # Bootstrap qualification is deliberately scoped to the immutable
+        # served-model identity. It informs low-risk presentation decisions;
+        # it never enables semantic/coercive repair on its own.
+        self._qualification_records: dict[str, Any] = {}
+        self._qualification_locks: dict[str, asyncio.Lock] = {}
+        from agent_interop.backends.runtime_cache import RuntimeCapabilityCache
+
+        self._runtime_capability_cache = RuntimeCapabilityCache()
+        from agent_interop.paths import diagnostic_cases_dir
+        from agent_interop.replay.store import DiagnosticCaseStore
+
+        self._diagnostic_cases = DiagnosticCaseStore(
+            config.diagnostics.retention_count,
+            diagnostic_cases_dir() if config.diagnostics.persist else None,
+            config.diagnostics.max_case_bytes,
+        )
 
     @property
     def transport(self) -> UpstreamTransport:
@@ -895,7 +925,43 @@ class Gateway:
         request: CanonicalRequest,
         context: Any,
         streaming: bool,
-    ) -> tuple[Any, Any, RepairPolicy, Any, Any]:
+    ) -> Any:
+        """Return an awaitable resolution, with a temporary sync unpack shim.
+
+        Runtime inspection is asynchronous.  The iterable behavior exists only
+        for the pre-v2 diagnostic callers that unpack the historical five
+        values outside an event loop; live traffic and all new callers await
+        the full resolution tuple.  It can be removed once the public
+        diagnostic API is migrated.
+        """
+        coroutine = self._resolve_invocation_plan_and_key_async(route, request, context, streaming)
+
+        class _Resolution:
+            def __await__(self):
+                return coroutine.__await__()
+
+            def __iter__(self):
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    return iter(asyncio.run(self._resolve()))
+                raise RuntimeError("await compatibility resolution inside an active event loop")
+
+            async def _resolve(self):
+                resolved = await coroutine
+                return resolved[:5]
+
+        return _Resolution()
+
+    async def _resolve_invocation_plan_and_key_async(
+        self,
+        route: ModelRoute,
+        request: CanonicalRequest,
+        context: Any,
+        streaming: bool,
+        *,
+        inspect_runtime: bool = True,
+    ) -> tuple[Any, Any, RepairPolicy, Any, Any, Any, Any, Any, Any]:
         """Resolve backend metadata, model profile, repair policy, invocation
         plan, and the authoritative compatibility key for an already-routed
         request — the exact computation ``_prepare_invocation`` performs,
@@ -909,19 +975,45 @@ class Gateway:
 
         Returns:
             (backend_metadata, model_profile, repair_policy, invocation_plan,
-            compat_key)
+            compat_key, runtime_capabilities, behavioral_capabilities,
+            compatibility_plan, context_plan)
         """
         from agent_interop.evidence.key import CompatibilityKeyInputs, build_compatibility_key
 
-        # Resolve the codec up front — it only depends on the route (already in
-        # hand) and is needed for pre-upstream tool-contract validation below.
+        # Runtime inspection is intentionally before profile resolution. Codec
+        # capabilities describe the transport only; they never prove that this
+        # served model can invoke tools.
         codec = get_codec(route.upstream.wire_protocol)
-
-        # Resolve backend metadata and model profile. These only depend on the
-        # route (already in hand), so resolve them BEFORE tool-contract validation
-        # and plan construction — both need the profile and the resolved mode.
-        backend_metadata = self._get_backend_metadata(route)
+        runtime_capabilities = (
+            await self._inspect_model_runtime(route)
+            if inspect_runtime else self._static_runtime_capabilities(route)
+        )
+        backend_metadata = self._backend_metadata_from_runtime(runtime_capabilities)
         model_profile = self._resolve_profile(route, backend_metadata)
+
+        from agent_interop.agents.base import ClientRequirementProfile
+        from agent_interop.agents.manifests import load_builtin_descriptor
+        from agent_interop.planning import RequestCompatibilityPlanner
+        behavioral = self._behavioral_capabilities(runtime_capabilities)
+        descriptor = load_builtin_descriptor(getattr(context, "client_id", ""))
+        client_requirements = descriptor.required_capabilities if descriptor else ClientRequirementProfile()
+        planning_route = route if route.controller is not None else replace(route, controller=self.config.controller)
+        compatibility_plan = await RequestCompatibilityPlanner().plan(
+            request=request,
+            context=context,
+            route=planning_route,
+            client_requirements=client_requirements,
+            codec_capabilities=codec.capabilities(),
+            runtime_capabilities=runtime_capabilities,
+            behavioral_capabilities=behavioral,
+        )
+        context_plan = compatibility_plan.context_plan
+        tool_surface_plan = compatibility_plan.tool_surface_plan
+        if not compatibility_plan.attempts:
+            raise ValueError(
+                "REQUEST_PLAN_UNAVAILABLE: no direct, adapted, or configured controller path "
+                f"can satisfy {', '.join(compatibility_plan.missing_capabilities) or 'this request'}"
+            )
 
         # A profile that declares streaming_supported=False is a real,
         # executable constraint (unlike declared_tokens/safe_tokens, which
@@ -945,9 +1037,8 @@ class Gateway:
         # of truth for tool-mode negotiation — so the plan is built exactly once, already
         # correctly negotiated, and never needs post-hoc mutation.
         from agent_interop.config import ToolMode
-        from agent_interop.repair.invocation import resolve_effective_tool_mode
         codec_caps = codec.capabilities()
-        effective_tool_mode = resolve_effective_tool_mode(route.tool_mode, model_profile, codec_caps)
+        effective_tool_mode = compatibility_plan.attempts[0].tool_mode
 
         # Validate tool contract (pre-upstream). This can raise ValueError for an
         # invalid contract, mirroring exactly what _prepare_invocation does —
@@ -963,7 +1054,12 @@ class Gateway:
             from dataclasses import replace as _replace
             backend_constraints = _replace(backend_constraints, max_tools=0)
         is_valid, validation_issues = validate_tool_contract(
-            tools=request.tools,
+            # A native route's hard backend array cap remains a preflight
+            # contract on the client declaration. Surface reduction may later
+            # shrink the rendered array, but must not disguise an explicitly
+            # native request that the backend could not accept as declared.
+            tools=(list(request.tools) if effective_tool_mode == ToolMode.NATIVE
+                   else list(tool_surface_plan.visible_tools)),
             tool_choice=request.tool_choice,
             tool_mode=route.tool_mode,
             backend_constraints=backend_constraints,
@@ -981,12 +1077,14 @@ class Gateway:
         # (route × profile × codec), so the plan is correct as built — no post-hoc
         # codec validation or mutation needed.
         plan = build_invocation_plan(
-            tools=request.tools,
+            tools=None,
             tool_choice=request.tool_choice,
             route_mode=effective_tool_mode,
             model_profile=model_profile,
             repair_policy=repair_policy,
             codec_capabilities=codec_caps,
+            upstream_tools=tool_surface_plan.visible_tools,
+            validation_tools=tool_surface_plan.validation_tools,
         )
 
         # Compute compatibility key.
@@ -1003,9 +1101,17 @@ class Gateway:
             invocation_plan=plan,
             tool_schema_fingerprint=tool_schema_fingerprint,
             streaming=streaming,
+            runtime_capabilities=runtime_capabilities,
+            compatibility_plan=compatibility_plan,
+            context_plan=context_plan,
+            tool_surface_plan=tool_surface_plan,
+            selected_attempt=compatibility_plan.attempts[0],
         ))
 
-        return backend_metadata, model_profile, repair_policy, plan, compat_key
+        return (
+            backend_metadata, model_profile, repair_policy, plan, compat_key,
+            runtime_capabilities, behavioral, compatibility_plan, context_plan,
+        )
 
     def _prepare_invocation(
         self,
@@ -1013,6 +1119,82 @@ class Gateway:
         context: Any,
         streaming: bool,
         execution: InteropRequestExecution,
+    ) -> Any:
+        """Return an awaitable preparation with legacy synchronous access.
+
+        Runtime inspection made preparation asynchronous.  A few diagnostic
+        and evidence callers intentionally use this internal helper outside
+        an event loop, so preserve that narrow compatibility boundary while
+        live request paths await the real implementation below.
+        """
+        # This compatibility entry point is intentionally offline.  It is used
+        # by diagnostics and older integrations that synchronously inspect the
+        # resolved plan; live traffic calls the async implementation below and
+        # performs runtime inspection before planning.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # Preserve the old eager error surface for ordinary synchronous
+            # callers (notably contract validation).
+            return asyncio.run(self._prepare_invocation_async(
+                request, context, streaming, execution, inspect_runtime=False,
+            ))
+
+        coroutine = self._prepare_invocation_async(
+            request, context, streaming, execution, inspect_runtime=False,
+        )
+
+        class _PreparedInvocation:
+            _value: ResolvedInvocation | None = None
+
+            async def _resolve(self) -> ResolvedInvocation:
+                if self._value is None:
+                    self._value = await coroutine
+                return self._value
+
+            def __await__(self):
+                return self._resolve().__await__()
+
+            def __getattr__(self, name: str) -> Any:
+                if self._value is not None:
+                    return getattr(self._value, name)
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    return getattr(asyncio.run(self._resolve()), name)
+                # The offline diagnostic path performs no I/O.  Its nested
+                # coroutines all complete immediately, which lets legacy
+                # callers access a field inside an async test without opening
+                # a second event loop (and without moving :memory: evidence
+                # stores to another thread).
+                try:
+                    coroutine.send(None)
+                except StopIteration as stop:
+                    self._value = stop.value
+                else:  # pragma: no cover - protects this compatibility path
+                    raise RuntimeError("offline preparation unexpectedly suspended")
+                return getattr(self._value, name)
+
+        prepared = _PreparedInvocation()
+        # The compatibility boundary is offline and must complete without an
+        # event-loop suspension. Resolve it eagerly so preflight validation
+        # preserves its historical synchronous error behavior.
+        try:
+            coroutine.send(None)
+        except StopIteration as stop:
+            prepared._value = stop.value
+        else:  # pragma: no cover - protects the offline-only contract
+            raise RuntimeError("offline preparation unexpectedly suspended")
+        return prepared
+
+    async def _prepare_invocation_async(
+        self,
+        request: CanonicalRequest,
+        context: Any,
+        streaming: bool,
+        execution: InteropRequestExecution,
+        *,
+        inspect_runtime: bool = True,
     ) -> ResolvedInvocation:
         """Prepare a resolved invocation for one request (P0.1).
 
@@ -1062,7 +1244,11 @@ class Gateway:
         if not history_result.is_safe:
             from dataclasses import replace
             reconciled = replace(request, messages=history_result.messages)
-            unsafe_backend_metadata = self._get_backend_metadata(route)
+            runtime_capabilities = (
+                await self._inspect_model_runtime(route)
+                if inspect_runtime else self._static_runtime_capabilities(route)
+            )
+            unsafe_backend_metadata = self._backend_metadata_from_runtime(runtime_capabilities)
             return ResolvedInvocation(
                 request_context=context,
                 original_request=request,
@@ -1077,6 +1263,7 @@ class Gateway:
                 evidence_record=None,
                 repair_budget=None,
                 execution_record=execution,
+                runtime_capabilities=runtime_capabilities,
             )
 
         from dataclasses import replace
@@ -1092,9 +1279,10 @@ class Gateway:
         # so certify/conformance tooling can obtain a key that byte-for-byte
         # matches what the live gate looks up. This includes the tool-contract
         # validation step that can raise ValueError (propagates unchanged).
-        backend_metadata, model_profile, repair_policy, plan, compat_key = (
-            self._resolve_invocation_plan_and_key(
+        backend_metadata, model_profile, repair_policy, plan, compat_key, runtime_capabilities, behavioral, compatibility_plan, context_plan = (
+            await self._resolve_invocation_plan_and_key_async(
                 route, reconciled_request, context, streaming,
+                inspect_runtime=inspect_runtime,
             )
         )
         execution.invocation_plan = plan
@@ -1120,7 +1308,7 @@ class Gateway:
         repair_budget = RepairBudget()
         execution.repair_budget = repair_budget
 
-        return ResolvedInvocation(
+        resolved_invocation = ResolvedInvocation(
             request_context=context,
             original_request=request,
             reconciled_request=reconciled_request,
@@ -1134,7 +1322,15 @@ class Gateway:
             evidence_record=evidence_record,
             repair_budget=repair_budget,
             execution_record=execution,
+            runtime_capabilities=runtime_capabilities,
+            behavioral_capabilities=behavioral,
+            request_requirements=compatibility_plan.requirements,
+            compatibility_plan=compatibility_plan,
+            context_plan=context_plan,
+            tool_surface_plan=compatibility_plan.tool_surface_plan,
         )
+        execution.configure_token_efficiency(resolved_invocation)
+        return resolved_invocation
 
     # ─── Non-streaming request ────────────────────────────────────────────
 
@@ -1153,10 +1349,29 @@ class Gateway:
         try:
             # Prepare the resolved invocation (passes in the shared record so
             # diagnostics/route/plan all land on the object that gets finalized)
-            invocation = self._prepare_invocation(
+            invocation = await self._prepare_invocation_async(
                 canonical, context, streaming=False, execution=exec_record,
             )
-            result = await self._handle_request_send(invocation, exec_record)
+            if await self._ensure_bootstrap_qualification(invocation):
+                # Qualification contributes only low-risk behavior evidence;
+                # rebuild the request plan so it can select the now-proven
+                # presentation path before its first real execution.
+                invocation = await self._prepare_invocation_async(
+                    canonical, context, streaming=False, execution=exec_record,
+                )
+            from agent_interop.execution_attempts import AttemptBudget, CompatibilityAttemptExecutor
+
+            executor = CompatibilityAttemptExecutor(AttemptBudget(
+                max_upstream_attempts=invocation.route.compatibility.max_attempts,
+            ))
+            result = await executor.execute(
+                invocation,
+                build_invocation=self._invocation_for_attempt,
+                execute_attempt=lambda attempt_invocation: self._execute_compatibility_attempt(
+                    attempt_invocation, exec_record
+                ),
+                replan_withheld_tool=self._invocation_with_withheld_tool,
+            )
             # Live evidence write-back: only on the success path, only when tools
             # were offered, only when an evidence store was injected. Backend
             # errors carry no tool-calling signal, so they are skipped.
@@ -1172,6 +1387,7 @@ class Gateway:
             # consumer never resumes the generator far enough to reach a
             # trailing call).
             exec_record.finalize_response(result)
+            self._capture_diagnostic_case(invocation, exec_record, result)
             return result
         except asyncio.CancelledError:
             # Mid-request cancellation: finalize the record as CANCELLED so it
@@ -1183,6 +1399,76 @@ class Gateway:
             exc_err = CanonicalError(code="HANDLE_ERROR", message=str(exc)) if not isinstance(exc, CanonicalError) else exc
             exec_record.finalize_error(exc_err)
             raise
+
+    def diagnostic_case(self, case_id: str) -> Any:
+        """Retrieve an in-memory sanitized diagnostic case by ID."""
+        return self._diagnostic_cases.get(case_id)
+
+    def _capture_diagnostic_case(
+        self,
+        invocation: ResolvedInvocation,
+        execution: InteropRequestExecution,
+        response: CanonicalResponse,
+    ) -> None:
+        """Retain bounded failure/repair diagnostics according to route policy."""
+        policy = self.config.diagnostics
+        repaired = any(decision.repair_steps for decision in execution.tool_decisions)
+        should_capture = policy.capture == "all" or response.error is not None or (
+            policy.capture in {"repairs", "failures_and_repairs"} and repaired
+        )
+        if not should_capture or policy.capture == "off":
+            return
+        from dataclasses import asdict
+
+        from agent_interop.build_info import get_build_info
+        from agent_interop.replay.capture import capture_case
+
+        def plan_metadata() -> dict[str, Any]:
+            compatibility = invocation.compatibility_plan
+            surface = invocation.tool_surface_plan
+            context = invocation.context_plan
+            return {
+                "path": getattr(compatibility.path, "value", str(compatibility.path)),
+                "planner_revision": compatibility.planner_revision,
+                "attempts": [attempt.kind.value for attempt in compatibility.attempts],
+                "missing_capabilities": list(compatibility.missing_capabilities),
+                "context_strategy": context.selected_strategy,
+                "context_transformations": list(context.transformations),
+                "visible_tools": [tool.name for tool in surface.visible_tools],
+                "withheld_tools": list(surface.withheld_tool_names),
+            }
+
+        diagnostics = {
+            "build": asdict(get_build_info()),
+            "runtime": asdict(invocation.runtime_capabilities),
+            "requirements": asdict(invocation.request_requirements),
+            "plan": plan_metadata(),
+            "execution": execution.to_sanitized_dict(),
+            "response": {
+                "error_code": response.error.code if response.error else "",
+                "stop_reason": getattr(response.stop_reason, "value", str(response.stop_reason)),
+                "tool_call_count": sum(isinstance(block, CanonicalToolCallBlock) for block in response.content),
+            },
+        }
+        inbound = {
+            "request_id": invocation.reconciled_request.request_id,
+            "model": invocation.reconciled_request.model.requested_name,
+            "message_count": len(invocation.reconciled_request.messages),
+            "tool_count": len(invocation.reconciled_request.tools),
+        }
+        canonical = invocation.reconciled_request if policy.content_mode != "metadata_only" else None
+        case = capture_case(
+            client_protocol=getattr(invocation.request_context.client_protocol, "value", ""),
+            upstream_protocol=invocation.route.upstream.wire_protocol.value,
+            inbound_request=inbound,
+            canonical_request=canonical,
+            upstream_request={"route": invocation.route.id, "model": invocation.route.upstream_model},
+            tool_registry=invocation.reconciled_request.tools,
+            compatibility_key=invocation.compatibility_key,
+            diagnostics=diagnostics,
+        )
+        execution.diagnostic_case_id = case.case_id
+        self._diagnostic_cases.put(case)
 
     def _build_transaction_context(
         self,
@@ -1213,6 +1499,248 @@ class Gateway:
             # verified signal. A merely well-formed key is not sufficient.
             compatibility_verified=invocation.evidence_record is not None,
         )
+
+    def _invocation_for_attempt(self, invocation: ResolvedInvocation, attempt: Any) -> ResolvedInvocation:
+        """Build the request-specific InvocationPlan for one ladder rung."""
+        from agent_interop.evidence.key import CompatibilityKeyInputs, build_compatibility_key
+        from agent_interop.repair.invocation import build_invocation_plan
+
+        surface = invocation.tool_surface_plan
+        plan = build_invocation_plan(
+            tools=None,
+            tool_choice=invocation.reconciled_request.tool_choice,
+            route_mode=attempt.tool_mode,
+            model_profile=invocation.model_profile,
+            repair_policy=invocation.repair_policy,
+            codec_capabilities=invocation.codec.capabilities(),
+            upstream_tools=surface.visible_tools,
+            validation_tools=surface.validation_tools,
+        )
+        if attempt.constrained_output:
+            plan = replace(plan, constrained_output=True)
+        compatibility_key = build_compatibility_key(CompatibilityKeyInputs(
+            request_context=invocation.request_context,
+            route=invocation.route,
+            request=invocation.reconciled_request,
+            backend_metadata=invocation.backend_metadata,
+            model_profile=invocation.model_profile,
+            invocation_plan=plan,
+            tool_schema_fingerprint=self._compute_tool_schema_fingerprint(
+                invocation.reconciled_request.tools,
+            ),
+            streaming=invocation.reconciled_request.generation.stream,
+            runtime_capabilities=invocation.runtime_capabilities,
+            compatibility_plan=invocation.compatibility_plan,
+            context_plan=invocation.context_plan,
+            tool_surface_plan=surface,
+            selected_attempt=attempt,
+        ))
+        return replace(
+            invocation,
+            invocation_plan=plan,
+            compatibility_key=compatibility_key,
+            # Evidence for a previous rung is not evidence for this exact
+            # path/presentation tuple.
+            evidence_record=None,
+            compatibility_attempt=attempt,
+        )
+
+    def _invocation_with_withheld_tool(
+        self, invocation: ResolvedInvocation, tool_name: str,
+    ) -> ResolvedInvocation:
+        """Rebuild an attempt once after an unseen declared tool was requested."""
+        from agent_interop.tool_surface.selector import ToolSurfacePlanner
+
+        surface = ToolSurfacePlanner.replan_with_tool(invocation.tool_surface_plan, tool_name)
+        if surface is invocation.tool_surface_plan:
+            return invocation
+        if invocation.execution_record is not None:
+            invocation.execution_record.record_compatibility_event(
+                f"withheld_tool_replanned:{tool_name}"
+            )
+        replanned = replace(invocation, tool_surface_plan=surface)
+        return self._invocation_for_attempt(replanned, invocation.compatibility_attempt)
+
+    async def _execute_compatibility_attempt(
+        self,
+        invocation: ResolvedInvocation,
+        exec_record: InteropRequestExecution,
+    ) -> CanonicalResponse:
+        """Dispatch one validated attempt without granting tool authority."""
+        if getattr(invocation.compatibility_attempt, "use_controller", False):
+            return await self._execute_controller_attempt(invocation, exec_record)
+        return await self._handle_request_send(invocation, exec_record)
+
+    async def _execute_controller_attempt(
+        self,
+        invocation: ResolvedInvocation,
+        exec_record: InteropRequestExecution,
+    ) -> CanonicalResponse:
+        """Use a qualified companion route for the agent/tool protocol.
+
+        The primary route is first asked for a tool-free work product. The
+        configured controller receives that work product plus the original
+        client request and decides whether to emit canonical tool calls. Tool
+        execution remains with the client; controller-generated calls are
+        explicitly provenance-labelled before leaving Interop.
+        """
+        from agent_interop.controller.companion import ControllerRegistry
+        from agent_interop.controller.policy import mark_controller_provenance
+        from agent_interop.controller.prompts import CONTROLLER_SYSTEM_PROMPT
+        from agent_interop.controller.types import ControllerSessionState
+
+        controller_route = ControllerRegistry().select(self.config, invocation.route)
+        if controller_route is None or controller_route.id == invocation.route.id:
+            return CanonicalResponse(
+                model=CanonicalModelReference(
+                    requested_name=invocation.reconciled_request.model.requested_name,
+                    resolved_name=invocation.route.upstream_model,
+                ),
+                error=CanonicalError(
+                    code=InteropErrorCode.CONTROLLER_UNAVAILABLE,
+                    message="No distinct configured controller route is available",
+                    details={"path": "controlled", "responsible": "controller"},
+                ),
+            )
+        effective_controller = invocation.route.controller or self.config.controller
+        if (
+            effective_controller.require_verified
+            and not await self._controller_route_is_qualified(controller_route, effective_controller.minimum_controller_level)
+        ):
+            return CanonicalResponse(
+                model=CanonicalModelReference(
+                    requested_name=invocation.reconciled_request.model.requested_name,
+                    resolved_name=invocation.route.upstream_model,
+                ),
+                error=CanonicalError(
+                    code=InteropErrorCode.CONTROLLER_UNAVAILABLE,
+                    message="Configured controller has not passed the required qualification level",
+                    details={
+                        "path": "controlled",
+                        "responsible": "controller",
+                        "minimum_controller_level": effective_controller.minimum_controller_level,
+                        "next": "run interop qualify for the controller route",
+                    },
+                ),
+            )
+
+        session_id = invocation.request_context.session_id
+        client_id = invocation.request_context.client_id
+        prior_state = self._controller_state.get(session_id, client_id, invocation.route.id)
+        if prior_state is not None:
+            if prior_state.controller_turn_count >= effective_controller.max_controller_turns:
+                self._controller_state.remove(session_id, client_id, invocation.route.id)
+                return CanonicalResponse(
+                    error=CanonicalError(
+                        code=InteropErrorCode.CONTROLLER_LOOP_DETECTED,
+                        message="Controller exceeded its bounded turn budget",
+                        details={"path": "controlled", "responsible": "controller", "next": "abort_session"},
+                    ),
+                )
+            has_tool_result = any(
+                isinstance(block, CanonicalToolResultBlock)
+                for message in invocation.reconciled_request.messages for block in message.content
+            )
+            if prior_state.pending_tool_call_ids and not has_tool_result:
+                return CanonicalResponse(
+                    error=CanonicalError(
+                        code=InteropErrorCode.CONTROLLER_LOOP_DETECTED,
+                        message="Controller session repeated before the pending tool result arrived",
+                        details={"path": "controlled", "responsible": "client", "next": "return_tool_result"},
+                    ),
+                )
+
+        # The primary worker may reason/code, but cannot emit tool calls. Its
+        # output is treated as untrusted advisory text to the controller.
+        primary_request = replace(
+            invocation.reconciled_request,
+            tools=[],
+            tool_choice=CanonicalToolChoice.none(),
+        )
+        primary_plan = replace(
+            invocation.invocation_plan,
+            effective_tool_mode=ToolMode.DISABLED,
+            upstream_tools=(),
+            prompt_contract="",
+            parser_id=None,
+        )
+        primary_invocation = replace(
+            invocation,
+            reconciled_request=primary_request,
+            invocation_plan=primary_plan,
+        )
+        primary = await self._handle_request_send(primary_invocation, exec_record)
+        if primary.error is not None:
+            return primary
+
+        primary_text = "\n".join(
+            block.text for block in primary.content if isinstance(block, CanonicalTextBlock)
+        )
+        controller_system = list(invocation.reconciled_request.system)
+        controller_system.append(CanonicalTextBlock(
+            text=f"{CONTROLLER_SYSTEM_PROMPT}\n\nPrimary worker work product:\n{primary_text}",
+        ))
+        controller_request = replace(
+            invocation.reconciled_request,
+            model=replace(invocation.reconciled_request.model, requested_name=controller_route.id),
+            system=controller_system,
+        )
+        controller_context = replace(invocation.request_context, route_id=controller_route.id)
+        controller_invocation = await self._prepare_invocation_async(
+            controller_request,
+            controller_context,
+            streaming=False,
+            execution=exec_record,
+        )
+        # The controller is a second model call; keep it visible in the
+        # request's efficiency record rather than hiding it behind a single
+        # compatibility attempt.
+        exec_record.record_attempt(controller_tokens=(len(primary_text) + 3) // 4)
+        response = await self._handle_request_send(controller_invocation, exec_record)
+        if response.error is not None:
+            return response
+        calls = tuple(
+            mark_controller_provenance(block)
+            if isinstance(block, CanonicalToolCallBlock) else block
+            for block in response.content
+        )
+        pending = tuple(block.id for block in calls if isinstance(block, CanonicalToolCallBlock))
+        self._controller_state.put(ControllerSessionState(
+            session_id=controller_context.session_id,
+            route_id=invocation.route.id,
+            client_id=controller_context.client_id,
+            controller_route_id=controller_route.id,
+            primary_route_id=invocation.route.id,
+            phase="awaiting_tool_result" if pending else "final_text",
+            visible_tool_fingerprint=invocation.tool_surface_plan.fingerprint,
+            pending_tool_call_ids=pending,
+            primary_turn_count=(prior_state.primary_turn_count + 1) if prior_state else 1,
+            controller_turn_count=(prior_state.controller_turn_count + 1) if prior_state else 1,
+        ))
+        return replace(response, content=list(calls))
+
+    async def _controller_route_is_qualified(self, route: ModelRoute, minimum_level: str) -> bool:
+        """Check a controller against the bounded bootstrap qualification state."""
+        runtime = await self._inspect_model_runtime(route)
+        record = self._qualification_records.get(self._qualification_key(runtime))
+        if record is None:
+            return False
+        from agent_interop.qualification import QualificationState
+
+        required = {"L1": QualificationState.FORCED_TOOL, "L2": QualificationState.AUTOMATIC_TOOL,
+                    "L3": QualificationState.SEQUENTIAL_AGENT, "L4": QualificationState.ADVANCED_AGENT}
+        candidate = getattr(record, "state", QualificationState.UNKNOWN)
+        order = {
+            QualificationState.UNKNOWN: 0,
+            QualificationState.CHAT_ONLY: 1,
+            QualificationState.FORCED_TOOL: 2,
+            QualificationState.AUTOMATIC_TOOL: 3,
+            QualificationState.SEQUENTIAL_AGENT: 4,
+            QualificationState.ADVANCED_AGENT: 5,
+            QualificationState.DEGRADED: 0,
+            QualificationState.PROBING: 0,
+        }
+        return order.get(candidate, 0) >= order.get(required.get(minimum_level, QualificationState.SEQUENTIAL_AGENT), 4)
 
     async def _handle_request_send(
         self,
@@ -1342,6 +1870,29 @@ class Gateway:
 
         # 6. Extract tool calls from model-dialect output
         candidates = self._extract_tool_candidates(decoded, invocation)
+
+        # A withheld declared tool is not executable merely because a model
+        # guessed its identifier. Record the event and let the bounded ladder
+        # expose it for exactly one retry.
+        surface = invocation.tool_surface_plan
+        withheld = set(surface.withheld_tool_names) if surface is not None else set()
+        requested_withheld = next((candidate.name for candidate in candidates if candidate.name in withheld), "")
+        if requested_withheld:
+            if exec_record is not None:
+                exec_record.record_compatibility_event(
+                    f"withheld_tool_requested:{requested_withheld}"
+                )
+            return CanonicalResponse(
+                model=CanonicalModelReference(
+                    requested_name=canonical.model.requested_name,
+                    resolved_name=route.upstream_model,
+                ),
+                error=CanonicalError(
+                    code=InteropErrorCode.TOOL_SELECTION_FAILED,
+                    message="Model requested a declared tool outside its visible surface",
+                    details={"withheld_tool_requested": requested_withheld},
+                ),
+            )
 
         # 7. Run tool transaction pipeline
         from agent_interop.transaction import ToolBatchPolicy, process_tool_batch
@@ -1590,6 +2141,180 @@ class Gateway:
             model_name=route.upstream_model,
         )
 
+    async def _inspect_model_runtime(self, route: ModelRoute) -> Any:
+        """Inspect the live backend/model tuple through the shared transport.
+
+        Unlike the retired route-only metadata helper, this has enough
+        information to constrain context and distinguish backend wire support
+        from model capability.  Callers convert it to ``BackendMetadata`` only
+        at the profile-registry boundary, which preserves the richer runtime
+        object for planning and diagnostics.
+        """
+        from agent_interop.backends.registry import get_backend_inspector
+
+        # ``--no-probe`` remains a real operational contract: request traffic
+        # must not turn it into several metadata calls (which can themselves
+        # retry) before the actual inference request.
+        if not self.config.probe_on_startup:
+            return self._static_runtime_capabilities(route)
+
+        cached = self._runtime_capability_cache.get_for_route(
+            route.upstream.base_url, route.upstream_model,
+        )
+        if cached is not None:
+            return cached
+
+        inspector = get_backend_inspector(route.upstream.kind)
+        try:
+            runtime = await inspector.inspect(route, self.transport)
+            self._runtime_capability_cache.put(runtime, route.upstream.base_url)
+            return runtime
+        except (AttributeError, OSError, RuntimeError) as exc:
+            # Inspection enriches planning but must not break a working route
+            # when a test/dedicated streaming transport exposes only ``stream``
+            # or when a backend's metadata endpoint is unavailable.
+            logger.debug("Runtime inspection unavailable for %s: %s", route.id, exc)
+            return self._static_runtime_capabilities(route)
+
+    @staticmethod
+    def _static_runtime_capabilities(route: ModelRoute) -> Any:
+        """Return conservative offline facts for synchronous diagnostics.
+
+        This never upgrades a model to native/direct tool capability.  It
+        exists solely to keep the historical inspection helper side-effect
+        free; live gateway requests always use ``_inspect_model_runtime``.
+        """
+        from agent_interop.backends.base import ModelRuntimeCapabilities
+
+        return ModelRuntimeCapabilities(
+            backend_kind=route.upstream.kind,
+            model_name=route.upstream_model,
+        )
+
+    @staticmethod
+    def _qualification_key(runtime: Any) -> str:
+        return getattr(runtime, "model_digest", "") or getattr(runtime, "model_name", "")
+
+    def record_qualification(self, record: Any) -> None:
+        """Store bounded bootstrap results for future safe planning decisions."""
+        key = getattr(record, "model_digest", "")
+        if key:
+            self._qualification_records[key] = record
+
+    def _behavioral_capabilities(self, runtime: Any) -> Any:
+        """Return only behavior proven by the synthetic bootstrap battery."""
+        from agent_interop.planning import BehavioralCapabilities
+        from agent_interop.qualification import QualificationState
+
+        record = self._qualification_records.get(self._qualification_key(runtime))
+        if record is None:
+            return BehavioralCapabilities()
+        forced = bool(getattr(record, "native_forced_tool", False) or getattr(record, "prompted_forced_tool", False))
+        sequential = bool(getattr(record, "continuation", False) and forced)
+        return BehavioralCapabilities(
+            # Qualification does not test automatic selection or parallelism.
+            native_tools=bool(getattr(record, "native_forced_tool", False)),
+            prompted_tools=bool(getattr(record, "prompted_forced_tool", False)),
+            forced_selection=forced,
+            sequential_tool_use=sequential,
+            tool_result_continuation=sequential,
+            streaming=(getattr(record, "state", None) == QualificationState.ADVANCED_AGENT),
+            sample_count=1,
+        )
+
+    async def _ensure_bootstrap_qualification(self, invocation: ResolvedInvocation) -> bool:
+        """Qualify an unknown tool model with side-effect-free synthetic calls.
+
+        Only required/named tool turns block.  Automatic selection may
+        legitimately choose no tool, so it uses existing evidence or the
+        controller path rather than treating a no-call probe as a failure.
+        """
+        qualification = invocation.route.qualification
+        choice = invocation.reconciled_request.tool_choice
+        if (
+            qualification.bootstrap != "blocking_for_tool_requests"
+            or not invocation.reconciled_request.tools
+            or choice.mode not in (ToolChoiceMode.NAMED, ToolChoiceMode.REQUIRED)
+        ):
+            return False
+        key = self._qualification_key(invocation.runtime_capabilities)
+        if not key or key in self._qualification_records:
+            return False
+        lock = self._qualification_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            if key in self._qualification_records:
+                return False
+            from agent_interop.qualification import BootstrapQualifier
+
+            async def execute(probe: Any) -> bool:
+                return await self._execute_bootstrap_probe(invocation, probe)
+
+            record = await BootstrapQualifier().qualify(key, execute)
+            self.record_qualification(record)
+            return True
+
+    async def _execute_bootstrap_probe(self, invocation: ResolvedInvocation, probe: Any) -> bool:
+        """Execute one synthetic qualification probe without client authority."""
+        from agent_interop.abi import CanonicalMessage
+        from agent_interop.qualification.probes import SYNTHETIC_TOOL
+
+        tools = [SYNTHETIC_TOOL] if probe.requires_tools else []
+        choice = CanonicalToolChoice.required() if probe.requires_tools else CanonicalToolChoice.none()
+        messages = [CanonicalMessage(role="user", content=[CanonicalTextBlock(text=probe.prompt)])]
+        if probe.name == "tool_result_continuation":
+            messages = [
+                CanonicalMessage(role="user", content=[CanonicalTextBlock(text="Call the probe tool.")]),
+                CanonicalMessage(
+                    role="assistant",
+                    content=[CanonicalToolCallBlock(id="interop_probe_call", name="interop_probe", arguments={"marker": "done"})],
+                ),
+                CanonicalMessage(
+                    role="tool",
+                    content=[CanonicalToolResultBlock(tool_call_id="interop_probe_call", content="marker=done")],
+                ),
+                CanonicalMessage(role="user", content=[CanonicalTextBlock(text=probe.prompt)]),
+            ]
+        request = CanonicalRequest(
+            model=invocation.reconciled_request.model,
+            messages=messages,
+            tools=tools,
+            tool_choice=choice,
+        )
+        execution = InteropRequestExecution(context=invocation.request_context)
+        probe_invocation = await self._prepare_invocation_async(
+            request,
+            invocation.request_context,
+            streaming=False,
+            execution=execution,
+        )
+        response = await self._handle_request_send(probe_invocation, execution)
+        if response.error is not None:
+            return False
+        calls = [block for block in response.content if isinstance(block, CanonicalToolCallBlock)]
+        if probe.name == "exact_text":
+            return any("INTEROP_PROBE_OK" in block.text for block in response.content if isinstance(block, CanonicalTextBlock))
+        if probe.name == "no_tool":
+            return not calls
+        if probe.name == "native_forced_tool":
+            return bool(calls) and probe_invocation.invocation_plan.effective_tool_mode == ToolMode.NATIVE
+        if probe.name == "prompted_forced_tool":
+            return bool(calls) and probe_invocation.invocation_plan.effective_tool_mode in (ToolMode.PROMPTED, ToolMode.TEXTUAL)
+        return not calls
+
+    @staticmethod
+    def _backend_metadata_from_runtime(runtime: Any) -> Any:
+        from agent_interop.model.registry import BackendMetadata
+
+        return BackendMetadata(
+            backend_kind=runtime.backend_kind,
+            backend_version=runtime.backend_version,
+            model_name=runtime.model_name,
+            model_digest=runtime.model_digest,
+            context_length=runtime.effective_context_tokens,
+            chat_template=runtime.chat_template,
+            quantization=runtime.quantization,
+        )
+
     def _compute_tool_schema_fingerprint(self, tools: list[Any]) -> str:
         """Compute a fingerprint of the tool schema set for evidence lookup (item 83).
 
@@ -1835,9 +2560,45 @@ class Gateway:
             # Prepare the resolved invocation (same as non-streaming; passes in
             # the shared record so diagnostics/route/plan land on the record
             # that gets finalized)
-            invocation = self._prepare_invocation(
+            invocation = await self._prepare_invocation_async(
                 canonical, context, streaming=True, execution=exec_record,
             )
+            if await self._ensure_bootstrap_qualification(invocation):
+                # A stream that requires qualification must not leak its first
+                # unqualified attempt.  Re-plan before deciding whether native
+                # passthrough is now justified or buffered validation remains
+                # necessary.
+                invocation = await self._prepare_invocation_async(
+                    canonical, context, streaming=True, execution=exec_record,
+            )
+            if self._requires_buffered_stream_validation(invocation):
+                from agent_interop.execution_attempts import (
+                    AttemptBudget,
+                    CompatibilityAttemptExecutor,
+                )
+
+                executor = CompatibilityAttemptExecutor(AttemptBudget(
+                    max_upstream_attempts=invocation.route.compatibility.max_attempts,
+                ))
+                response = await executor.execute(
+                    invocation,
+                    build_invocation=self._invocation_for_attempt,
+                    execute_attempt=lambda attempt_invocation: self._execute_compatibility_attempt(
+                        attempt_invocation, exec_record,
+                    ),
+                    replan_withheld_tool=self._invocation_with_withheld_tool,
+                )
+                if (
+                    self._evidence_store is not None
+                    and canonical.tools
+                    and response.error is None
+                ):
+                    self._record_evidence_observation(invocation, exec_record)
+                exec_record.finalize_response(response)
+                self._capture_diagnostic_case(invocation, exec_record, response)
+                async for event in self._events_from_buffered_response(response):
+                    yield event
+                return
             # The sub-generator finalizes the record (success or internal
             # terminal error) — and logs the summary — BEFORE yielding its
             # terminal event, not after. The ASGI server stops consuming this
@@ -1857,6 +2618,40 @@ class Gateway:
             yield CanonicalEvent(type="error", error=exc_err)
             yield CanonicalEvent(type="message_stop")
             return
+
+    @staticmethod
+    def _requires_buffered_stream_validation(invocation: ResolvedInvocation) -> bool:
+        """Whether this stream must wait for an accepted ladder response."""
+        if not invocation.route.compatibility.buffer_unverified_streaming:
+            return False
+        plan = invocation.invocation_plan
+        compatibility = invocation.compatibility_plan
+        return not (
+            compatibility is not None
+            and getattr(compatibility.path, "value", compatibility.path) == "direct"
+            and invocation.evidence_record is not None
+            and plan is not None
+            and plan.effective_tool_mode == ToolMode.NATIVE
+        )
+
+    async def _events_from_buffered_response(self, response: CanonicalResponse) -> AsyncIterator[CanonicalEvent]:
+        """Encode one validated buffered response as canonical stream events."""
+        if response.error is not None:
+            yield CanonicalEvent(type="error", error=response.error)
+            yield CanonicalEvent(type="message_stop", stop_reason=CanonicalStopReason.INVALID_OUTPUT)
+            return
+        for index, block in enumerate(response.content):
+            if isinstance(block, CanonicalTextBlock) and block.text:
+                yield CanonicalEvent(type="text_delta", index=index, partial=block.text)
+            elif isinstance(block, CanonicalToolCallBlock):
+                yield CanonicalEvent(type="tool_use", index=index, content_block=block)
+        if response.usage.input_tokens or response.usage.output_tokens:
+            yield CanonicalEvent(
+                type="usage_update",
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+            )
+        yield CanonicalEvent(type="message_stop", stop_reason=response.stop_reason)
 
     async def _handle_stream_send(
         self,

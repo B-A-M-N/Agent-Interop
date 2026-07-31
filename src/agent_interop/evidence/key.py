@@ -55,6 +55,11 @@ class CompatibilityKeyInputs:
     invocation_plan: Any = None
     tool_schema_fingerprint: str = ""
     streaming: bool = False
+    runtime_capabilities: Any = None
+    compatibility_plan: Any = None
+    context_plan: Any = None
+    tool_surface_plan: Any = None
+    selected_attempt: Any = None
 
 
 def build_compatibility_key(
@@ -161,6 +166,43 @@ def build_compatibility_key(
 
     backend_serving_config = ""
 
+    runtime = inputs.runtime_capabilities
+    runtime_context_tokens = int(getattr(runtime, "effective_context_tokens", 0) or 0)
+    runtime_capability_digest = ""
+    if runtime is not None:
+        import hashlib
+        import json
+
+        runtime_key_facts = {
+            name: value for name, value in vars(runtime).items()
+            # Observation time is telemetry, not a compatibility dimension.
+            # Including it makes identical requests miss evidence every turn.
+            if name != "probed_at"
+        }
+        runtime_capability_digest = hashlib.sha256(
+            json.dumps(runtime_key_facts, sort_keys=True, default=_strval).encode()
+        ).hexdigest()[:16]
+
+    compatibility = inputs.compatibility_plan
+    surface = inputs.tool_surface_plan
+    context_plan = inputs.context_plan
+    selected_attempt = inputs.selected_attempt
+    path = _strval(getattr(compatibility, "path", ""))
+    planner_revision = _strval(getattr(compatibility, "planner_revision", ""))
+    attempt_kind = _strval(getattr(selected_attempt, "kind", ""))
+    controller_model_id = _strval(getattr(getattr(route, "controller", None), "route_id", ""))
+    streaming_policy = "direct"
+    if path == "controlled":
+        streaming_policy = "controller"
+    elif inputs.streaming and (
+        effective_tool_mode != "native"
+        or bool(getattr(getattr(route, "compatibility", None), "buffer_unverified_streaming", False))
+    ):
+        streaming_policy = "buffered_validation"
+
+    from agent_interop.build_info import get_build_info
+    build = get_build_info()
+
     return CompatibilityKey(
         client_id=client_id,
         client_version=client_version,
@@ -180,4 +222,18 @@ def build_compatibility_key(
         parser_id=parser_id,
         template_revision=template_revision,
         backend_serving_config=backend_serving_config,
+        interop_build_commit=build.git_commit,
+        interop_build_dirty=build.git_dirty,
+        planner_revision=planner_revision or build.planner_revision,
+        runtime_context_tokens=runtime_context_tokens,
+        runtime_capability_digest=runtime_capability_digest,
+        compatibility_path=path,
+        attempt_kind=attempt_kind,
+        controller_model_id=controller_model_id,
+        tool_surface_mode=_strval(getattr(surface, "mode", "")),
+        visible_tool_fingerprint=_strval(getattr(surface, "fingerprint", "")),
+        tool_selector_revision=_strval(getattr(surface, "selector_revision", "")),
+        context_strategy=_strval(getattr(context_plan, "selected_strategy", "")),
+        context_plan_revision="1" if context_plan is not None else "",
+        streaming_policy=streaming_policy,
     )

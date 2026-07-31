@@ -285,17 +285,22 @@ def _requires_execution_nonce(fallback_strategies: Sequence[Any]) -> bool:
 
 
 def build_invocation_plan(
-    tools: Sequence[CanonicalTool],
+    tools: Sequence[CanonicalTool] | None,
     tool_choice: CanonicalToolChoice,
     route_mode: ToolMode,
     model_profile: Any = None,
     repair_policy: RepairPolicy | None = None,
     codec_capabilities: Any = None,
+    *,
+    upstream_tools: Sequence[CanonicalTool] | None = None,
+    validation_tools: Sequence[CanonicalTool] | None = None,
 ) -> InvocationPlan:
     """Build an InvocationPlan given tools, choice, and resolved mode.
 
     Args:
-        tools: Sequence of CanonicalTool objects.
+        tools: Legacy shorthand for both the visible and validation tool set.
+        upstream_tools: Tools exposed to the model in this attempt.
+        validation_tools: Complete client-declared registry used for validation.
         tool_choice: The original tool choice from the client request.
         route_mode: The route's configured tool mode.
         model_profile: Resolved model profile (provides extractor_id, envelope).
@@ -307,10 +312,15 @@ def build_invocation_plan(
     Returns:
         A complete InvocationPlan describing how tools are presented.
     """
+    if upstream_tools is None:
+        upstream_tools = tools or ()
+    if validation_tools is None:
+        validation_tools = tools if tools is not None else upstream_tools
+    visible_tools = tuple(upstream_tools)
+    all_validation_tools = tuple(validation_tools)
     resolved = resolve_effective_tool_mode(route_mode, model_profile, codec_capabilities)
 
-    tool_names = tuple(t.name for t in tools if t.name)
-    validation_tools = tuple(tools)
+    tool_names = tuple(t.name for t in visible_tools if t.name)
 
     # Determine extractor and envelope from model profile
     extractor_id = getattr(model_profile, 'parser_id', None) if model_profile else None
@@ -333,16 +343,15 @@ def build_invocation_plan(
         stream_mode = StreamExtractionMode.NATIVE_FRAGMENTS
 
     # Build tool-choice-specific prompt instructions
-    choice_instructions = _build_choice_instructions(tool_choice, tools)
+    choice_instructions = _build_choice_instructions(tool_choice, visible_tools)
 
     if resolved == ToolMode.NATIVE:
-        upstream_tools = tuple(tools)
         return InvocationPlan(
             effective_tool_mode=ToolMode.NATIVE,
             original_tool_choice=tool_choice,
             native_tools_enabled=True,
-            upstream_tools=upstream_tools,
-            validation_tools=validation_tools,
+            upstream_tools=visible_tools,
+            validation_tools=all_validation_tools,
             prompt_contract="",
             prompt_contract_digest="",
             parser_id=extractor_id,
@@ -362,7 +371,7 @@ def build_invocation_plan(
             original_tool_choice=tool_choice,
             native_tools_enabled=False,
             upstream_tools=(),
-            validation_tools=validation_tools,
+            validation_tools=all_validation_tools,
             prompt_contract="",
             prompt_contract_digest="",
             parser_id=None,
@@ -376,10 +385,10 @@ def build_invocation_plan(
             codec_capabilities=codec_capabilities,
         )
 
-    if resolved == ToolMode.PROMPTED and tools:
+    if resolved == ToolMode.PROMPTED and visible_tools:
         from agent_interop.model.contract_templates import render_contract
 
-        tool_descriptions = build_tool_descriptions(tools)
+        tool_descriptions = build_tool_descriptions(visible_tools)
         prompt_contract = render_contract(
             contract_template_id,
             tool_descriptions=tool_descriptions,
@@ -411,7 +420,7 @@ def build_invocation_plan(
             original_tool_choice=tool_choice,
             native_tools_enabled=False,
             upstream_tools=(),
-            validation_tools=validation_tools,
+            validation_tools=all_validation_tools,
             prompt_contract=prompt_contract,
             prompt_contract_digest=contract_digest,
             parser_id=parser,
@@ -426,8 +435,8 @@ def build_invocation_plan(
             execution_nonce=execution_nonce,
         )
 
-    if resolved == ToolMode.TEXTUAL and tools:
-        tool_descriptions = build_tool_descriptions(tools, include_schemas=False)
+    if resolved == ToolMode.TEXTUAL and visible_tools:
+        tool_descriptions = build_tool_descriptions(visible_tools, include_schemas=False)
         prompt_contract = (
             "Available tools:\n\n"
             f"{tool_descriptions}\n\n"
@@ -439,7 +448,7 @@ def build_invocation_plan(
             original_tool_choice=tool_choice,
             native_tools_enabled=False,
             upstream_tools=(),
-            validation_tools=validation_tools,
+            validation_tools=all_validation_tools,
             prompt_contract=prompt_contract,
             prompt_contract_digest=contract_digest,
             parser_id=extractor_id,
@@ -459,7 +468,7 @@ def build_invocation_plan(
         original_tool_choice=tool_choice,
         native_tools_enabled=False,
         upstream_tools=(),
-        validation_tools=validation_tools,
+        validation_tools=all_validation_tools,
         prompt_contract="",
         prompt_contract_digest="",
         parser_id=extractor_id,

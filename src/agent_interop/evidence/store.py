@@ -18,7 +18,7 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -58,7 +58,7 @@ class RepairStatsGroup:
     rule_counts: dict[str, int] = field(default_factory=dict)
 
 # Schema version for migrations
-_SCHEMA_VERSION = 7
+_SCHEMA_VERSION = 8
 
 # Columns added in schema version 2
 _V2_COLUMNS = [
@@ -111,6 +111,13 @@ _V5_COLUMNS = [
 # Columns added in schema version 6 — conformance-level battery provenance
 _V6_COLUMNS = [
     ("battery_version", "TEXT DEFAULT ''"),
+]
+
+# Schema v8 stores the complete immutable key representation. Earlier
+# columns remain queryable indexes, while this prevents new key dimensions
+# from being silently dropped during round-trip reconstruction.
+_V8_COLUMNS = [
+    ("key_json", "TEXT DEFAULT ''"),
 ]
 
 
@@ -196,7 +203,8 @@ class EvidenceStore:
                     accepted_count INTEGER DEFAULT 0,
                     rejected_count INTEGER DEFAULT 0,
                     attestation TEXT DEFAULT '',
-                    battery_version TEXT DEFAULT ''
+                    battery_version TEXT DEFAULT '',
+                    key_json TEXT DEFAULT ''
                 )
                 """
             )
@@ -286,6 +294,12 @@ class EvidenceStore:
                         f"ALTER TABLE compatibility_results ADD COLUMN {col_name} {col_def}"
                     )
                     logger.info("Migrated evidence DB: added column %s", col_name)
+            for col_name, col_def in _V8_COLUMNS:
+                if col_name not in existing_cols:
+                    conn.execute(
+                        f"ALTER TABLE compatibility_results ADD COLUMN {col_name} {col_def}"
+                    )
+                    logger.info("Migrated evidence DB: added column %s", col_name)
 
     @contextmanager
     def _connection(self):
@@ -304,14 +318,7 @@ class EvidenceStore:
         """Generate a deterministic ID from a compatibility key."""
         import hashlib
 
-        content = ":".join([
-            key.client_id, key.client_version, key.client_protocol,
-            key.model_id, key.model_digest, key.quantization,
-            key.backend_kind, key.backend_version, key.upstream_protocol,
-            key.chat_template_digest, key.profile_id, key.profile_revision,
-            key.tool_schema_fingerprint, str(key.streaming), key.effective_tool_mode,
-            key.parser_id, key.template_revision, key.backend_serving_config,
-        ])
+        content = json.dumps(asdict(key), sort_keys=True, separators=(",", ":"), default=str)
         return f"res_{hashlib.sha256(content.encode()).hexdigest()[:16]}"
 
     def store_result(
@@ -350,7 +357,7 @@ class EvidenceStore:
             "last_observed_at",
             "no_selection_request_count", "candidate_count",
             "valid_unchanged_count", "repaired_count", "regenerated_count",
-            "accepted_count", "rejected_count", "attestation", "battery_version",
+            "accepted_count", "rejected_count", "attestation", "battery_version", "key_json",
         )
         # Serialize pass/fail breakdown
         pf = result.pass_fail_breakdown
@@ -401,6 +408,7 @@ class EvidenceStore:
             result.rejected_count,
             result.attestation,
             result.battery_version,
+            json.dumps(asdict(key), sort_keys=True, default=str),
         )
 
         assert len(columns) == len(values), (
@@ -517,7 +525,8 @@ class EvidenceStore:
 
         results = []
         for row in rows:
-            key = CompatibilityKey(
+            key_data = json.loads(row["key_json"]) if row["key_json"] else {}
+            key = CompatibilityKey(**key_data) if key_data else CompatibilityKey(
                 client_id=row["client_id"],
                 client_version=row["client_version"],
                 client_protocol=row["client_protocol"],

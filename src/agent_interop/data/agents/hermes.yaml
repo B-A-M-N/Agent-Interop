@@ -1,0 +1,9 @@
+schema_version: interop.agent-integration.v1
+id: hermes
+aliases: [hermes-agent, hermes_agent]
+binaries: [hermes]
+protocols: [openai_chat]
+preferred_protocol: openai_chat
+version: {command: [hermes, --version]}
+launch: {strategy: generated_config}
+requirements: {tool_result_continuation: true, stable_tool_ids: true}

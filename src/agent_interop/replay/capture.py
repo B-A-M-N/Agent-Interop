@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
+from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from agent_interop.abi import CanonicalRequest, CanonicalTool
@@ -35,18 +36,27 @@ def sanitize_headers(headers: Mapping[str, str]) -> dict[str, str]:
     }
 
 
-def sanitize_body(body: Mapping[str, Any]) -> dict[str, Any]:
-    """Remove sensitive fields from request/response bodies."""
-    if not isinstance(body, dict):
-        return dict(body)
+def sanitize_body(body: Any) -> Any:
+    """Recursively remove sensitive content from serializable diagnostics.
 
-    sanitized = {}
-    for k, v in body.items():
-        if k.lower() in ("api_key", "token", "secret", "password"):
-            sanitized[k] = "[REDACTED]"
-        else:
-            sanitized[k] = v
-    return sanitized
+    Capture callers pass mappings, ABI dataclasses, headers, and nested lists.
+    A shallow pass can leave an API key in a nested tool payload, so every
+    branch follows the same field-name rule before persistence.
+    """
+    if is_dataclass(body) and not isinstance(body, type):
+        return sanitize_body(asdict(body))
+    if isinstance(body, Mapping):
+        return {
+            str(key): "[REDACTED]" if str(key).lower() in _SENSITIVE_HEADERS
+            or str(key).lower() in ("api_key", "token", "secret", "password")
+            else sanitize_body(value)
+            for key, value in body.items()
+        }
+    if isinstance(body, list):
+        return [sanitize_body(value) for value in body]
+    if isinstance(body, tuple):
+        return tuple(sanitize_body(value) for value in body)
+    return body
 
 
 def capture_case(
@@ -62,6 +72,7 @@ def capture_case(
     expected_invariants: Sequence[ReplayInvariant] = (),
     compatibility_key: CompatibilityKey | None = None,
     case_id: str = "",
+    diagnostics: Mapping[str, Any] | None = None,
 ) -> ReplayCase:
     """Capture a request/response cycle as a ReplayCase.
 
@@ -87,4 +98,5 @@ def capture_case(
         raw_upstream_frames=tuple(raw_upstream_frames),
         tool_registry=tuple(tool_registry),
         expected_invariants=tuple(expected_invariants),
+        diagnostics=sanitize_body(diagnostics or {}),
     )

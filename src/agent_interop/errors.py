@@ -57,6 +57,18 @@ class InteropErrorCode(str):
     # Capability errors
     CAPABILITY_REQUIRED = "CAPABILITY_REQUIRED"
     CONTEXT_LIMIT_EXCEEDED = "CONTEXT_LIMIT_EXCEEDED"
+    MODEL_QUALIFICATION_REQUIRED = "MODEL_QUALIFICATION_REQUIRED"
+    MODEL_QUALIFICATION_FAILED = "MODEL_QUALIFICATION_FAILED"
+    REQUEST_PLAN_UNAVAILABLE = "REQUEST_PLAN_UNAVAILABLE"
+    TOOL_SURFACE_EXHAUSTED = "TOOL_SURFACE_EXHAUSTED"
+    TOOL_SELECTION_FAILED = "TOOL_SELECTION_FAILED"
+    CONTEXT_ADAPTATION_FAILED = "CONTEXT_ADAPTATION_FAILED"
+    CONTROLLER_UNAVAILABLE = "CONTROLLER_UNAVAILABLE"
+    CONTROLLER_FAILED = "CONTROLLER_FAILED"
+    CONTROLLER_LOOP_DETECTED = "CONTROLLER_LOOP_DETECTED"
+    ATTEMPT_BUDGET_EXHAUSTED = "ATTEMPT_BUDGET_EXHAUSTED"
+    CLIENT_INTEGRATION_UNAVAILABLE = "CLIENT_INTEGRATION_UNAVAILABLE"
+    CLIENT_VERSION_UNSUPPORTED = "CLIENT_VERSION_UNSUPPORTED"
 
     # Tool errors
     TOOL_SCHEMA_UNSUPPORTED = "TOOL_SCHEMA_UNSUPPORTED"
@@ -163,6 +175,42 @@ ERROR_REGISTRY: dict[str, ErrorDescriptor] = {
     InteropErrorCode.CONTEXT_LIMIT_EXCEEDED: ErrorDescriptor(
         code=InteropErrorCode.CONTEXT_LIMIT_EXCEEDED, http_status=400, retryable=False,
         anthropic_type="invalid_request_error", openai_type="context_length_exceeded"),
+    InteropErrorCode.MODEL_QUALIFICATION_REQUIRED: ErrorDescriptor(
+        code=InteropErrorCode.MODEL_QUALIFICATION_REQUIRED, http_status=422, retryable=True,
+        anthropic_type="invalid_request_error", openai_type="invalid_request_error"),
+    InteropErrorCode.MODEL_QUALIFICATION_FAILED: ErrorDescriptor(
+        code=InteropErrorCode.MODEL_QUALIFICATION_FAILED, http_status=422, retryable=False,
+        anthropic_type="invalid_request_error", openai_type="invalid_request_error"),
+    InteropErrorCode.REQUEST_PLAN_UNAVAILABLE: ErrorDescriptor(
+        code=InteropErrorCode.REQUEST_PLAN_UNAVAILABLE, http_status=422, retryable=False,
+        anthropic_type="invalid_request_error", openai_type="invalid_request_error"),
+    InteropErrorCode.TOOL_SURFACE_EXHAUSTED: ErrorDescriptor(
+        code=InteropErrorCode.TOOL_SURFACE_EXHAUSTED, http_status=422, retryable=True,
+        anthropic_type="invalid_request_error", openai_type="invalid_request_error"),
+    InteropErrorCode.TOOL_SELECTION_FAILED: ErrorDescriptor(
+        code=InteropErrorCode.TOOL_SELECTION_FAILED, http_status=422, retryable=True,
+        anthropic_type="invalid_request_error", openai_type="invalid_request_error"),
+    InteropErrorCode.CONTEXT_ADAPTATION_FAILED: ErrorDescriptor(
+        code=InteropErrorCode.CONTEXT_ADAPTATION_FAILED, http_status=400, retryable=False,
+        anthropic_type="invalid_request_error", openai_type="context_length_exceeded"),
+    InteropErrorCode.CONTROLLER_UNAVAILABLE: ErrorDescriptor(
+        code=InteropErrorCode.CONTROLLER_UNAVAILABLE, http_status=503, retryable=True,
+        anthropic_type="overloaded_error", openai_type="server_error"),
+    InteropErrorCode.CONTROLLER_FAILED: ErrorDescriptor(
+        code=InteropErrorCode.CONTROLLER_FAILED, http_status=502, retryable=True,
+        anthropic_type="api_error", openai_type="server_error"),
+    InteropErrorCode.CONTROLLER_LOOP_DETECTED: ErrorDescriptor(
+        code=InteropErrorCode.CONTROLLER_LOOP_DETECTED, http_status=422, retryable=False,
+        anthropic_type="invalid_request_error", openai_type="invalid_request_error"),
+    InteropErrorCode.ATTEMPT_BUDGET_EXHAUSTED: ErrorDescriptor(
+        code=InteropErrorCode.ATTEMPT_BUDGET_EXHAUSTED, http_status=504, retryable=True,
+        anthropic_type="timeout_error", openai_type="server_error"),
+    InteropErrorCode.CLIENT_INTEGRATION_UNAVAILABLE: ErrorDescriptor(
+        code=InteropErrorCode.CLIENT_INTEGRATION_UNAVAILABLE, http_status=422, retryable=False,
+        anthropic_type="invalid_request_error", openai_type="invalid_request_error"),
+    InteropErrorCode.CLIENT_VERSION_UNSUPPORTED: ErrorDescriptor(
+        code=InteropErrorCode.CLIENT_VERSION_UNSUPPORTED, http_status=422, retryable=False,
+        anthropic_type="invalid_request_error", openai_type="invalid_request_error"),
     InteropErrorCode.TOOL_SCHEMA_UNSUPPORTED: ErrorDescriptor(
         code=InteropErrorCode.TOOL_SCHEMA_UNSUPPORTED, http_status=400, retryable=False,
         anthropic_type="invalid_request_error", openai_type="invalid_request_error"),

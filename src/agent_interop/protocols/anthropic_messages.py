@@ -27,6 +27,7 @@ from agent_interop.abi import (
     CanonicalToolCallBlock,
     CanonicalToolResultBlock,
     CanonicalUnknownBlock,
+    RequestedCapabilities,
     canonical_tool_choice,
     tool_from_anthropic,
 )
@@ -220,6 +221,16 @@ class AnthropicMessagesAdapter(ClientProtocolAdapter):
                 top_p=self.validate_top_p(body.get("top_p")),
                 stop=self.validate_stop(body.get("stop_sequences")),
                 stream=body.get("stream", False),
+            ),
+            requested_capabilities=RequestedCapabilities(
+                tools=bool(tools),
+                parallel_tools=bool(tc.get("disable_parallel_tool_use") is False) if isinstance(tc, dict) else False,
+                reasoning=bool(body.get("thinking")),
+                images=any(getattr(block, "type", "") == "image" for message in messages for block in message.content),
+                structured_output=False,
+                tool_result_continuation=any(getattr(block, "type", "") == "tool_result" for message in messages for block in message.content),
+                sequential_tools=any(getattr(block, "type", "") == "tool_result" for message in messages for block in message.content),
+                exact_named_tool=tool_choice.mode.value == "named",
             ),
             metadata={
                 "anthropic_version": headers.get("anthropic-version", body.get("anthropic-version", "2023-06-01")),

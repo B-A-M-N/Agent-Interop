@@ -40,6 +40,7 @@ from agent_interop.abi import (
     CanonicalToolChoice,
 )
 from agent_interop.config import (
+    CompatibilityConfig,
     InteropServerConfig,
     ModelRoute,
     ToolMode,
@@ -773,6 +774,49 @@ class TestGatewayStreamingDirect:
             assert "message_stop" in events
         finally:
             await gw.close()
+
+    @pytest.mark.asyncio
+    async def test_unverified_stream_buffers_until_a_validated_response(
+        self, fake_upstream: FakeStreamingUpstreamServer
+    ):
+        """Schema-v2-style routes use the non-streaming attempt ladder first.
+
+        This proves the model-visible stream is emitted only after the
+        buffered response has passed ordinary decode/extraction/validation,
+        rather than forwarding speculative textual frames from an unknown
+        compatibility path.
+        """
+        fake_upstream.set_text_response("validated buffered response")
+        config = InteropServerConfig(
+            probe_on_startup=False,
+            routes={
+                "test-route": ModelRoute(
+                    id="test-route",
+                    client_model_aliases=["test-model"],
+                    upstream_model="fake-model",
+                    upstream=UpstreamConfig(
+                        kind=UpstreamKind.OPENAI_COMPATIBLE,
+                        base_url=fake_upstream.url,
+                        wire_protocol=UpstreamProtocol.OPENAI_CHAT,
+                    ),
+                    tool_mode=ToolMode.AUTO,
+                    compatibility=CompatibilityConfig(buffer_unverified_streaming=True),
+                ),
+            },
+        )
+        gateway = Gateway(config)
+        await gateway.startup()
+        try:
+            request = CanonicalRequest(
+                model=CanonicalModelReference(requested_name="test-model"),
+                messages=[CanonicalMessage(role="user", content=[CanonicalTextBlock(text="hello")])],
+                generation=CanonicalGenerationOptions(max_output_tokens=32, stream=True),
+            )
+            events = [event async for event in gateway.handle_stream(request, RequestContext())]
+            assert [event.type for event in events] == ["text_delta", "usage_update", "message_stop"]
+            assert events[0].partial == "validated buffered response"
+        finally:
+            await gateway.close()
 
     @pytest.mark.asyncio
     async def test_gateway_handle_stream_tool_calls(

@@ -26,6 +26,7 @@ from agent_interop.abi import (
     CanonicalToolResultBlock,
     CanonicalUnknownBlock,
     ProviderMetadata,
+    RequestedCapabilities,
     canonical_tool_choice,
     tool_from_openai,
 )
@@ -229,6 +230,8 @@ class OpenAIResponsesAdapter(ClientProtocolAdapter):
                 # client's request semantics without telling them.
                 raise ValueError(f"'tool_choice' has an unrecognized value: {tc!r}")
             tool_choice = canonical_tool_choice(tc)
+        elif isinstance(tc, dict) and tc.get("type") == "function":
+            tool_choice = canonical_tool_choice("named", tc.get("name", tc.get("function", {}).get("name", "")))
         else:
             raise ValueError(f"'tool_choice' must be a string, got {tc!r}")
 
@@ -247,6 +250,16 @@ class OpenAIResponsesAdapter(ClientProtocolAdapter):
                 temperature=self.validate_temperature(body.get("temperature", 0.0)),
                 top_p=self.validate_top_p(body.get("top_p")),
                 stream=body.get("stream", False),
+            ),
+            requested_capabilities=RequestedCapabilities(
+                tools=bool(tools),
+                parallel_tools=bool(body.get("parallel_tool_calls")),
+                reasoning=any(getattr(block, "source_type", "") == "reasoning" for message in messages for block in message.content) or bool(body.get("reasoning")),
+                images=any(getattr(block, "type", "") == "image" for message in messages for block in message.content),
+                structured_output=bool(body.get("text", {}).get("format")) if isinstance(body.get("text"), dict) else False,
+                tool_result_continuation=any(getattr(block, "type", "") == "tool_result" for message in messages for block in message.content),
+                sequential_tools=any(getattr(block, "type", "") == "tool_result" for message in messages for block in message.content),
+                exact_named_tool=tool_choice.mode.value == "named",
             ),
             previous_response_id=prev_id,
             metadata={

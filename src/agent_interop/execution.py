@@ -51,6 +51,40 @@ class ToolDecisionRecord:
 
 
 @dataclass
+class RepairSavingsEstimate:
+    """Conservative estimate of a repair avoiding a model regeneration.
+
+    These are explicitly estimates: a successful deterministic repair proves
+    the call was accepted, not that a model would certainly have retried.
+    """
+
+    repaired_without_regeneration: bool = False
+    estimated_prompt_tokens_avoided: int = 0
+    estimated_tool_schema_tokens_avoided: int = 0
+    estimated_latency_avoided_ms: int | None = None
+
+
+@dataclass
+class TokenEfficiencyRecord:
+    """Per-request accounting for cost per successfully completed task."""
+
+    original_tool_schema_tokens: int = 0
+    visible_tool_schema_tokens: int = 0
+    original_history_tokens: int = 0
+    model_visible_history_tokens: int = 0
+    prompted_contract_tokens: int = 0
+    tool_result_tokens_original: int = 0
+    tool_result_tokens_visible: int = 0
+    repair_operations: int = 0
+    regenerations_avoided: int = 0
+    controller_tokens: int = 0
+    total_model_input_tokens: int = 0
+    total_model_output_tokens: int = 0
+    total_attempts: int = 0
+    task_completed: bool = False
+
+
+@dataclass
 class InteropRequestExecution:
     """Request-scoped execution coordinator.
 
@@ -66,7 +100,11 @@ class InteropRequestExecution:
     history_diagnostics: list[str] = field(default_factory=list)
     raw_frame_evidence: list[dict[str, Any]] = field(default_factory=list)
     parser_diagnostics: list[str] = field(default_factory=list)
+    compatibility_events: list[str] = field(default_factory=list)
     tool_decisions: list[ToolDecisionRecord] = field(default_factory=list)
+    repair_savings_estimates: list[RepairSavingsEstimate] = field(default_factory=list)
+    token_efficiency: TokenEfficiencyRecord = field(default_factory=TokenEfficiencyRecord)
+    diagnostic_case_id: str = ""
     repair_budget: RepairBudget | None = None
     response_outcome: str = ""  # accepted | rejected | error
     started_at: float = field(default_factory=time.monotonic)
@@ -92,6 +130,43 @@ class InteropRequestExecution:
             accepted=accepted,
         )
         self.tool_decisions.append(record)
+        repair_operations = len(record.repair_steps)
+        self.token_efficiency.repair_operations += repair_operations
+        if accepted and repair_operations:
+            self.token_efficiency.regenerations_avoided += 1
+            self.repair_savings_estimates.append(RepairSavingsEstimate(
+                repaired_without_regeneration=True,
+                estimated_prompt_tokens_avoided=self.token_efficiency.original_history_tokens,
+                estimated_tool_schema_tokens_avoided=self.token_efficiency.original_tool_schema_tokens,
+            ))
+
+    def configure_token_efficiency(self, invocation: Any) -> None:
+        """Seed transparent accounting from the chosen surface/context plan."""
+        surface = getattr(invocation, "tool_surface_plan", None)
+        context = getattr(invocation, "context_plan", None)
+        plan = getattr(invocation, "invocation_plan", None)
+        if surface is not None:
+            self.token_efficiency.original_tool_schema_tokens = surface.original_schema_tokens
+            self.token_efficiency.visible_tool_schema_tokens = surface.visible_schema_tokens
+        if context is not None:
+            self.token_efficiency.original_history_tokens = context.before.message_tokens
+            self.token_efficiency.model_visible_history_tokens = context.after.message_tokens
+            self.token_efficiency.tool_result_tokens_original = context.before.message_tokens
+            self.token_efficiency.tool_result_tokens_visible = context.after.message_tokens
+            self.token_efficiency.total_model_input_tokens = context.after.total_required_tokens
+        if plan is not None:
+            self.token_efficiency.prompted_contract_tokens = (len(plan.prompt_contract) + 3) // 4
+
+    def record_attempt(self, *, controller_tokens: int = 0) -> None:
+        self.token_efficiency.total_attempts += 1
+        self.token_efficiency.controller_tokens += controller_tokens
+
+    def record_response_tokens(self, response: CanonicalResponse) -> None:
+        visible = "".join(
+            getattr(block, "text", "") + str(getattr(block, "arguments", ""))
+            for block in response.content
+        )
+        self.token_efficiency.total_model_output_tokens += (len(visible) + 3) // 4
 
     def record_malformed_frame(self, ordinal: int, error: str, raw: str) -> None:
         """Record a malformed stream frame for evidence."""
@@ -104,6 +179,10 @@ class InteropRequestExecution:
     def record_parser_diagnostic(self, message: str) -> None:
         """Record a parser/extraction diagnostic."""
         self.parser_diagnostics.append(message)
+
+    def record_compatibility_event(self, event: str) -> None:
+        """Record bounded planner/executor events without request content."""
+        self.compatibility_events.append(event)
 
     def finalize_response(self, response: CanonicalResponse) -> None:
         """Mark execution as finished with a successful response."""
@@ -119,6 +198,8 @@ class InteropRequestExecution:
         else:
             self.response_outcome = "accepted"
             self.state = ExecutionState.SUCCEEDED
+        self.record_response_tokens(response)
+        self.token_efficiency.task_completed = self.state == ExecutionState.SUCCEEDED
         self._log_summary()
 
     def finalize_error(self, error: CanonicalError | Exception | None = None) -> None:
@@ -170,6 +251,7 @@ class InteropRequestExecution:
             "client_id": self.context.client_id if self.context else "",
             "route_id": self.route.id if self.route else "",
             "response_outcome": self.response_outcome,
+            "diagnostic_case_id": self.diagnostic_case_id,
             "tool_decisions": [
                 {
                     "tool_name": d.tool_name,

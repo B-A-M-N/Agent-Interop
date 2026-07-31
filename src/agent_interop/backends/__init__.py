@@ -1,4 +1,4 @@
-"""Backend clients for local inference servers.
+"""Backend runtime inspection and admin clients.
 
 ``ollama_admin.OllamaAdminClient`` lives in this package but is
 intentionally NOT exported here: no production CLI feature or gateway
@@ -9,4 +9,12 @@ surface until something in the tested request/CLI path actually wires
 it in.
 """
 
-__all__: list[str] = []
+from agent_interop.backends.base import BackendInspector, ModelRuntimeCapabilities
+from agent_interop.backends.registry import get_backend_inspector, register_backend_inspector
+
+__all__ = [
+    "BackendInspector",
+    "ModelRuntimeCapabilities",
+    "get_backend_inspector",
+    "register_backend_inspector",
+]

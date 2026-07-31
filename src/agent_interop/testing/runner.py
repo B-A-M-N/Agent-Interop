@@ -222,7 +222,7 @@ class RealConformanceRunner:
                 tool_choice=test.tool_choice if test.tool_choice else CanonicalToolChoice(),
             )
             try:
-                _, _, _, _, compat_key = self._gateway._resolve_invocation_plan_and_key(
+                _, _, _, _, compat_key, *_ = await self._gateway._resolve_invocation_plan_and_key(
                     route, key_request, context, streaming=False,
                 )
                 result.compat_key = compat_key

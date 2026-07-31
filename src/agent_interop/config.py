@@ -22,6 +22,14 @@ class ToolMode(Enum):
     DISABLED = "disabled"
 
 
+class ToolSurfaceMode(str, Enum):
+    """How much of the client tool registry is visible to a model."""
+
+    TRANSPARENT = "transparent"
+    SCOPED = "scoped"
+    DYNAMIC = "dynamic"
+
+
 class UpstreamKind(Enum):
     """The inference server software."""
 
@@ -127,6 +135,81 @@ class RepairConfig:
     # of requiring every operator to discover and set this per route.
     field_aliases: str = "compatibility_pack"
     batch_policy: str = "atomic"
+
+
+@dataclass
+class ToolSurfaceConfig:
+    mode: ToolSurfaceMode = ToolSurfaceMode.DYNAMIC
+    toolsets: tuple[str, ...] = ()
+    allow_tools: tuple[str, ...] = ()
+    deny_tools: tuple[str, ...] = ()
+    max_initial_tools: int = 8
+    max_schema_tokens: int = 8192
+    max_selection_rounds: int = 1
+    selector: str = "lexical"
+    allow_embedding_selector: bool = False
+
+
+@dataclass
+class ContextConfig:
+    strategy: str = "auto"
+    output_reserve_tokens: int = 4096
+    context_limit_tokens: int = 0
+    allow_tool_reduction: bool = True
+    allow_history_compaction: bool = True
+    allow_controller_decomposition: bool = True
+
+
+@dataclass
+class QualificationConfig:
+    """When bounded model qualification is allowed to run."""
+
+    # Programmatic/legacy routes stay opt-in. Schema-v2 configuration opts
+    # into the target blocking behavior below, preserving existing callers.
+    bootstrap: str = "on_demand"
+    full_battery: str = "on_demand"
+    cache_by_digest: bool = True
+
+
+@dataclass
+class DiagnosticsConfig:
+    """Privacy-preserving replay/diagnostic capture policy."""
+
+    capture: str = "failures"
+    content_mode: str = "metadata_only"
+    max_case_bytes: int = 1024 * 1024
+    max_frames: int = 128
+    retention_count: int = 100
+    # Legacy/programmatic configs retain in-memory capture. Schema-v2 config
+    # enables durable, sanitized case retention by default below.
+    persist: bool = False
+
+
+@dataclass
+class ControllerConfig:
+    enabled: bool = True
+    route_id: str = ""
+    auto_select_route: bool = True
+    minimum_controller_level: str = "L3"
+    # Schema-v2 config enables this below; legacy programmatic routes retain
+    # their historical behavior until operators opt into controller gating.
+    require_verified: bool = False
+    max_controller_turns: int = 4
+    max_primary_turns: int = 4
+    allow_primary_tool_calls: bool = False
+    preserve_primary_reasoning: bool = False
+
+
+@dataclass
+class CompatibilityConfig:
+    mode: str = "auto"
+    allow_direct: bool = True
+    allow_adapted: bool = True
+    allow_controlled: bool = True
+    # Schema-v2 routes buffer unknown/non-direct streaming attempts until the
+    # same ladder that protects non-streaming output has accepted one.
+    buffer_unverified_streaming: bool = False
+    max_attempts: int = 3
 
 
 class MalformedJsonPolicy(str, Enum):
@@ -254,6 +337,11 @@ class ModelRoute:
     tool_mode: ToolMode = ToolMode.AUTO
     translation_mode: TranslationMode = TranslationMode.CANONICAL
     repair: RepairConfig = field(default_factory=RepairConfig)
+    tool_surface: ToolSurfaceConfig = field(default_factory=ToolSurfaceConfig)
+    context: ContextConfig = field(default_factory=ContextConfig)
+    qualification: QualificationConfig = field(default_factory=QualificationConfig)
+    controller: ControllerConfig | None = None
+    compatibility: CompatibilityConfig = field(default_factory=CompatibilityConfig)
 
 
 @dataclass
@@ -284,6 +372,8 @@ class InteropServerConfig:
     ingress_auth: dict[str, str] = field(default_factory=dict)
     backend_timeout: float = 120.0
     evidence: EvidenceConfig | None = None  # Opt-in; None = no evidence store
+    controller: ControllerConfig = field(default_factory=ControllerConfig)
+    diagnostics: DiagnosticsConfig = field(default_factory=DiagnosticsConfig)
 
     # Operational transport settings (P0.6)
     connect_timeout: float = 5.0
@@ -474,6 +564,24 @@ def validate_config(config: InteropServerConfig) -> list[str]:
                 "is not implemented; only 'canonical' is supported"
             )
 
+        surface = route.tool_surface
+        if surface.max_initial_tools <= 0:
+            issues.append(f"Route '{route_id}': tool_surface.max_initial_tools must be positive")
+        if surface.max_schema_tokens <= 0:
+            issues.append(f"Route '{route_id}': tool_surface.max_schema_tokens must be positive")
+        if surface.max_selection_rounds <= 0:
+            issues.append(f"Route '{route_id}': tool_surface.max_selection_rounds must be positive")
+        if surface.selector != "lexical" and not surface.allow_embedding_selector:
+            issues.append(f"Route '{route_id}': unsupported tool_surface.selector '{surface.selector}'")
+        if route.context.output_reserve_tokens <= 0:
+            issues.append(f"Route '{route_id}': context.output_reserve_tokens must be positive")
+        if route.context.context_limit_tokens < 0:
+            issues.append(f"Route '{route_id}': context.context_limit_tokens must be nonnegative")
+        if route.compatibility.mode not in {"auto", "direct", "adapted", "controlled"}:
+            issues.append(f"Route '{route_id}': compatibility.mode must be auto, direct, adapted, or controlled")
+        if route.compatibility.max_attempts <= 0:
+            issues.append(f"Route '{route_id}': compatibility.max_attempts must be positive")
+
         # Cross-field: explicit profile must exist unless "auto"
         if route.profile and route.profile != "auto":
             from agent_interop.model.profiles_v2 import load_profiles
@@ -593,7 +701,7 @@ def validate_config(config: InteropServerConfig) -> list[str]:
     return issues
 
 
-SUPPORTED_CONFIG_SCHEMA_VERSIONS = (1,)
+SUPPORTED_CONFIG_SCHEMA_VERSIONS = (1, 2)
 
 
 def load_config_from_dict(data: dict[str, Any]) -> InteropServerConfig:
@@ -633,6 +741,39 @@ def load_config_from_dict(data: dict[str, Any]) -> InteropServerConfig:
             field_aliases=repair_data.get("field_aliases", RepairConfig().field_aliases),
             batch_policy=repair_data.get("batch_policy", RepairConfig().batch_policy),
         )
+        tool_surface_data = rd.get("tool_surface", {})
+        tool_surface = ToolSurfaceConfig(
+            mode=ToolSurfaceMode(tool_surface_data.get("mode", ToolSurfaceMode.DYNAMIC.value)),
+            toolsets=tuple(tool_surface_data.get("toolsets", ())),
+            allow_tools=tuple(tool_surface_data.get("allow_tools", ())),
+            deny_tools=tuple(tool_surface_data.get("deny_tools", ())),
+            max_initial_tools=tool_surface_data.get("max_initial_tools", 8),
+            max_schema_tokens=tool_surface_data.get("max_schema_tokens", 8192),
+            max_selection_rounds=tool_surface_data.get("max_selection_rounds", 1),
+            selector=tool_surface_data.get("selector", "lexical"),
+            allow_embedding_selector=tool_surface_data.get("allow_embedding_selector", False),
+        )
+        context_data = rd.get("context", {})
+        context = ContextConfig(
+            strategy=context_data.get("strategy", "auto"),
+            output_reserve_tokens=context_data.get("output_reserve_tokens", 4096),
+            context_limit_tokens=context_data.get("context_limit_tokens", 0),
+            allow_tool_reduction=context_data.get("allow_tool_reduction", True),
+            allow_history_compaction=context_data.get("allow_history_compaction", True),
+            allow_controller_decomposition=context_data.get("allow_controller_decomposition", True),
+        )
+        qualification_data = dict(rd.get("qualification", {}))
+        if schema_version == 2 and "bootstrap" not in qualification_data:
+            qualification_data["bootstrap"] = "blocking_for_tool_requests"
+        qualification = QualificationConfig(**qualification_data)
+        controller_data = rd.get("controller")
+        if schema_version == 2 and isinstance(controller_data, dict) and "require_verified" not in controller_data:
+            controller_data = {**controller_data, "require_verified": True}
+        controller = ControllerConfig(**controller_data) if isinstance(controller_data, dict) else None
+        compatibility_data = dict(rd.get("compatibility", {}))
+        if schema_version == 2 and "buffer_unverified_streaming" not in compatibility_data:
+            compatibility_data["buffer_unverified_streaming"] = True
+        compatibility = CompatibilityConfig(**compatibility_data)
         routes[route_id] = ModelRoute(
             id=route_id,
             client_model_aliases=rd.get("aliases", []),
@@ -642,6 +783,11 @@ def load_config_from_dict(data: dict[str, Any]) -> InteropServerConfig:
             tool_mode=ToolMode(rd.get("tool_mode", "auto")),
             translation_mode=TranslationMode(rd.get("translation_mode", "canonical")),
             repair=repair,
+            tool_surface=tool_surface,
+            context=context,
+            qualification=qualification,
+            controller=controller,
+            compatibility=compatibility,
         )
 
     # Transport settings (P0.6)
@@ -655,6 +801,14 @@ def load_config_from_dict(data: dict[str, Any]) -> InteropServerConfig:
             enabled=evidence_data.get("enabled", False),
             db_path=evidence_data.get("db_path"),
         )
+    controller_data = dict(data.get("controller", {}))
+    if schema_version == 2 and "require_verified" not in controller_data:
+        controller_data["require_verified"] = True
+    controller = ControllerConfig(**controller_data)
+    diagnostics_data = dict(data.get("diagnostics", {}))
+    if schema_version == 2 and "persist" not in diagnostics_data:
+        diagnostics_data["persist"] = True
+    diagnostics = DiagnosticsConfig(**diagnostics_data)
 
     return InteropServerConfig(
         host=data.get("host", "127.0.0.1"),
@@ -683,6 +837,8 @@ def load_config_from_dict(data: dict[str, Any]) -> InteropServerConfig:
             transport.get("retryable_statuses", (429, 500, 502, 503, 504))
         ),
         evidence=evidence,
+        controller=controller,
+        diagnostics=diagnostics,
     )
 
 

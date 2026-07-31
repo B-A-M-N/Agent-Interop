@@ -1,0 +1,8 @@
+schema_version: interop.agent-integration.v1
+id: crush
+binaries: [crush]
+protocols: [openai_chat]
+preferred_protocol: openai_chat
+version: {command: [crush, --version]}
+launch: {strategy: generated_config}
+requirements: {tool_result_continuation: true}

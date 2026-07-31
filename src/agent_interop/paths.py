@@ -47,3 +47,8 @@ def log_file() -> Path:
 
 def evidence_file() -> Path:
     return state_dir() / "evidence.db"
+
+
+def diagnostic_cases_dir() -> Path:
+    """Directory for bounded, sanitized live diagnostic replay cases."""
+    return state_dir() / "replay-cases"

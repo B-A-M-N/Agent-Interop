@@ -1,0 +1,9 @@
+schema_version: interop.agent-integration.v1
+id: claude_code
+aliases: [claude, claude-code]
+binaries: [claude]
+protocols: [anthropic_messages]
+preferred_protocol: anthropic_messages
+version: {command: [claude, --version]}
+launch: {strategy: environment}
+requirements: {streaming: true, tool_result_continuation: true, stable_tool_ids: true, model_alias_prefix: claude}

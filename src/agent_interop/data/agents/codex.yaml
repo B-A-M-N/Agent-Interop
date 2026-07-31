@@ -1,0 +1,8 @@
+schema_version: interop.agent-integration.v1
+id: codex
+binaries: [codex]
+protocols: [openai_responses]
+preferred_protocol: openai_responses
+version: {command: [codex, --version]}
+launch: {strategy: generated_config}
+requirements: {streaming: true, tool_result_continuation: true, stable_tool_ids: true}

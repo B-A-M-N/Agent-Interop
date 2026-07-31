@@ -1,0 +1,8 @@
+schema_version: interop.agent-integration.v1
+id: opencode
+binaries: [opencode]
+protocols: [openai_chat]
+preferred_protocol: openai_chat
+version: {command: [opencode, --version]}
+launch: {strategy: generated_config}
+requirements: {tool_result_continuation: true}
