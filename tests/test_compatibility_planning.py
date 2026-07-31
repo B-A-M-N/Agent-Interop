@@ -846,3 +846,47 @@ def test_controlled_execution_consumes_private_delegation_before_client_response
     assert state is not None
     assert (state.primary_turn_count, state.controller_turn_count) == (2, 2)
     assert "controller_delegated_primary" in invocation.execution_record.compatibility_events
+
+
+def test_controller_delegation_checks_controller_budget_before_another_primary_turn() -> None:
+    primary = _route(allow_adapted=False, allow_direct=False, allow_controlled=True)
+    primary.id = "primary"
+    primary.client_model_aliases = ["primary"]
+    primary.controller = ControllerConfig(route_id="controller", max_primary_turns=3, max_controller_turns=1)
+    controller = _route(allow_adapted=True, allow_direct=False, allow_controlled=False)
+    controller.id = "controller"
+    controller.client_model_aliases = ["controller"]
+    gateway = Gateway(InteropServerConfig(default_route_id="primary", routes={"primary": primary, "controller": controller}))
+    context = RequestContext(session_id="controller-budget", client_id="test")
+    request = CanonicalRequest(
+        model=CanonicalModelReference(requested_name="primary"),
+        messages=[CanonicalMessage(role="user", content=[CanonicalTextBlock(text="inspect a file")])],
+        tools=[_tool("read_file", "read a file")],
+        tool_choice=CanonicalToolChoice.required(),
+    )
+    base_plan = build_invocation_plan([], CanonicalToolChoice.none(), ToolMode.DISABLED)
+    invocation = ResolvedInvocation(
+        context, request, request, primary, object(), object(), object(), base_plan, object(), object(), None, None,
+        InteropRequestExecution(context=context),
+        tool_surface_plan=type("Surface", (), {"fingerprint": "tools"})(),
+    )
+    sent = 0
+
+    async def fake_send(inv, record):
+        nonlocal sent
+        sent += 1
+        if sent == 1:
+            return CanonicalResponse(content=[CanonicalTextBlock(text="First analysis")])
+        if sent == 2:
+            return CanonicalResponse(content=[CanonicalToolCallBlock(
+                id="internal_1", name=CONTROLLER_DELEGATE_TOOL_NAME,
+                arguments={"prompt": "Inspect one more detail."},
+            )])
+        raise AssertionError("controller budget must stop before another primary call")
+
+    gateway._handle_request_send = fake_send  # type: ignore[method-assign]
+    response = asyncio.run(gateway._execute_controller_attempt(invocation, invocation.execution_record))
+    assert response.error is not None
+    assert response.error.code == "CONTROLLER_LOOP_DETECTED"
+    assert response.error.details["responsible"] == "controller"
+    assert sent == 2

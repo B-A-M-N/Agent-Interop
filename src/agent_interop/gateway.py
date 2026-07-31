@@ -1912,14 +1912,18 @@ class Gateway:
 
         refinement_prompt = ""
         while True:
-            primary_failure = await ask_primary(refinement_prompt)
-            if primary_failure is not None:
-                return primary_failure
-            refinement_prompt = ""
+            # A controller delegation consumes a controller turn already.
+            # Check that budget before asking the worker for another costly
+            # work product; otherwise a saturated controller could still
+            # cause one unnecessary primary-model generation.
             if controller_turns >= effective_controller.max_controller_turns:
                 return loop_error(
                     "Controller exceeded its bounded turn budget", responsible="controller",
                 )
+            primary_failure = await ask_primary(refinement_prompt)
+            if primary_failure is not None:
+                return primary_failure
+            refinement_prompt = ""
             rendered_work_products = "\n\n".join(
                 f"[primary turn {index}]\n{work_product}"
                 for index, work_product in enumerate(work_products, start=1)
