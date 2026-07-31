@@ -8,7 +8,7 @@ model to direct tool mode on its own.
 from __future__ import annotations
 
 from agent_interop.config import ToolMode
-from agent_interop.context_budget import ContextBudgetPlanner
+from agent_interop.context_budget import ContextBudgetPlanner, effective_context_limit
 from agent_interop.context_budget.estimator import estimate_request_context
 from agent_interop.planning.attempts import adapted_attempts, direct_attempts
 from agent_interop.planning.decisions import missing_behavioral_capabilities
@@ -41,7 +41,12 @@ class RequestCompatibilityPlanner:
         from agent_interop.context_budget.types import TokenEstimate
         requirements = derive_request_requirements(request, context, client_requirements, TokenEstimate(token_estimate))
         tool_surface = ToolSurfacePlanner().plan(request, route.tool_surface)
-        runtime_limit = runtime_capabilities.effective_context_tokens or runtime_capabilities.configured_context_tokens or runtime_capabilities.architecture_context_tokens
+        runtime_limit = effective_context_limit(
+            runtime_capabilities.architecture_context_tokens,
+            runtime_capabilities.configured_context_tokens,
+            route.context.context_limit_tokens,
+            runtime_capabilities.effective_context_tokens,
+        )
         context_plan = ContextBudgetPlanner().plan(
             request,
             runtime_limit_tokens=runtime_limit,

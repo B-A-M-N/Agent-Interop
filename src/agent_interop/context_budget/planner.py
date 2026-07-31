@@ -38,9 +38,14 @@ class ContextLimitExceededError(ValueError):
 
 
 def effective_context_limit(
-    architecture_limit: int, configured_limit: int, route_override: int = 0,
+    architecture_limit: int,
+    configured_limit: int,
+    route_override: int = 0,
+    observed_effective_limit: int = 0,
 ) -> int:
-    limits = [value for value in (architecture_limit, configured_limit, route_override) if value > 0]
+    limits = [value for value in (
+        architecture_limit, configured_limit, route_override, observed_effective_limit,
+    ) if value > 0]
     return min(limits) if limits else 0
 
 

@@ -126,6 +126,29 @@ def test_effective_context_limit_cannot_exceed_runtime() -> None:
     assert effective_context_limit(32768, 16384, 65536) == 16384
 
 
+def test_planner_honors_route_context_override_as_a_hard_ceiling() -> None:
+    route = _route()
+    route.context = ContextConfig(context_limit_tokens=1024, output_reserve_tokens=16)
+    request = CanonicalRequest(
+        messages=[CanonicalMessage(role="user", content=[CanonicalTextBlock(text="hello")])],
+    )
+    plan = asyncio.run(RequestCompatibilityPlanner().plan(
+        request=request,
+        context=RequestContext(),
+        route=route,
+        client_requirements=object(),
+        codec_capabilities=CodecCapabilities(),
+        runtime_capabilities=ModelRuntimeCapabilities(
+            backend_kind=UpstreamKind.OLLAMA,
+            architecture_context_tokens=32768,
+            configured_context_tokens=8192,
+            effective_context_tokens=8192,
+        ),
+        behavioral_capabilities=BehavioralCapabilities(),
+    ))
+    assert plan.context_plan.runtime_limit_tokens == 1024
+
+
 def test_direct_path_requires_codec_runtime_and_behavioral_evidence() -> None:
     request = CanonicalRequest(
         model=CanonicalModelReference(requested_name="local"),
