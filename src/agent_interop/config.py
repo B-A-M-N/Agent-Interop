@@ -727,16 +727,22 @@ def validate_config(config: InteropServerConfig) -> list[str]:
                         "does not support native tools"
                     )
 
-        # Cross-field: regeneration requires a codec that supports repair requests
+        # Cross-field: regeneration requires a codec with a DECLARED repair
+        # strategy (P0-codec-repair-capability). The historical check —
+        # hasattr(codec, 'build_repair_request') — was vacuously true for
+        # every codec because the base class always defines the method.
+        # Method existence proved nothing about whether the protocol can
+        # actually express a correction request.
         if r.max_regenerations > 0:
+            from agent_interop.upstreams.codec import RepairStrategy
             from agent_interop.upstreams.registry import get_codec
             try:
                 codec = get_codec(route.upstream.wire_protocol)
-                # Verify the codec has repair request capability
-                if not hasattr(codec, 'build_repair_request'):
+                if codec.capabilities().repair_strategy is RepairStrategy.UNSUPPORTED:
                     issues.append(
                         f"Route '{route_id}': max_regenerations > 0 but codec "
-                        f"'{route.upstream.wire_protocol.value}' does not support repair requests"
+                        f"'{route.upstream.wire_protocol.value}' declares no supported "
+                        "repair strategy (repair_strategy=unsupported)"
                     )
             except ValueError:
                 issues.append(

@@ -106,6 +106,10 @@ def test_gateway_uses_only_v2_repair_pipeline() -> None:
         "agent_interop.repair.pipeline",
         "agent_interop.repair.invocation",
         "agent_interop.repair.schema",
+        # P0-wire-regeneration: the gateway-owned adapter that turns the
+        # transaction service's regenerate_fn callback into one real,
+        # budgeted generation through the seam.
+        "agent_interop.repair.adapter",
     }
 
     violations: list[str] = []

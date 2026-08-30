@@ -94,18 +94,24 @@ def _request(max_output: int = 64) -> CanonicalRequest:
 
 def test_serialized_body_reaches_transport_unchanged():
     """The transport receives serialized_body bytes that are exactly the
-    compact JSON of body — the request was serialized once, by the gateway."""
+    compact JSON of the rendered request — serialized once, by the gateway.
+    P0-6: the seam no longer also parses the bytes back into ``body``; the
+    lazy accessor reconstructs the dict only when a consumer asks."""
     transport = _CapturingTransport()
     gw = Gateway(_config(), transport=transport)
     resp = asyncio.run(gw.handle_request(_request(), RequestContext()))
     assert resp.error is None
     req = transport.last
     assert req is not None and req.serialized_body is not None
-    # Byte-identical to a compact serialization of the body dict.
-    compact = json.dumps(req.body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    # The hot path never parsed the bytes into a dict (P0-6).
+    assert req.body is None
+    # Byte-identical to a compact serialization of the reconstructed dict.
+    compact = json.dumps(
+        req.materialized_body(), ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")
     assert req.serialized_body == compact
     # And it parses back to the same body.
-    assert json.loads(req.serialized_body) == req.body
+    assert json.loads(req.serialized_body) == req.materialized_body()
 
 
 def test_serialized_body_present_on_stream_request():

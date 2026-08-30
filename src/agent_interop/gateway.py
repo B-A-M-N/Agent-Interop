@@ -380,6 +380,16 @@ class Gateway:
 
         self._attempt_hints = AttemptHintCache()
 
+        # P0-7: stream-safety observations — the buffered-stream gate's
+        # automatic path.  One fully-accepted unbuffered streaming turn on
+        # a serving tuple unlocks later streams of the SAME tuple; a
+        # rejected batch revokes it.  NOT evidence-store material and
+        # never persisted: the opt-in evidence store keeps its role as the
+        # durable, operator-certified channel.
+        from agent_interop.planning.stream_safety import StreamSafetyCache
+
+        self._stream_safety = StreamSafetyCache()
+
         # P1.8: ONE planner for the gateway's lifetime so its plan cache can
         # actually serve across requests — instantiating per request made
         # the cache a permanent miss.
@@ -462,6 +472,7 @@ class Gateway:
             record_tool_decisions=self._record_tool_decisions,
             record_evidence_observation=self._record_evidence_observation,
             build_batch_rejection_error=self._build_batch_rejection_error,
+            record_stream_safety=self._record_stream_safety_observation,
         )
 
         # The controlled (controller-mediated) attempt loop: route selection,
@@ -488,6 +499,28 @@ class Gateway:
             diagnostic_cases_dir() if config.diagnostics.persist else None,
             config.diagnostics.max_case_bytes,
         )
+
+    def _record_stream_safety_observation(
+        self,
+        invocation: ResolvedInvocation,
+        accepted: bool,
+    ) -> None:
+        """P0-7: one stream's batch outcome updates the tuple's observation.
+
+        A fully-accepted tool batch records stream safety; a rejected batch
+        revokes it. Failures here must never break the client stream, so
+        the whole operation is wrapped.
+        """
+        try:
+            key = self._stream_safety_key(invocation)
+            if not key:
+                return
+            if accepted:
+                self._stream_safety.record(key)
+            else:
+                self._stream_safety.revoke(key)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("stream-safety observation failed", exc_info=True)
 
     @property
     def transport(self) -> UpstreamTransport:
@@ -1546,7 +1579,11 @@ class Gateway:
         from agent_interop.replay.capture import capture_case
 
         def metadata(value: Any) -> dict[str, Any]:
-            return asdict(value) if value is not None and is_dataclass(value) else {}
+            # is_dataclass accepts classes as well as instances; only an
+            # instance can be expanded, so exclude the class form explicitly.
+            if value is None or isinstance(value, type) or not is_dataclass(value):
+                return {}
+            return asdict(value)
 
         def plan_metadata() -> dict[str, Any]:
             compatibility = invocation.compatibility_plan
@@ -1612,12 +1649,20 @@ class Gateway:
         and drop telemetry/compatibility_key.
         """
         request_context = invocation.request_context
+        from agent_interop.repair.adapter import make_regenerate_fn
         return ToolTransactionContext(
             request_id=request_context.request_id if request_context else "",
             session_id=getattr(request_context, 'session_id', '') if request_context else '',
             tool_choice=canonical.tool_choice,
             repair_policy=invocation.repair_policy,
             client_id=request_context.client_id if request_context else None,
+            # P0-wire-regeneration: the hidden repair generation is real —
+            # it reserves budget, passes admission, and is accounted under
+            # purpose="tool_repair". None (AUTO default) means the
+            # transaction service performs deterministic repair only.
+            regenerate_fn=make_regenerate_fn(
+                self, invocation, invocation.execution_record,
+            ),
             telemetry=self._telemetry,
             budget=invocation.repair_budget,
             compatibility_key=invocation.compatibility_key,
@@ -1772,8 +1817,8 @@ class Gateway:
             model_profile=invocation.model_profile,
             repair_policy=invocation.repair_policy,
             codec_capabilities=invocation.codec.capabilities(),
-            upstream_tools=surface.visible_tools,
-            validation_tools=surface.validation_tools,
+            upstream_tools=list(surface.visible_tools) if surface is not None else [],
+            validation_tools=list(surface.validation_tools) if surface is not None else [],
             capabilities=getattr(invocation, "private_capabilities", None),
         )
         if attempt.constrained_output:
@@ -1820,7 +1865,11 @@ class Gateway:
         """Rebuild an attempt once after an unseen declared tool was requested."""
         from agent_interop.tool_surface.selector import ToolSurfacePlanner
 
-        surface = ToolSurfacePlanner.replan_with_tool(invocation.tool_surface_plan, tool_name)
+        if invocation.tool_surface_plan is None:
+            return invocation
+        surface = ToolSurfacePlanner.replan_with_tool(
+            invocation.tool_surface_plan, tool_name,
+        )
         if surface is invocation.tool_surface_plan:
             return invocation
         if invocation.execution_record is not None:
@@ -2308,14 +2357,20 @@ class Gateway:
         exec_record: InteropRequestExecution,
         *,
         purpose: str = "private_continuation",
+        attempt_request: CanonicalRequest | None = None,
     ) -> tuple[CanonicalResponse, bytes]:
         """One generation with no extraction and no transaction pipeline —
         the private continuation loop's unit of work, delegated to the
         generation seam (which owns budget reservation, admission, and
-        decoding into the uniform CanonicalResponse shape)."""
+        decoding into the uniform CanonicalResponse shape).
+
+        ``attempt_request`` narrows the rendered surface for this step only
+        (the tool-repair adapter passes a no-tool correction request); the
+        invocation's resolved facts are reused untouched."""
         return await self._generation_seam.run_step(
             invocation, exec_record, purpose=purpose,
             context_limit_error=self._context_limit_error,
+            attempt_request=attempt_request,
         )
 
     def _extract_tool_candidates(
@@ -3059,8 +3114,56 @@ class Gateway:
         async for event in self._handle_stream_send(invocation, exec_record):
             yield event
 
+    def _stream_safety_key(self, invocation: ResolvedInvocation) -> str:
+        """P0-7: the serving tuple a stream-safety observation attaches to."""
+        from agent_interop.planning.stream_safety import stream_safety_key
+
+        runtime = getattr(invocation, "runtime_capabilities", None)
+        fingerprint = ""
+        requirements = getattr(invocation, "request_requirements", None)
+        if requirements is not None:
+            fingerprint = getattr(requirements, "tool_schema_fingerprint", "") or ""
+        if not fingerprint:
+            fingerprint = self._compute_tool_schema_fingerprint(
+                invocation.reconciled_request.tools,
+            )
+        choice = invocation.reconciled_request.tool_choice
+        choice_class = {
+            "auto": "auto",
+            "none": "none",
+            "required": "required",
+        }.get(getattr(choice.mode, "value", str(choice.mode)), "named")
+        return stream_safety_key(
+            model_digest=getattr(runtime, "model_digest", "") or "",
+            template_digest=getattr(runtime, "chat_template_digest", "") or "",
+            serving_config_digest=getattr(runtime, "serving_config_digest", "") or "",
+            profile_revision=str(getattr(
+                getattr(invocation, "model_profile", None), "profile_revision", "",
+            ) or ""),
+            client_protocol=(
+                f"{getattr(getattr(invocation, 'request_context', None), 'client_id', '') or ''}"
+                f"/{getattr(getattr(invocation, 'request_context', None), 'wire_protocol', '') or ''}"
+            ),
+            tool_surface_fingerprint=fingerprint,
+            tool_choice_class=choice_class,
+        )
+
+    def _requires_buffered_stream_validation(self, invocation: ResolvedInvocation) -> bool:
+        """Instance entry: resolve the tuple's stream-safety observation,
+        then apply the pure policy."""
+        return self._buffered_stream_policy(
+            invocation,
+            observation_unlocks=self._stream_safety.is_safe(
+                self._stream_safety_key(invocation),
+            ),
+        )
+
     @staticmethod
-    def _requires_buffered_stream_validation(invocation: ResolvedInvocation) -> bool:
+    def _buffered_stream_policy(
+        invocation: ResolvedInvocation,
+        *,
+        observation_unlocks: bool,
+    ) -> bool:
         """Whether this stream must wait for an accepted ladder response.
 
         P0-24/P0-25 (review): buffering is a TTFT tax, so it applies ONLY
@@ -3076,8 +3179,12 @@ class Gateway:
              immediately.
           3. tool_choice=NONE (no private caps) ⇒ never buffer, same reason.
           4. Otherwise: unverified native/prompted tool streams buffer until
-             a validated response exists (verified native+evidence streams
-             immediately).
+             a validated response exists.  Two independent unlock paths —
+             P0-7: an operator-certified evidence record for this tuple,
+             OR a recent in-process stream-safety observation (one prior
+             unbuffered stream on this exact tuple came back fully
+             accepted). A deployment that never configured the evidence
+             store still earns the streaming fast path.
         """
         if not invocation.route.compatibility.buffer_unverified_streaming:
             return False
@@ -3092,12 +3199,15 @@ class Gateway:
             return False
         plan = invocation.invocation_plan
         compatibility = invocation.compatibility_plan
-        return not (
+        if not (
             compatibility is not None
             and getattr(compatibility.path, "value", compatibility.path) == "direct"
-            and invocation.evidence_record is not None
             and plan is not None
             and plan.effective_tool_mode == ToolMode.NATIVE
+        ):
+            return True
+        return not (
+            invocation.evidence_record is not None or observation_unlocks
         )
 
     async def _events_from_buffered_response(self, response: CanonicalResponse) -> AsyncIterator[CanonicalEvent]:

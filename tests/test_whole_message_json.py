@@ -517,7 +517,7 @@ class TestGatewayEndToEnd:
                             yield from _iter_strings(v)
 
                 nonce = ""
-                for s in _iter_strings(request.body):
+                for s in _iter_strings(request.materialized_body()):
                     m = re.search(r'"interop_call_id":\s*"([0-9a-f]+)"', s)
                     if m:
                         nonce = m.group(1)

@@ -128,6 +128,14 @@ DecodedStreamEvent = (
 DecodedModelEvent = DecodedStreamEvent
 
 
+class RepairNotSupportedError(Exception):
+    """This codec declares no supported hidden-repair request strategy.
+
+    Raised by ``build_repair_request`` instead of silently producing a
+    Chat-Completions-shaped body a different protocol cannot parse.
+    """
+
+
 class StreamFraming(str, Enum):
     """How upstream streaming responses are framed."""
 
@@ -136,6 +144,25 @@ class StreamFraming(str, Enum):
 
 
 @dataclass(frozen=True)
+class RepairStrategy(str, Enum):
+    """How this codec renders a hidden repair/correction request.
+
+    P0-codec-repair-capability: method existence proves nothing — the base
+    class always has ``build_repair_request``. A codec must DECLARE its
+    strategy; an undeclared/unsupported strategy makes config-level
+    regeneration enablement invalid instead of silently falling back to a
+    Chat-Completions-shaped request that other protocols cannot parse.
+    """
+
+    # Chat-Completions-shaped: append the correction as a user message.
+    # Correct only for protocols whose request body has a "messages" list.
+    MESSAGE_APPEND = "message_append"
+    # The protocol has no supported correction shape — regeneration must
+    # not be enabled against this codec.
+    UNSUPPORTED = "unsupported"
+
+
+@dataclass
 class CodecCapabilities:
     """Declared capabilities of an upstream codec.
 
@@ -152,6 +179,10 @@ class CodecCapabilities:
     supports_n_choices: bool = False
     max_tools: int = 128
     streaming_framing: StreamFraming = StreamFraming.SSE
+    # P0-codec-repair-capability: explicit typed repair support. The
+    # historical capability check was hasattr(codec, 'build_repair_request'),
+    # which the base class always satisfied — vacuously true for every codec.
+    repair_strategy: RepairStrategy = RepairStrategy.MESSAGE_APPEND
 
 
 class ModelCodec(ABC):
@@ -253,10 +284,11 @@ class ModelCodec(ABC):
     ) -> dict[str, Any]:
         """Build a repair/correction request for hidden regeneration.
 
-        Each codec can override this to construct a protocol-native correction
-        request that forces the target tool and uses constrained decoding when
-        available. The default implementation appends a user message with the
-        correction prompt (Chat Completions style).
+        P0-codec-repair-capability: a codec must declare
+        ``capabilities().repair_strategy`` for this to run. The default
+        implementation is Chat-Completions-shaped (appends a user message
+        to a ``messages`` list) — a protocol whose request body has no
+        ``messages`` array cannot use it and must declare UNSUPPORTED.
 
         Args:
             original_request: The original upstream request body.
@@ -264,7 +296,18 @@ class ModelCodec(ABC):
 
         Returns:
             A new request body suitable for sending to the upstream.
+
+        Raises:
+            RepairNotSupportedError: when this codec declares no supported
+                repair strategy — regeneration is a config error for that
+                route, not a silent fallback.
         """
+        strategy = self.capabilities().repair_strategy
+        if strategy is RepairStrategy.UNSUPPORTED:
+            raise RepairNotSupportedError(
+                f"codec for {self.protocol.value} declares no supported "
+                "repair strategy; enable regeneration only on codecs that do"
+            )
         import copy
         correction_body = copy.deepcopy(original_request)
         correction_body["stream"] = False

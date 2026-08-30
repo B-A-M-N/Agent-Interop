@@ -466,12 +466,20 @@ async def _attempt_regeneration(
 
     Only performed when the caller has explicitly enabled regeneration
     and the model emitted a declared but malformed tool call.
+
+    P0-repair-budget: the orchestrator dispatches ONE correction
+    generation per call; this layer owns repetition through the shared
+    ``RepairBudget`` — one budget increment = one actual model call. The
+    policy's latency and input ceilings are passed through so the route's
+    configured limits are authoritative, not this module's constants.
     """
     from agent_interop.repair.regenerate import RegenerationOrchestrator
 
-    max_attempts = getattr(policy, 'max_regenerations', 1) if policy else 1
     try:
-        orchestrator = RegenerationOrchestrator(max_attempts=max_attempts)
+        orchestrator = RegenerationOrchestrator(
+            max_latency_ms=getattr(policy, 'max_added_latency_ms', 15000) if policy else 15000,
+            max_input_bytes=getattr(policy, 'max_input_bytes', 65536) if policy else 65536,
+        )
         corrected = await orchestrator.attempt(
             tool_name=canonical_name,
             raw_arguments=candidate.raw_arguments,

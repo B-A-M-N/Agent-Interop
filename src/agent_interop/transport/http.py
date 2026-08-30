@@ -59,15 +59,30 @@ class PreparedUpstreamRequest:
     transport sends these bytes verbatim instead of re-serializing ``body`` —
     the request is serialized exactly once, and diagnostics/accounting see
     byte-identical content to what goes on the wire.
+
+    P0-6: ``body`` is optional. When ``serialized_body`` is set, senders
+    may leave ``body`` as None so the rendered request is never parsed back
+    into a dict just to satisfy a field the transport will not use. The
+    :meth:`materialized_body` accessor reconstructs the dict on demand for
+    the rare diagnostic consumer that wants it.
     """
 
     method: str = "POST"
     url: str = ""
     headers: dict[str, str] = field(default_factory=dict)
-    body: dict[str, Any] = field(default_factory=dict)
+    body: dict[str, Any] | None = None
     stream: bool = True
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     serialized_body: bytes | None = None
+
+    def materialized_body(self) -> dict[str, Any]:
+        """The parsed body dict, reconstructing from ``serialized_body``
+        when the sender skipped it (P0-6)."""
+        if self.body is not None:
+            return self.body
+        if self.serialized_body is not None:
+            return json.loads(self.serialized_body.decode("utf-8", "replace"))
+        return {}
 
 
 @dataclass
@@ -382,7 +397,10 @@ class UpstreamTransport:
 
         for attempt in range(self._max_retries + 1):
             try:
-                json_body = request.body if request.method not in ("GET", "HEAD") else None
+                json_body = (
+                    request.materialized_body()
+                    if request.method not in ("GET", "HEAD") else None
+                )
                 # P0-10: pre-serialized bytes win — the request is serialized
                 # exactly once by the caller, never re-traversed here.
                 request_kwargs: dict[str, Any] = {
@@ -510,7 +528,7 @@ class UpstreamTransport:
         if request.serialized_body is not None:
             stream_kwargs["content"] = request.serialized_body
         else:
-            stream_kwargs["json"] = request.body
+            stream_kwargs["json"] = request.materialized_body()
         async with self.client.stream(
             request.method,
             request.url,

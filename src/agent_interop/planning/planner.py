@@ -117,30 +117,44 @@ class RequestCompatibilityPlanner:
     def _cache_key(
         self,
         *,
-        request,
         route,
-        cost_snapshot: Any | None,
+        requirements,
+        codec_capabilities: Any,
         behavioral_capabilities: Any,
         runtime_capabilities: Any = None,
     ) -> tuple | None:
         """Build a cache key from the inputs that actually influence the plan.
 
-        Returns None when a key cannot be built — the caller MUST NOT cache
-        in that case (e.g. unhashable cost_snapshot).
+        P0-planner-cache: the key is anchored on the NORMALIZED requirement
+        vector (``RequestRequirements`` is frozen and hashable) rather than
+        an ad-hoc list of source fields. ``derive_request_requirements``
+        consumes tool_choice mode/named tool, streaming, requested
+        capabilities, tool-result history, and the client profile — keying
+        on its OUTPUT means any request whose requirements differ gets a
+        different key by construction, and a new source field added to
+        derivation is automatically covered instead of silently missing
+        from a hand-maintained list.
+
+        Everything else in the key is the plan's remaining direct input:
+        route policy (tool mode, surface config, context config,
+        compatibility policy, controller config), codec capabilities,
+        runtime capacity, and the behavioral-evidence tuple.
+
+        Returns None when a key cannot be built — the caller MUST NOT
+        cache in that case.
         """
         try:
-            snapshot_fingerprint = (
-                getattr(cost_snapshot, "tool_schema_fingerprint", "") or ""
-            )
-            # P0-audit: request SIZE is part of the key. The context plan
-            # (compaction_required, protected indices) and the requirements'
-            # token estimate both depend on the message/system cost — two
-            # requests with identical tools but different history sizes
-            # MUST NOT share an entry, or the second inherits the first's
-            # compaction decision.
-            size_key = (
-                getattr(cost_snapshot, "message_tokens", 0) or 0,
-                getattr(cost_snapshot, "system_tokens", 0) or 0,
+            # Route policy fingerprint: every route field the plan reads.
+            # Local model names/aliases are content — include them so a
+            # repointed route cannot inherit the old target's plan.
+            route_key = (
+                getattr(route, "id", "") or "",
+                str(getattr(route, "upstream_model", "") or ""),
+                str(getattr(getattr(route, "tool_mode", None), "value", getattr(route, "tool_mode", ""))),
+                repr(getattr(route, "tool_surface", None)),
+                repr(getattr(route, "context", None)),
+                repr(getattr(route, "compatibility", None)),
+                repr(getattr(route, "controller", None)),
             )
             # P0-audit: runtime capacity facts feed runtime_limit directly.
             # A replan (static capabilities) and a live request (inspected
@@ -157,11 +171,7 @@ class RequestCompatibilityPlanner:
             # state value doesn't differentiate UNKNOWN from a fully
             # populated BehavioralCapabilities with the same effective
             # state, which would conflate very different planner inputs.
-            return (
-                getattr(route, "id", "") or "",
-                snapshot_fingerprint,
-                size_key,
-                runtime_key,
+            behavioral_key = (
                 getattr(behavioral_capabilities, "native_tools", None),
                 getattr(behavioral_capabilities, "prompted_tools", None),
                 getattr(behavioral_capabilities, "forced_selection", None),
@@ -179,6 +189,13 @@ class RequestCompatibilityPlanner:
                         "",
                     )
                 ),
+            )
+            return (
+                route_key,
+                requirements,
+                repr(codec_capabilities),
+                runtime_key,
+                behavioral_key,
             )
         except Exception:
             return None
@@ -212,14 +229,24 @@ class RequestCompatibilityPlanner:
         # the original request is the truth for that request's cost).
         if cost_snapshot is None:
             cost_snapshot = build_request_cost_snapshot(request)
-        # P1.8: cache lookup. A request whose (route, surface-fingerprint,
-        # behavioral state) hit the same tuple before returns the previously
-        # computed plan instead of re-running requirements-derivation and
-        # context-fit. The cache is invalidated by anything that actually
-        # changes the plan; surface changes invalidate via fingerprint,
-        # behavioral changes via state, route changes via id.
+        # P0-planner-cache: requirements are derived BEFORE the cache
+        # lookup and the normalized requirement vector anchors the key.
+        # The historical form keyed on source fields (tool fingerprint +
+        # message size) and could hand a plan computed for one request
+        # contract to a different one — an AUTO turn and a REQUIRED turn
+        # with the same tools collided, inheriting the wrong attempts and
+        # context decisions. Derive-then-key makes cross-request plan
+        # contamination structurally impossible: any request whose
+        # requirements differ gets a different key by construction.
+        token_estimate = estimate_request_context(request, snapshot=cost_snapshot).total_required_tokens
+        requirements = derive_request_requirements(
+            request, context, client_requirements, TokenEstimate(token_estimate),
+            cost_snapshot=cost_snapshot,
+        )
         cache_key = self._cache_key(
-            request=request, route=route, cost_snapshot=cost_snapshot,
+            route=route,
+            requirements=requirements,
+            codec_capabilities=codec_capabilities,
             behavioral_capabilities=behavioral_capabilities,
             runtime_capabilities=runtime_capabilities,
         )
@@ -230,11 +257,6 @@ class RequestCompatibilityPlanner:
                     self._cache_order.remove(cache_key)
                     self._cache_order.append(cache_key)
                     return cached
-        token_estimate = estimate_request_context(request, snapshot=cost_snapshot).total_required_tokens
-        requirements = derive_request_requirements(
-            request, context, client_requirements, TokenEstimate(token_estimate),
-            cost_snapshot=cost_snapshot,
-        )
         tool_surface = ToolSurfacePlanner().plan(request, route.tool_surface, cost_snapshot=cost_snapshot)
         # P0-49: architecture_context_tokens is a CEILING on what could be
         # allocated, never itself evidence of allocation.  Usable capacity
@@ -454,12 +476,13 @@ class RequestCompatibilityPlanner:
             warnings=("context_adaptation_required",) if context_plan.compaction_required else (),
             planner_revision=self.revision,
         )
-        # P1.8: cache the plan keyed by route/surface-fingerprint/behavior.
-        # A warm client with a stable tool surface reuses the previous plan
-        # instead of paying the full requirements-derivation + context-fit
-        # pass per request.
+        # P0-planner-cache: store under the SAME key the lookup used — the
+        # requirement vector was already derived above, so re-deriving here
+        # would both waste the pass and risk a divergent key.
         cache_key = self._cache_key(
-            request=request, route=route, cost_snapshot=cost_snapshot,
+            route=route,
+            requirements=requirements,
+            codec_capabilities=codec_capabilities,
             behavioral_capabilities=behavioral_capabilities,
             runtime_capabilities=runtime_capabilities,
         )

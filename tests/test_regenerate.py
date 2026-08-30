@@ -123,15 +123,79 @@ async def test_regeneration_wrong_tool():
     assert result is None
 
 
-async def test_regeneration_max_attempts():
-    orch = RegenerationOrchestrator(max_attempts=2)
+async def test_regeneration_single_shot():
+    """P0-repair-budget: one attempt() call = exactly ONE generation.
+    Repetition moved to the caller (transaction budget); the orchestrator
+    never loops internally, so a bad answer costs one dispatch, not N."""
+    calls: list[str] = []
+
+    async def always_bad(_prompt: str) -> str:
+        calls.append(_prompt)
+        return "not json at all"
+
+    orch = RegenerationOrchestrator()
     result = await orch.attempt(
         tool_name="read_file",
         raw_arguments={},
         issues=SAMPLE_ISSUES,
         tool=SAMPLE_TOOL,
-        regenerate_fn=_fake_regenerate_bad_shape,
+        regenerate_fn=always_bad,
     )
     assert result is None
-    # Should have attempted twice
-    assert orch.attempts <= 2
+    assert len(calls) == 1, f"expected exactly one dispatch, got {len(calls)}"
+    assert orch.attempts == 1
+
+
+async def test_regeneration_oversized_correction_rejected_before_dispatch():
+    """max_input_bytes is a real ceiling: an oversized correction prompt is
+    rejected BEFORE the generation, not after the model paid for it."""
+    calls: list[str] = []
+
+    async def spy(_prompt: str) -> str:
+        calls.append(_prompt)
+        return "{}"
+
+    from agent_interop.abi import CanonicalTool
+
+    big_schema_tool = CanonicalTool(
+        name="read_file",
+        description="read",
+        # ~100KB schema — far beyond a 1KB ceiling
+        input_schema={"type": "object", "properties": {
+            f"field_{i}": {"type": "string", "description": "x" * 100}
+            for i in range(500)
+        }},
+    )
+    orch = RegenerationOrchestrator(max_input_bytes=1024)
+    result = await orch.attempt(
+        tool_name="read_file",
+        raw_arguments={},
+        issues=SAMPLE_ISSUES,
+        tool=big_schema_tool,
+        regenerate_fn=spy,
+    )
+    assert result is None
+    assert calls == [], "oversized correction must not reach the model"
+
+
+async def test_regeneration_deadline_enforced():
+    """An already-exceeded deadline aborts before dispatch."""
+    import time as _time
+
+    calls: list[str] = []
+
+    async def spy(_prompt: str) -> str:
+        calls.append(_prompt)
+        return "{}"
+
+    orch = RegenerationOrchestrator(max_latency_ms=0)
+    orch.start_time = _time.monotonic() - 1  # deadline already blown
+    result = await orch.attempt(
+        tool_name="read_file",
+        raw_arguments={},
+        issues=SAMPLE_ISSUES,
+        tool=SAMPLE_TOOL,
+        regenerate_fn=spy,
+    )
+    assert result is None
+    assert calls == []

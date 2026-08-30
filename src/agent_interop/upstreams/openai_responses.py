@@ -30,6 +30,7 @@ from agent_interop.config import UpstreamProtocol
 from agent_interop.upstreams.codec import (
     CodecCapabilities,
     DecodedModelResponse,
+    RepairStrategy,
     DecodedStreamComplete,
     DecodedStreamError,
     DecodedStreamEvent,
@@ -199,6 +200,12 @@ class OpenAIResponsesCodec(ModelCodec):
             supports_system_messages=False,  # Uses "instructions" instead
             max_tools=128,
             streaming_framing=StreamFraming.SSE,
+            # P0-codec-repair-capability: the Responses API request body has
+            # an ``input`` item list, not a ``messages`` array — the base
+            # message-append correction shape does not apply. Hidden repair
+            # against this protocol must not silently render a
+            # Chat-Completions-shaped body.
+            repair_strategy=RepairStrategy.UNSUPPORTED,
         )
 
 

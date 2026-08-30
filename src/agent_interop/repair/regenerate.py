@@ -11,10 +11,12 @@ Backend-specific strategies:
 - Forced named tool selection
 - Narrow repair prompt
 
-Limits enforced:
-``max_regenerations: int = 1``
-``max_added_latency_ms: int = 15000``
-``max_repair_input_bytes: int = 65536``
+Limits (P0-repair-budget): ONE call to the orchestrator = ONE attempted
+model generation. The caller (transaction layer / request budget) owns
+repetition and passes its configured ceilings in:
+``max_added_latency_ms`` — wall-clock deadline for the correction
+``max_input_bytes`` — serialized correction-request ceiling, enforced
+before dispatch
 """
 
 from __future__ import annotations
@@ -111,42 +113,50 @@ def _truncate_str(s: str, limit: int) -> str:
 
 
 class RegenerationOrchestrator:
-    """Manages hidden constrained regeneration for tool-call repair.
+    """One call = one attempted model generation (P0-repair-budget).
+
+    The orchestrator owns NO repetition loop. Repetition policy (how many
+    regenerations a request may make) belongs to the caller — the
+    transaction layer / request budget — because only it sees every other
+    generation the request spends. Each :meth:`attempt` dispatches at most
+    one correction generation, enforces the caller's latency deadline and
+    input-size ceiling, and returns the parsed correction or None.
 
     Usage:
-        orchestrator = RegenerationOrchestrator()
-        result = await orchestrator.attempt(
-            tool_name="read_file",
-            raw_arguments={"path": "/tmp/x"},
-            issues=issues,
-            tool=tool,
-            regenerate_fn=async_callable,
+        orchestrator = RegenerationOrchestrator(
+            max_latency_ms=policy.max_added_latency_ms,
+            max_input_bytes=policy.max_input_bytes,
         )
+        result = await orchestrator.attempt(...)
     """
 
     def __init__(
         self,
-        max_attempts: int = MAX_REGENERATIONS,
         max_latency_ms: int = MAX_ADDED_LATENCY_MS,
         max_input_bytes: int = MAX_REPAIR_INPUT_BYTES,
     ) -> None:
-        self.max_attempts = max_attempts
         self.max_latency_ms = max_latency_ms
         self.max_input_bytes = max_input_bytes
         self.start_time: float = 0.0
         self.attempts = 0
         self.total_latency_ms: float = 0.0
 
-    def _check_limits(self) -> str | None:
-        """Check if any limit has been exceeded.
+    def _check_limits(self, prompt_bytes: int = 0) -> str | None:
+        """Check the deadline and the rendered-correction input ceiling.
 
-        Returns an error message if a limit is exceeded, or None if ok.
+        ``prompt_bytes`` — the actual serialized size of the correction
+        request about to be sent. The advertised ``max_input_bytes`` is a
+        real ceiling: an oversized correction prompt is rejected BEFORE
+        dispatch, not after the model has already paid for it.
         """
         elapsed = (time.monotonic() - self.start_time) * 1000
         if elapsed > self.max_latency_ms:
             return f"latency limit exceeded ({elapsed:.0f}ms > {self.max_latency_ms}ms)"
-        if self.attempts >= self.max_attempts:
-            return f"max regeneration attempts ({self.max_attempts}) exceeded"
+        if prompt_bytes > self.max_input_bytes:
+            return (
+                f"correction request too large ({prompt_bytes} bytes > "
+                f"{self.max_input_bytes} max_input_bytes)"
+            )
         return None
 
     async def attempt(
@@ -157,70 +167,53 @@ class RegenerationOrchestrator:
         tool: CanonicalTool,
         regenerate_fn: Any,
     ) -> dict[str, Any] | None:
-        """Attempt to regenerate a corrected tool call.
+        """Dispatch exactly one constrained correction generation.
 
-        Args:
-            tool_name: The canonical tool name.
-            raw_arguments: The raw argument shape.
-            issues: Validation issues from the failed deterministic repair.
-            tool: The tool definition.
-            regenerate_fn: An async callable that takes a prompt string and
-                returns the model's text response.
-
-        Returns:
-            A dict with ``name`` and ``arguments`` keys on success, or None.
+        Returns a dict with ``name`` and ``arguments`` keys on success, or
+        None (deadline exceeded, oversized correction, dispatch failure, or
+        an unparseable answer — one generation, whatever the outcome).
         """
         self.start_time = time.monotonic()
-        self.attempts = 0
+        self.attempts = 1
 
-        return await self._attempt_inner(tool_name, raw_arguments, issues, tool, regenerate_fn)
+        prompt = build_correction_request(tool_name, raw_arguments, issues, tool)
+        limit_msg = self._check_limits(prompt_bytes=len(prompt.encode("utf-8")))
+        if limit_msg:
+            logger.warning("regeneration aborted before dispatch: %s", limit_msg)
+            self.attempts = 0
+            return None
 
-    async def _attempt_inner(
-        self,
-        tool_name: str,
-        raw_arguments: Any,
-        issues: list[SchemaIssue],
-        tool: CanonicalTool,
-        regenerate_fn: Any,
-    ) -> dict[str, Any] | None:
-        while True:
-            limit_msg = self._check_limits()
-            if limit_msg:
-                logger.warning("regeneration aborted: %s", limit_msg)
+        try:
+            response_text = await regenerate_fn(prompt)
+        except Exception as exc:
+            logger.warning("regeneration failed: %s", exc)
+            return None
+        finally:
+            self.total_latency_ms = (time.monotonic() - self.start_time) * 1000
+
+        if not response_text:
+            return None
+
+        # Parse the response — try to extract JSON
+        parsed = self._extract_json(response_text)
+        if parsed is None:
+            return None
+
+        # Validate shape
+        name = parsed.get("name", parsed.get("tool", parsed.get("function", "")))
+        args = parsed.get("arguments", parsed.get("input", parsed.get("parameters", {})))
+        if not isinstance(name, str) or not isinstance(args, dict):
+            return None
+
+        # Use the canonical tool name
+        if name != tool_name:
+            # Accept if it's a recognized alias
+            from agent_interop.repair.pipeline import canonicalize_tool_name
+            canonical = canonicalize_tool_name(name, [tool])
+            if canonical != tool_name:
                 return None
 
-            self.attempts += 1
-            prompt = build_correction_request(tool_name, raw_arguments, issues, tool)
-
-            try:
-                response_text = await regenerate_fn(prompt)
-            except Exception as exc:
-                logger.warning("regeneration failed (attempt %d): %s", self.attempts, exc)
-                continue
-
-            if not response_text:
-                continue
-
-            # Parse the response — try to extract JSON
-            parsed = self._extract_json(response_text)
-            if parsed is None:
-                continue
-
-            # Validate shape
-            name = parsed.get("name", parsed.get("tool", parsed.get("function", "")))
-            args = parsed.get("arguments", parsed.get("input", parsed.get("parameters", {})))
-            if not isinstance(name, str) or not isinstance(args, dict):
-                continue
-
-            # Use the canonical tool name
-            if name != tool_name:
-                # Accept if it's a recognized alias
-                from agent_interop.repair.pipeline import canonicalize_tool_name
-                canonical = canonicalize_tool_name(name, [tool])
-                if canonical != tool_name:
-                    continue
-
-            return {"name": tool_name, "arguments": args}
+        return {"name": tool_name, "arguments": args}
 
     def _extract_json(self, text: str) -> dict[str, Any] | None:
         """Extract a JSON object from model response text.

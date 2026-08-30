@@ -91,6 +91,7 @@ class StreamEngine:
         record_tool_decisions: Callable[[Any, Any], None],
         record_evidence_observation: Callable[[Any, Any], None],
         build_batch_rejection_error: Callable[[Any, str], Any],
+        record_stream_safety: Callable[[Any, bool], None] | None = None,
     ) -> None:
         self._config = config
         self._admission_controller = admission_controller
@@ -110,6 +111,11 @@ class StreamEngine:
         self._record_tool_decisions = record_tool_decisions
         self._record_evidence_observation = record_evidence_observation
         self._build_batch_rejection_error = build_batch_rejection_error
+        # P0-7: optional stream-safety recorder — (invocation, accepted).
+        # The gateway injects a closure that records/revokes the serving
+        # tuple's observation; None keeps the cache inert for direct
+        # engine constructions in tests.
+        self._record_stream_safety = record_stream_safety
 
     # ─── Entry ────────────────────────────────────────────────────────────
 
@@ -192,6 +198,8 @@ class StreamEngine:
                 client_headers=dict(invocation.request_context.forwardable_transport_headers),
                 codec_headers=codec.required_headers(),
             ),
+            # P0-6: body kept for diagnostics only; transport sends
+            # serialized_body verbatim.
             body=rendered,
             stream=True,
             timeout_seconds=route.upstream.timeout_seconds,
@@ -563,6 +571,19 @@ class StreamEngine:
                             invocation.execution_record,
                         ):
                             yield event
+                        # P0-7: a fully-accepted unbuffered tool batch is the
+                        # one observation that unlocks later streams of this
+                        # tuple; a rejected batch revokes it. Runs on BOTH
+                        # buffered and direct paths — a buffered path that
+                        # just accepted a batch is the same model behavior.
+                        if self._record_stream_safety is not None:
+                            self._record_stream_safety(
+                                invocation,
+                                (
+                                    batch_decision.is_accepted
+                                    and bool(batch_decision.accepted_blocks)
+                                ),
+                            )
                     else:
                         # No candidates extracted but there is plain text — yield it.
                         if buffered_text:
@@ -854,6 +875,16 @@ class StreamEngine:
             invocation.execution_record,
         ):
             yield event
+        # P0-7: mirror the BUFFER path — the batch outcome updates the
+        # serving tuple's stream-safety observation either way.
+        if self._record_stream_safety is not None:
+            self._record_stream_safety(
+                invocation,
+                (
+                    batch_decision.is_accepted
+                    and bool(batch_decision.accepted_blocks)
+                ),
+            )
 
     async def _iter_frame_data(
         self,

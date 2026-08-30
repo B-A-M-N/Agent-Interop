@@ -348,7 +348,10 @@ class GenerationSeam:
                 client_headers=dict(invocation.request_context.forwardable_transport_headers),
                 codec_headers=invocation.codec.required_headers(),
             ),
-            body=json.loads(rendered_bytes.decode("utf-8", "replace")),
+            # P0-6: the rendered bytes go on the wire verbatim — the rendered
+            # dict is never parsed back just to fill a field the transport
+            # will not use. Diagnostics call .materialized_body() on demand.
+            body=None,
             stream=False,
             timeout_seconds=route.upstream.timeout_seconds,
             serialized_body=rendered_bytes,

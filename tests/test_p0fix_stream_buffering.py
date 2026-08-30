@@ -74,6 +74,24 @@ def _invocation(
     )
 
 
+def _gateway() -> Gateway:
+    return Gateway(
+        InteropServerConfig(
+            probe_on_startup=False, log_level="error",
+            routes={"r": ModelRoute(
+                id="r",
+                client_model_aliases=["m"],
+                upstream_model="fake-model",
+                upstream=UpstreamConfig(
+                    kind=UpstreamKind.OPENAI_COMPATIBLE,
+                    base_url="http://127.0.0.1:1",
+                    wire_protocol=UpstreamProtocol.OPENAI_CHAT,
+                ),
+            )},
+        ),
+    )
+
+
 def test_private_capabilities_always_buffer():
     """P0-25: even a verified direct native stream buffers when private
     retrieval is active — streamed text cannot be un-sent before a private
@@ -82,34 +100,34 @@ def test_private_capabilities_always_buffer():
         private_caps=True, path="direct",
         evidence=object(), effective_mode=ToolMode.NATIVE,
     )
-    assert Gateway._requires_buffered_stream_validation(invocation) is True
+    assert _gateway()._requires_buffered_stream_validation(invocation) is True
 
 
 def test_tool_free_stream_never_buffers():
     invocation = _invocation(tools=False, path="adapted", evidence=None)
-    assert Gateway._requires_buffered_stream_validation(invocation) is False
+    assert _gateway()._requires_buffered_stream_validation(invocation) is False
 
 
 def test_tool_choice_none_never_buffers_without_caps():
     invocation = _invocation(tool_choice_none=True, path="adapted", evidence=None)
-    assert Gateway._requires_buffered_stream_validation(invocation) is False
+    assert _gateway()._requires_buffered_stream_validation(invocation) is False
 
 
 def test_unverified_tool_stream_buffers():
     invocation = _invocation()
-    assert Gateway._requires_buffered_stream_validation(invocation) is True
+    assert _gateway()._requires_buffered_stream_validation(invocation) is True
 
 
 def test_verified_native_direct_streams_immediately():
     invocation = _invocation(
         path="direct", evidence=object(), effective_mode=ToolMode.NATIVE,
     )
-    assert Gateway._requires_buffered_stream_validation(invocation) is False
+    assert _gateway()._requires_buffered_stream_validation(invocation) is False
 
 
 def test_flag_disabled_short_circuits_everything():
     invocation = _invocation(private_caps=True, buffered_flag=False)
-    assert Gateway._requires_buffered_stream_validation(invocation) is False
+    assert _gateway()._requires_buffered_stream_validation(invocation) is False
 
 
 # ─── P0-27: streaming ref pinning lifecycle ─────────────────────────────────
