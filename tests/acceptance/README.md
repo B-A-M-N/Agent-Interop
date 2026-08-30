@@ -37,6 +37,32 @@ real Ollama/vLLM/llama.cpp backend or model is needed), launches the real
 client binary with the exact `LaunchSpec` `interop run <agent>` would use,
 and asserts the round trip completes.
 
+### The matrix driver
+
+`scripts/acceptance_matrix.py` drives the whole client × backend matrix and
+reports every cell honestly — `PASSED`/`FAILED` (a real run happened),
+`SKIPPED` (opt-in guard: binary/env/model missing on *this* machine), or
+`no-runner` (declared in RELEASE.md but no harness module exists yet):
+
+```bash
+uv run python scripts/acceptance_matrix.py --list      # what would run here
+uv run python scripts/acceptance_matrix.py             # drive everything runnable
+uv run python scripts/acceptance_matrix.py --tier 2    # only the real-model gate
+```
+
+A `SKIPPED` cell is a fine, expected outcome on a dev laptop — the point of
+the driver is that the matrix can never be reported as more than was
+actually executed. Exit code is nonzero only when a real run FAILED, or a
+run claims `PASSED` without writing a fresh evidence record.
+
+Known environment hazard: inside sandboxed shells that force all traffic
+through a local proxy (e.g. an `ANTHROPIC_BASE_URL`-proxied dev sandbox),
+the client binary's localhost dials can be intercepted and loop forever —
+`strace -f -e trace=connect` shows every connect landing on the proxy port
+regardless of `ANTHROPIC_BASE_URL`. That is a sandbox artifact, not an
+Interop bug; run the Tier 1/2 cells on an unsandboxed machine (the recorded
+results under `acceptance/results/` were produced that way).
+
 ## Result format
 
 A successful run writes `acceptance/results/<client-slug>-<version>.json`:
