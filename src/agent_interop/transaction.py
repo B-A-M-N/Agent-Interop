@@ -497,15 +497,16 @@ async def _attempt_regeneration(
     # Route the regenerated output through the full repair pipeline
     # instead of accepting it directly. This ensures exact parsing,
     # deterministic repair rules, and schema validation are all applied.
+    # The orchestrator already returned a dict, so pass it as-is: the
+    # pipeline only re-parses strings, so no serialize→parse round trip
+    # is spent re-deriving what we already hold. Nothing is privileged —
+    # schema validation and the deterministic repair loop still run.
     regenerated_args = corrected.get("arguments", {})
-    # Serialize back to JSON string so repair_one can re-parse it
-    import json
-    raw_json = json.dumps(regenerated_args)
 
     tools_list = tools or [tool]
     pipeline_outcome = repair_one(
         call_name=canonical_name,
-        call_arguments=raw_json,
+        call_arguments=regenerated_args,
         tools=tools_list,
         policy=policy,
         client_id=client_id,

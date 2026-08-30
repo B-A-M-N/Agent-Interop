@@ -358,3 +358,109 @@ async def test_failed_repair_generation_degrades_to_rejection():
     purpose_counts = exec_record.attempt_budget.generations_by_purpose
     assert purpose_counts.get("worker") == 1
     assert purpose_counts.get("tool_repair") == 1
+
+
+async def test_regenerated_dict_reaches_pipeline_without_round_trip():
+    """P0-5: the correction dict is passed to repair_one as a dict.
+
+    The orchestrator already holds parsed arguments; serializing them back
+    to a JSON string only to re-parse them in the pipeline is a redundant
+    round trip. repair_one accepts a dict and skips the parse stage for
+    it, so the fast path is a pure call-site change. The round trip is
+    observable: a dict pass-through means the pipeline sees the exact
+    object the orchestrator validated for shape.
+    """
+    import agent_interop.transaction as txn_module
+
+    correction = {
+        "name": "read_file",
+        "arguments": {"path": "/tmp/x", "encoding": "utf-8"},
+    }
+    seen_arguments: list[object] = []
+    real_repair_one = txn_module.repair_one
+
+    def spy_repair_one(*args: object, **kwargs: object) -> object:
+        seen_arguments.append(kwargs.get("call_arguments"))
+        return real_repair_one(*args, **kwargs)  # type: ignore[arg-type]
+
+    transport = _ScriptedTransport([
+        _completion(None, tool_calls=[{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": '{"encoding": "utf-8"}'},
+        }]),
+        _completion(json.dumps(correction)),
+    ])
+    gw = Gateway(
+        InteropServerConfig(
+            probe_on_startup=False, log_level="error", routes={"r": _route()},
+        ),
+        transport=transport,
+    )
+    invocation = _invocation(gw, _required_request(), RepairPolicy(max_regenerations=1))
+    context = gw._build_transaction_context(
+        invocation, invocation.reconciled_request,
+    )
+
+    original_repair_one = txn_module.repair_one
+    txn_module.repair_one = spy_repair_one  # type: ignore[assignment]
+    try:
+        step, _ = await gw._send_one_model_step(
+            invocation, invocation.execution_record, purpose="worker",
+        )
+        decision_batch = await process_tool_batch(
+            list(step.tool_candidates), [TOOL], context=context,
+        )
+    finally:
+        txn_module.repair_one = original_repair_one  # type: ignore[assignment]
+
+    assert decision_batch.is_accepted
+    assert len(seen_arguments) == 2, (
+        "expected worker validation + regeneration validation"
+    )
+    # First call is the worker's raw string; the regeneration's call — the
+    # one P0-5 changes — must arrive as the dict, not a re-serialized string.
+    worker_arguments, regenerated_arguments = seen_arguments
+    assert isinstance(worker_arguments, str)
+    assert isinstance(regenerated_arguments, dict)
+    assert regenerated_arguments == {"path": "/tmp/x", "encoding": "utf-8"}
+
+
+async def test_regenerated_output_still_fully_validated_not_privileged():
+    """P0-5 corollary: skipping the re-serialize does NOT privilege the
+    regenerated output. A correction whose arguments violate the schema
+    still fails schema validation in the pipeline and degrades to the
+    original rejection."""
+    transport = _ScriptedTransport([
+        _completion(None, tool_calls=[{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": '{"encoding": "utf-8"}'},
+        }]),
+        # "Corrected" call is STILL missing the required "path".
+        _completion(json.dumps({
+            "name": "read_file",
+            "arguments": {"encoding": "utf-16"},
+        })),
+    ])
+    gw = Gateway(
+        InteropServerConfig(
+            probe_on_startup=False, log_level="error", routes={"r": _route()},
+        ),
+        transport=transport,
+    )
+    invocation = _invocation(gw, _required_request(), RepairPolicy(max_regenerations=1))
+    context = gw._build_transaction_context(
+        invocation, invocation.reconciled_request,
+    )
+
+    step, _ = await gw._send_one_model_step(
+        invocation, invocation.execution_record, purpose="worker",
+    )
+    decision_batch = await process_tool_batch(
+        list(step.tool_candidates), [TOOL], context=context,
+    )
+
+    assert not decision_batch.is_accepted
+    assert decision_batch.accepted_blocks == []
+    assert len(transport.bodies) == 2

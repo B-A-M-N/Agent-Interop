@@ -96,3 +96,9 @@ ignore = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Test modules import shared scaffolding across files (e.g.
+# test_p0fix_private_loop_budget imports from test_p01_private_continuation)
+# as `from tests.X import Y`. That requires the repo root on sys.path, which
+# `python -m pytest` provides but the console-script entry point does not —
+# so without this line the release gate's `uv run pytest` failed collection.
+pythonpath = ["."]
