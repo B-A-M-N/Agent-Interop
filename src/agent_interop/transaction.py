@@ -107,7 +107,7 @@ class CompiledToolRegistry:
     by_name: dict[str, CanonicalTool] = field(default_factory=dict)
 
     @classmethod
-    def compile(cls, tools: Sequence[CanonicalTool]) -> "CompiledToolRegistry":
+    def compile(cls, tools: Sequence[CanonicalTool]) -> CompiledToolRegistry:
         return cls(tools=tuple(tools), by_name={t.name: t for t in tools})
 
     def get(self, name: str) -> CanonicalTool | None:

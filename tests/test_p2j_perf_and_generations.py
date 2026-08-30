@@ -14,11 +14,9 @@ Locks in:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 from contextlib import asynccontextmanager
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -47,7 +45,6 @@ from agent_interop.execution import InteropRequestExecution
 from agent_interop.execution_attempts import AttemptBudget
 from agent_interop.gateway import Gateway
 from agent_interop.transport.http import UpstreamResponse
-
 
 # ─── P0-62: generation accounting ───────────────────────────────────────────
 

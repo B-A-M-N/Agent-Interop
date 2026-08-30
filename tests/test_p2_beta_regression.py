@@ -22,9 +22,9 @@ from pathlib import Path
 import pytest
 
 from agent_interop.context_store.store import ContextStore
+from agent_interop.errors import ContextEntryTooLargeError
 from agent_interop.execution_attempts.budget import AttemptBudget
 from agent_interop.qualification.state import ProbeOutcome, QualificationRecord
-
 
 # ─── P0.17: oversized entry never returns a dead ref ───────────────────────
 
@@ -39,7 +39,7 @@ def test_oversized_entry_raises_not_evicted():
     )
     # A 600-byte entry exceeds max_entry_bytes=500 → must raise, never return a ref
     big = "x" * 600
-    with pytest.raises(Exception):
+    with pytest.raises(ContextEntryTooLargeError):
         store.store("s1", big, kind="tool_result", tool_call_id="c1")
     # A valid small entry must survive
     ok = store.store("s1", "small", kind="tool_result", tool_call_id="c2")
@@ -76,8 +76,8 @@ def test_omitted_line_count_is_bounded():
     from agent_interop.context_store.executor import (
         DEFAULT_LINE_COUNT,
         MAX_LINE_COUNT,
-        InternalToolExecutor,
         InternalExecutionContext,
+        InternalToolExecutor,
     )
 
     store = ContextStore(ttl_seconds=0.0)

@@ -12,7 +12,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from agent_interop.abi import CanonicalTool
-from agent_interop.gateway import Gateway
 from agent_interop.private_loop import parse_private_arguments
 
 

@@ -29,6 +29,7 @@ from agent_interop.abi import (
     RepairStatus,
 )
 from agent_interop.config import (
+    ContextConfig,
     FieldAliasPolicy,
     ModelRoute,
     RepairPolicy,
@@ -36,7 +37,6 @@ from agent_interop.config import (
     UpstreamConfig,
     UpstreamKind,
     UpstreamProtocol,
-    ContextConfig,
 )
 from agent_interop.protocols.anthropic_messages import AnthropicMessagesAdapter
 from agent_interop.protocols.openai_chat import OpenAIChatAdapter

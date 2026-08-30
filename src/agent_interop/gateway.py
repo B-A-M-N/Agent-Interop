@@ -20,12 +20,17 @@ Production path:
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
+
 import asyncio
 import json
 import logging
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, cast
 
 from agent_interop import __version__
 from agent_interop.abi import (
@@ -50,6 +55,7 @@ from agent_interop.config import (
     RepairPolicy,
     ToolMode,
 )
+from agent_interop.context import RequestContext
 from agent_interop.context_budget.adaptation import (
     AdaptationState,
     run_context_adaptation,
@@ -1583,7 +1589,10 @@ class Gateway:
             # instance can be expanded, so exclude the class form explicitly.
             if value is None or isinstance(value, type) or not is_dataclass(value):
                 return {}
-            return asdict(value)
+            # asdict() rejects dataclass *classes*; the isinstance check above
+            # already excluded them. _typeshed's DataclassInstance is
+            # typeshed-only (never importable at runtime), hence TYPE_CHECKING.
+            return asdict(cast("DataclassInstance", value))
 
         def plan_metadata() -> dict[str, Any]:
             compatibility = invocation.compatibility_plan
@@ -2750,6 +2759,86 @@ class Gateway:
 
     async def _execute_bootstrap_probe(self, invocation: ResolvedInvocation, probe: Any) -> bool:
         return await self._qualification.execute_bootstrap_probe(invocation, probe)
+
+    async def qualify_route(
+        self,
+        model_digest: str,
+        runtime: Any,
+        *,
+        scope: str = "full",
+    ) -> Any:
+        """Run the synthetic bootstrap battery for one resolved model.
+
+        Restores the entry point ``interop qualify`` and
+        ``InteropRuntime.qualify`` call: the dee1a97 god-object extraction
+        moved probe execution into the qualification coordinator but left
+        no public route-qualification entry, so both callers raised
+        ``AttributeError`` at runtime. This delegates to the same
+        coordinator the request path uses — probes run through
+        ``execute_bootstrap_probe``'s isolated route overrides, never by
+        mutating serving config — and records the resulting evidence under
+        the runtime's digest key. ``scope`` is accepted for API
+        compatibility; the battery is the same bounded synthetic set
+        either way.
+        """
+        from agent_interop.qualification import BootstrapQualifier
+
+        key = self._qualification_key(runtime) or model_digest
+        existing = self._qualification.record_for_runtime(runtime)
+
+        async def execute(probe: Any) -> bool:
+            # Build a minimal probe invocation through the standard
+            # preparation path so the probe exercises the same machinery
+            # (plan, admission, seam) as any request.
+            invocation = await self._probe_invocation_for(runtime)
+            return await self._qualification.execute_bootstrap_probe(invocation, probe)
+
+        record = await BootstrapQualifier().qualify_demand(
+            key,
+            execute,
+            existing=existing,
+            want_native=True,
+            need_continuation=True,
+            template_digest=getattr(runtime, "chat_template_digest", ""),
+        )
+        self.record_qualification(record)
+        return record
+
+    async def _probe_invocation_for(self, runtime: Any) -> Any:
+        """Build the minimal invocation one synthetic probe runs against."""
+        from agent_interop.abi import (
+            CanonicalGenerationOptions,
+            CanonicalMessage,
+            CanonicalRequest,
+            CanonicalTextBlock,
+            CanonicalToolChoice,
+        )
+        from agent_interop.execution import InteropRequestExecution
+
+        route = self.get_route_for_model(getattr(runtime, "model_name", "") or "")
+        if route is None:
+            from agent_interop.errors import InteropError, InteropErrorCode
+
+            raise InteropError(
+                code=InteropErrorCode.MODEL_NOT_FOUND,
+                message=(
+                    f"no route serves model "
+                    f"{getattr(runtime, 'model_name', '')!r} — cannot qualify"
+                ),
+            )
+        request = CanonicalRequest(
+            model=CanonicalModelReference(requested_name=getattr(runtime, "model_name", "") or ""),
+            generation=CanonicalGenerationOptions(max_output_tokens=64, stream=False),
+            messages=[CanonicalMessage(role="user", content=[CanonicalTextBlock(text="probe")])],
+            tool_choice=CanonicalToolChoice.none(),
+        )
+        execution = InteropRequestExecution(context=RequestContext())
+        return await self._prepare_invocation_async(
+            request,
+            execution.context,
+            streaming=False,
+            execution=execution,
+        )
 
     @staticmethod
     def _backend_metadata_from_runtime(runtime: Any) -> Any:

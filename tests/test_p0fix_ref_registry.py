@@ -9,17 +9,10 @@ leaked every dynamic ref past all three.
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from agent_interop.abi import (
-    CanonicalGenerationOptions,
-    CanonicalMessage,
-    CanonicalModelReference,
-    CanonicalTextBlock,
     CanonicalTool,
-    CanonicalToolChoice,
 )
 from agent_interop.config import (
     ContextConfig,
@@ -32,9 +25,8 @@ from agent_interop.config import (
 )
 from agent_interop.context_store import RequestRefRegistry
 from agent_interop.context_store.store import ContextStore
+from agent_interop.errors import ContextStoreError
 from agent_interop.gateway import Gateway
-from agent_interop.context import RequestContext
-from agent_interop.types import CanonicalRequest
 
 
 class _TrackingStore(ContextStore):
@@ -93,7 +85,7 @@ def test_register_is_idempotent_per_request():
 def test_register_unknown_ref_raises():
     store = ContextStore()
     reg = _registry(store)
-    with pytest.raises(Exception):
+    with pytest.raises(ContextStoreError):
         reg.register("nonexistent0000000000000000")
 
 
@@ -102,7 +94,7 @@ def test_register_after_close_raises():
     reg = _registry(store)
     reg.close()
     stored = store.store(session_id="s-1", content="x", kind="tool_result")
-    with pytest.raises(Exception):
+    with pytest.raises(ContextStoreError):
         reg.register(stored.ref)
 
 
@@ -121,7 +113,7 @@ def test_cross_session_ref_is_not_pinned():
     store = ContextStore()
     other = store.store(session_id="s-other", content="secret", kind="tool_result")
     reg = _registry(store, session="s-1")
-    with pytest.raises(Exception):
+    with pytest.raises(ContextStoreError):
         reg.register(other.ref)
     assert other.ref not in reg.snapshot()
 
@@ -155,7 +147,7 @@ def test_dynamic_schema_ref_joins_registry_and_cleanup():
     )
 
     store = _TrackingStore()
-    gw = _gateway(store)
+    _gateway(store)
 
     big_tool = CanonicalTool(
         name="big_tool",
@@ -173,19 +165,6 @@ def test_dynamic_schema_ref_joins_registry_and_cleanup():
                 for i in range(40)
             },
         },
-    )
-    request = CanonicalRequest(
-        model=CanonicalModelReference(requested_name="m"),
-        generation=CanonicalGenerationOptions(max_output_tokens=64),
-        messages=[
-            CanonicalMessage(role="user", content=[
-                CanonicalTextBlock(text=(
-                    "Call __interop_get_tool_schema with name=big_tool."
-                )),
-            ]),
-        ],
-        tools=[big_tool],
-        tool_choice=CanonicalToolChoice.auto(),
     )
     # The route is fake; what this test proves is the ref LIFECYCLE: the
     # private executor mints a mid-request ref, the registry pins it, and

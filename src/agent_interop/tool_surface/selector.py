@@ -84,7 +84,7 @@ class ToolSurfacePlanner:
         request: CanonicalRequest,
         config: ToolSurfaceConfig,
         *,
-        cost_snapshot: "RequestCostSnapshot | None" = None,
+        cost_snapshot: RequestCostSnapshot | None = None,
     ) -> ToolSurfacePlan:
         """Select the model-visible tool surface.
 

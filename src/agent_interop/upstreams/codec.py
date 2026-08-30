@@ -143,7 +143,6 @@ class StreamFraming(str, Enum):
     NDJSON = "ndjson"
 
 
-@dataclass(frozen=True)
 class RepairStrategy(str, Enum):
     """How this codec renders a hidden repair/correction request.
 

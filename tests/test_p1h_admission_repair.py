@@ -19,15 +19,14 @@ import time
 
 import pytest
 
-from agent_interop.admission import AdmissionConfig, AdmissionResult, InferenceAdmissionController
 from agent_interop.abi import CanonicalTool
+from agent_interop.admission import AdmissionConfig, AdmissionResult, InferenceAdmissionController
 from agent_interop.repair.schema import (
     _VALIDATOR_CACHE,
     _cached_validator,
     validate_against_schema,
 )
 from agent_interop.transaction import CompiledToolRegistry, ToolTransactionContext
-
 
 # ─── Admission: copy-on-write slot ownership ────────────────────────────────
 
@@ -275,8 +274,8 @@ def test_compiled_registry_matches_per_candidate_map():
 def test_batch_uses_registry_with_identical_decisions():
     """A batch processed with a pre-compiled registry must produce the same
     decisions as the historical rebuild-per-candidate path."""
-    from agent_interop.transaction import ToolBatchPolicy, process_tool_batch
     from agent_interop.abi import RawToolCallCandidate
+    from agent_interop.transaction import ToolBatchPolicy, process_tool_batch
 
     tools = [
         CanonicalTool(

@@ -53,7 +53,7 @@ class QualificationRecord:
         object.__setattr__(self, "continuation", self._coerce(self.continuation))
 
     @staticmethod
-    def _coerce(value: object) -> "ProbeOutcome":
+    def _coerce(value: object) -> ProbeOutcome:
         if isinstance(value, ProbeOutcome):
             return value
         if value is True:
@@ -62,7 +62,7 @@ class QualificationRecord:
             return ProbeOutcome.FAILED
         return ProbeOutcome.UNKNOWN
 
-    def merge(self, new_results: dict[str, ProbeOutcome]) -> "QualificationRecord":
+    def merge(self, new_results: dict[str, ProbeOutcome]) -> QualificationRecord:
         """P0.29: Monotonic merge — only tested dimensions change.
 
         P0-54: battery probe names are translated to record field names

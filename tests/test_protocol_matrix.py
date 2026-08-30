@@ -32,6 +32,7 @@ from fastapi import Request as FastAPIRequest
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from agent_interop.config import (
+    ContextConfig,
     InteropServerConfig,
     ModelRoute,
     ToolMode,
@@ -39,7 +40,6 @@ from agent_interop.config import (
     UpstreamConfig,
     UpstreamKind,
     UpstreamProtocol,
-    ContextConfig,
 )
 from agent_interop.server.app import create_app
 

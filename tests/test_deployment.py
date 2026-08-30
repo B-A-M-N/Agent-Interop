@@ -102,7 +102,6 @@ class TestSessionTokenAuth:
         from agent_interop.config import (
             InteropServerConfig,
             ModelRoute,
-            RuntimeInspectionConfig,
             ToolMode,
             TranslationMode,
             UpstreamConfig,
@@ -180,7 +179,6 @@ class TestIngressAuthProtocolNativeErrors:
         from agent_interop.config import (
             InteropServerConfig,
             ModelRoute,
-            RuntimeInspectionConfig,
             ToolMode,
             TranslationMode,
             UpstreamConfig,
@@ -264,7 +262,6 @@ class TestIngressAuthProtocolNativeErrors:
         from agent_interop.config import (
             InteropServerConfig,
             ModelRoute,
-            RuntimeInspectionConfig,
             ToolMode,
             TranslationMode,
             UpstreamConfig,
@@ -313,7 +310,6 @@ class TestGracefulShutdown:
         from agent_interop.config import (
             InteropServerConfig,
             ModelRoute,
-            RuntimeInspectionConfig,
             ToolMode,
             TranslationMode,
             UpstreamConfig,
@@ -381,7 +377,6 @@ class TestBackendUnavailable:
         from agent_interop.config import (
             InteropServerConfig,
             ModelRoute,
-            RuntimeInspectionConfig,
             ToolMode,
             TranslationMode,
             UpstreamConfig,
@@ -423,7 +418,6 @@ class TestTransportConfigWiring:
         from agent_interop.config import (
             InteropServerConfig,
             ModelRoute,
-            RuntimeInspectionConfig,
             ToolMode,
             TranslationMode,
             UpstreamConfig,
@@ -472,7 +466,6 @@ class TestTransportConfigWiring:
         from agent_interop.config import (
             InteropServerConfig,
             ModelRoute,
-            RuntimeInspectionConfig,
             ToolMode,
             TranslationMode,
             UpstreamConfig,
@@ -558,7 +551,6 @@ class TestMalformedUpstreamResponse:
         from agent_interop.config import (
             InteropServerConfig,
             ModelRoute,
-            RuntimeInspectionConfig,
             ToolMode,
             TranslationMode,
             UpstreamConfig,

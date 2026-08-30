@@ -24,8 +24,6 @@ from __future__ import annotations
 import asyncio
 import json
 
-import pytest
-
 from agent_interop.qualification import BootstrapQualifier, QualificationRecord, QualificationState
 from agent_interop.qualification.probes import SYNTHETIC_TOOL, fast_bootstrap_battery
 from agent_interop.qualification.promotion import promote_from_outcomes
@@ -197,8 +195,8 @@ def test_battery_digest_covers_synthetic_tool_schema():
     }}
     import dataclasses
     modified = dataclasses.replace(SYNTHETIC_TOOL, input_schema=mutated)
-    import agent_interop.qualification.revision as revision_module
     import agent_interop.qualification.probes as probes_module
+    import agent_interop.qualification.revision as revision_module
 
     saved = probes_module.SYNTHETIC_TOOL
     try:
@@ -214,7 +212,7 @@ def test_battery_digest_covers_synthetic_tool_schema():
 
 def _attempt(kind):
     from agent_interop.config import ToolMode
-    from agent_interop.planning.types import AttemptKind, CompatibilityAttempt
+    from agent_interop.planning.types import CompatibilityAttempt
 
     return CompatibilityAttempt(kind, ToolMode.PROMPTED, reason="test")
 
@@ -255,11 +253,11 @@ def test_hint_cache_ttl_and_bounded_eviction():
 def test_hint_key_covers_the_full_serving_tuple():
     from agent_interop.planning.hints import attempt_hint_key
 
-    base = dict(
-        model_digest="m", template_digest="t", serving_config_digest="s",
-        profile_revision="p", client_protocol="claude_code/v1",
-        tool_surface_fingerprint="f", streaming=False, tool_choice_class="auto",
-    )
+    base = {
+        "model_digest": "m", "template_digest": "t", "serving_config_digest": "s",
+        "profile_revision": "p", "client_protocol": "claude_code/v1",
+        "tool_surface_fingerprint": "f", "streaming": False, "tool_choice_class": "auto",
+    }
     reference = attempt_hint_key(**base)
     for field, value in (
         ("model_digest", "other"), ("template_digest", "other"),

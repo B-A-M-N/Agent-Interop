@@ -32,7 +32,6 @@ from agent_interop.history.projector import (
     render_fragment_text,
 )
 
-
 # ─── Factory helpers ───────────────────────────────────────────────────────
 
 

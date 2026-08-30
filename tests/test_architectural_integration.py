@@ -34,6 +34,7 @@ from agent_interop.abi import (
     ToolCallDecision,
 )
 from agent_interop.config import (
+    ContextConfig,
     InteropServerConfig,
     ModelRoute,
     RepairConfig,
@@ -41,7 +42,6 @@ from agent_interop.config import (
     UpstreamConfig,
     UpstreamKind,
     UpstreamProtocol,
-    ContextConfig,
 )
 from agent_interop.context import RequestContext
 from agent_interop.errors import InteropErrorCode

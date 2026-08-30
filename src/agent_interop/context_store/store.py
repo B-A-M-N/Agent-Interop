@@ -18,14 +18,13 @@ Design
 
 from __future__ import annotations
 
-import re
 import secrets
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from hashlib import sha256
 from threading import Lock
-from typing import Any, Iterable
-
+from typing import Any
 
 _EXOTIC_BOUNDARIES_NON_ASCII = ("\x85", "\u2028", "\u2029")
 _EXOTIC_BOUNDARIES_ASCII = ("\r", "\v", "\f", "\x1c", "\x1d", "\x1e")
@@ -410,12 +409,12 @@ class ContextStore:
         for _, session_id, ref in all_entries:
             if self._total_bytes <= self._max_total_bytes:
                 return
-            bucket = self._sessions.get(session_id)
-            if bucket and ref in bucket.entries:
-                entry = bucket.entries[ref]
-                bucket.total_bytes -= entry.byte_size
+            target = self._sessions.get(session_id)
+            if target and ref in target.entries:
+                entry = target.entries[ref]
+                target.total_bytes -= entry.byte_size
                 self._total_bytes -= entry.byte_size
-                bucket.entries.pop(ref, None)
+                target.entries.pop(ref, None)
                 dedup_key = (entry.session_id, entry.kind, entry.tool_call_id, entry.sha256)
                 self._dedup_index.pop(dedup_key, None)
         self._cleanup_empty_sessions()
@@ -533,12 +532,12 @@ class ContextStore:
                     if now - entry.last_accessed_at > self._ttl_seconds:
                         expired.append((session_id, entry.ref))
             for session_id, ref in expired:
-                bucket = self._sessions.get(session_id)
-                if bucket and ref in bucket.entries:
-                    entry = bucket.entries[ref]
-                    bucket.total_bytes -= entry.byte_size
+                target = self._sessions.get(session_id)
+                if target and ref in target.entries:
+                    entry = target.entries[ref]
+                    target.total_bytes -= entry.byte_size
                     self._total_bytes -= entry.byte_size
-                    bucket.entries.pop(ref, None)
+                    target.entries.pop(ref, None)
                     dedup_key = (entry.session_id, entry.kind, entry.tool_call_id, entry.sha256)
                     self._dedup_index.pop(dedup_key, None)
             self._cleanup_empty_sessions()

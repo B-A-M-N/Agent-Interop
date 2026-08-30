@@ -56,7 +56,7 @@ register(HermesAgentIntegration())
 
 def register_external_manifests() -> list[AgentIntegration]:
     """Register project/user manifest integrations, rejecting alias collisions."""
-    integrations = load_external_integrations()
+    integrations: list[AgentIntegration] = list(load_external_integrations())
     for integration in integrations:
         register(integration)
     return integrations

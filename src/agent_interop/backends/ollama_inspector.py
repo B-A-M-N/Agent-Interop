@@ -32,7 +32,7 @@ def _context_from_options(*sources: dict[str, Any]) -> int:
                 return int(value)
         # Check architecture-qualified keys (e.g. 'llama.context_length')
         for key, value in source.items():
-            if key.endswith(".context_length") or key.endswith(".num_ctx"):
+            if key.endswith((".context_length", ".num_ctx")):
                 if isinstance(value, int) and value > 0:
                     return value
                 if isinstance(value, str) and value.isdigit():
@@ -125,8 +125,8 @@ class OllamaInspector:
             self._request(transport, route, "POST", "/api/show", {"model": route.upstream_model}),
             self._request(transport, route, "GET", "/api/ps"),
         )
-        tag = next((item for item in tags.get("models", []) if item.get("name") == route.upstream_model), {})
-        loaded = next((item for item in running.get("models", []) if item.get("name") == route.upstream_model), {})
+        tag: dict = next((item for item in tags.get("models", []) if item.get("name") == route.upstream_model), {})
+        loaded: dict = next((item for item in running.get("models", []) if item.get("name") == route.upstream_model), {})
         details = shown.get("details") if isinstance(shown.get("details"), dict) else {}
         model_info = shown.get("model_info") if isinstance(shown.get("model_info"), dict) else {}
         capabilities = {str(item).lower() for item in shown.get("capabilities", [])}

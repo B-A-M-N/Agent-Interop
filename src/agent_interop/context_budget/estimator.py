@@ -28,7 +28,7 @@ def estimate_tool_schema_tokens(tools: list[CanonicalTool] | tuple[CanonicalTool
     ]) if tools else TokenEstimate(0, "exact")
 
 
-def build_request_cost_snapshot(request: CanonicalRequest) -> "RequestCostSnapshot":
+def build_request_cost_snapshot(request: CanonicalRequest) -> RequestCostSnapshot:
     """Serialize the request ONCE and derive every planning cost from it.
 
     This is the single serialization point for a planning pass. It prices
@@ -73,7 +73,7 @@ def build_request_cost_snapshot(request: CanonicalRequest) -> "RequestCostSnapsh
     if tools:
         canonical = sorted(
             ({"name": tool.name, "schema": tool.input_schema} for tool in tools),
-            key=lambda entry: entry["name"],
+            key=lambda entry: str(entry["name"]),
         )
         raw = json.dumps(canonical, sort_keys=True, default=str)
         encoded = raw.encode()
@@ -92,7 +92,7 @@ def build_request_cost_snapshot(request: CanonicalRequest) -> "RequestCostSnapsh
 
 
 def price_tool_subset(
-    snapshot: "RequestCostSnapshot",
+    snapshot: RequestCostSnapshot,
     tools: list[CanonicalTool] | tuple[CanonicalTool, ...],
 ) -> int:
     """Price a tool subset from the snapshot without serializing again.
@@ -130,7 +130,7 @@ def estimate_request_context(
     prompted_contract: str = "",
     output_reserve_tokens: int | None = None,
     provider_overhead_tokens: int = 32,
-    snapshot: "RequestCostSnapshot | None" = None,
+    snapshot: RequestCostSnapshot | None = None,
 ) -> ContextBreakdown:
     """Break down a request's context cost.
 

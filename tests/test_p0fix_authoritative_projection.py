@@ -122,12 +122,6 @@ def test_authoritative_request_never_contains_virtualized_content():
     req = _virtualizing_request()
     inv = _prepare(gw, req, RequestContext(session_id="s-auth"))
 
-    full_blob_marker = "line 499"
-    # Authoritative keeps the original bytes verbatim.
-    auth_text = "\n".join(
-        b.text for m in inv.authoritative_request.messages
-        for b in m.content if isinstance(b, CanonicalTextBlock)
-    )
     # The authoritative tool result block is untouched.
     for m in inv.authoritative_request.messages:
         for b in m.content:
@@ -138,7 +132,8 @@ def test_authoritative_request_never_contains_virtualized_content():
         str(b.content) for m in inv.model_request.messages
         for b in m.content if hasattr(b, "content") and not isinstance(b.content, list)
     )
-    assert full_blob_marker not in auth_text or True  # authoritative may or may not inline text blocks
+    # The authoritative view MAY or MAY NOT inline text blocks — assert nothing
+    # about full_blob_marker there; the contract is on model_texts below.
     assert "Interop result ref" in model_texts or inv.private_capabilities.read_result
 
 

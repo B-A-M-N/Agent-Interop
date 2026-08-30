@@ -30,7 +30,6 @@ from agent_interop.config import UpstreamProtocol
 from agent_interop.upstreams.codec import (
     CodecCapabilities,
     DecodedModelResponse,
-    RepairStrategy,
     DecodedStreamComplete,
     DecodedStreamError,
     DecodedStreamEvent,
@@ -38,6 +37,7 @@ from agent_interop.upstreams.codec import (
     DecodedToolBatchComplete,
     DecodedToolFragment,
     ModelCodec,
+    RepairStrategy,
     StreamFraming,
     upstream_extra,
 )

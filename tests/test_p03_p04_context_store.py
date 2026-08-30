@@ -16,6 +16,7 @@ from agent_interop.abi import (
     CanonicalToolResultBlock,
 )
 from agent_interop.config import (
+    ContextConfig,
     InteropServerConfig,
     ModelRoute,
     ToolMode,
@@ -24,7 +25,6 @@ from agent_interop.config import (
     UpstreamConfig,
     UpstreamKind,
     UpstreamProtocol,
-    ContextConfig,
 )
 from agent_interop.context import RequestContext
 from agent_interop.context_store import (
@@ -37,7 +37,6 @@ from agent_interop.context_store import (
 from agent_interop.enums import RESERVED_INTERNAL_TOOL_PREFIX, ToolAuthority
 from agent_interop.execution import InteropRequestExecution
 from agent_interop.gateway import Gateway
-
 
 # ─── ContextStore ─────────────────────────────────────────────────────────
 
@@ -68,7 +67,7 @@ class TestContextStore:
         store = ContextStore()
         store.store("s1", "the quick brown fox", "tool_result")
         store.store("s1", "lazy dog", "tool_result")
-        results = store.store("s1", "foxes are quick", "tool_result")
+        store.store("s1", "foxes are quick", "tool_result")
         matches = store.search("s1", "fox")
         assert len(matches) == 2
 
@@ -159,11 +158,11 @@ class TestVirtualizationPolicy:
 
 class TestToolAuthority:
     def test_classify_internal(self):
-        gw = Gateway(InteropServerConfig(routes={}, probe_on_startup=False, log_level="error"), allow_invalid_config=True)
+        Gateway(InteropServerConfig(routes={}, probe_on_startup=False, log_level="error"), allow_invalid_config=True)
         assert Gateway._classify_tool_authority("__interop_read_result") == ToolAuthority.INTEROP_INTERNAL
 
     def test_classify_client(self):
-        gw = Gateway(InteropServerConfig(routes={}, probe_on_startup=False, log_level="error"), allow_invalid_config=True)
+        Gateway(InteropServerConfig(routes={}, probe_on_startup=False, log_level="error"), allow_invalid_config=True)
         assert Gateway._classify_tool_authority("Read") == ToolAuthority.CLIENT
 
     def test_reserved_namespace_collision_raises(self):

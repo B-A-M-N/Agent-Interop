@@ -31,17 +31,18 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from agent_interop.abi import (
     CanonicalEvent,
-    CanonicalStopReason,
     CanonicalGenerationOptions,
     CanonicalMessage,
     CanonicalModelReference,
     CanonicalRequest,
+    CanonicalStopReason,
     CanonicalTextBlock,
     CanonicalTool,
     CanonicalToolChoice,
 )
 from agent_interop.config import (
     CompatibilityConfig,
+    ContextConfig,
     InteropServerConfig,
     ModelRoute,
     ToolMode,
@@ -49,13 +50,13 @@ from agent_interop.config import (
     UpstreamConfig,
     UpstreamKind,
     UpstreamProtocol,
-    ContextConfig,
 )
 from agent_interop.context import RequestContext
 from agent_interop.execution import ExecutionState, InteropRequestExecution
 from agent_interop.gateway import Gateway, ResolvedInvocation
 from agent_interop.repair.invocation import build_invocation_plan
 from agent_interop.server.app import create_app
+from agent_interop.transport import SSEFrame
 from agent_interop.transport.http import PreparedUpstreamRequest
 from agent_interop.upstreams.registry import get_codec
 

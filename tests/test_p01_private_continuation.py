@@ -28,6 +28,7 @@ from agent_interop.abi import (
     CanonicalToolChoice,
 )
 from agent_interop.config import (
+    ContextConfig,
     InteropServerConfig,
     ModelRoute,
     ToolMode,
@@ -36,7 +37,6 @@ from agent_interop.config import (
     UpstreamConfig,
     UpstreamKind,
     UpstreamProtocol,
-    ContextConfig,
 )
 from agent_interop.context import RequestContext
 from agent_interop.execution import InteropRequestExecution
@@ -76,7 +76,7 @@ class _ScriptedTransport:
         self._responses = list(responses)
         self.calls = 0
 
-    async def send(self, request):  # noqa: ANN001 - matches TransportProtocol
+    async def send(self, request):
         idx = min(self.calls, len(self._responses) - 1)
         self.calls += 1
         return UpstreamResponse(status_code=200, body=self._responses[idx])
@@ -278,7 +278,7 @@ class _ScriptedStreamTransport:
         self.send_calls = 0
 
     @asynccontextmanager
-    async def stream(self, request):  # noqa: ANN001
+    async def stream(self, request):
         from agent_interop.transport.sse import SSEFrame
 
         class _S:
@@ -302,7 +302,7 @@ class _ScriptedStreamTransport:
         s._lines = self._first_sse
         yield s
 
-    async def send(self, request):  # noqa: ANN001
+    async def send(self, request):
         idx = min(self.send_calls, len(self._continuation) - 1)
         self.send_calls += 1
         return UpstreamResponse(status_code=200, body=self._continuation[idx])
@@ -454,7 +454,7 @@ def test_policy_preserves_structured_content_deterministically():
     """P1.3: a tool result with structured (non-string) content must NOT be
     flattened via str(); it must be serialized deterministically so
     search/paging stay lossless."""
-    from agent_interop.abi import CanonicalToolResultBlock, CanonicalTextBlock
+    from agent_interop.abi import CanonicalTextBlock, CanonicalToolResultBlock
     from agent_interop.context_store.policy import VirtualizationPolicy
 
     p = VirtualizationPolicy(max_inline_lines=2, max_inline_bytes=10)

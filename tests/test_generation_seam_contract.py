@@ -66,7 +66,7 @@ class _RecordingAdmission:
     def __init__(self) -> None:
         self.calls = 0
 
-    def generation_slot(self, base_url: str, model: str):  # noqa: ANN201
+    def generation_slot(self, base_url: str, model: str):
         self.calls += 1
 
         class _Slot:
@@ -88,13 +88,13 @@ class _UsageTransport:
         self.payload = payload
         self.bodies: list[bytes] = []
 
-    async def send(self, request):  # noqa: ANN001, ANN201
+    async def send(self, request):
         self.bodies.append(request.serialized_body)
 
         class _Resp:
             status_code = 200
 
-            def __init__(self, outer: "_UsageTransport") -> None:
+            def __init__(self, outer: _UsageTransport) -> None:
                 self._outer = outer
 
             def is_error(self) -> bool:
@@ -232,11 +232,11 @@ def test_context_gate_rejects_oversized_render_before_dispatch():
     class _NeverTransport:
         calls = 0
 
-        async def send(self, request):  # noqa: ANN001
+        async def send(self, request):
             self.calls += 1
             raise AssertionError("transport must not be reached")
 
-    def _limit_error(inv: Any, reason: str):  # noqa: ANN001
+    def _limit_error(inv: Any, reason: str):
         from agent_interop.abi import CanonicalError, CanonicalResponse
 
         return CanonicalResponse(
@@ -301,7 +301,7 @@ def test_post_construction_transport_injection_is_honored():
     gw._transport = transport  # post-construction injection
 
     invocation = _invocation(gw)
-    response, rendered = asyncio.run(gw._send_one_model_step(
+    response, _rendered = asyncio.run(gw._send_one_model_step(
         invocation, InteropRequestExecution(),
     ))
     assert response.error is None

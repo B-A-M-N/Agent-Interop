@@ -11,7 +11,6 @@ from agent_interop.context_store.executor import (
 )
 from agent_interop.context_store.store import ContextStore
 
-
 # ─── Task 1: search() refreshes last_accessed_at ───────────────────────────
 
 

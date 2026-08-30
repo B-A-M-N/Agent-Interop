@@ -702,7 +702,7 @@ class EvidenceStore:
         import queue as _queue
         import threading as _threading
 
-        self._write_behind_queue: _queue.Queue = _queue.Queue(maxsize=max_pending)
+        self._write_behind_queue = _queue.Queue(maxsize=max_pending)
         stop = _threading.Event()
         self._write_behind_stop = stop
 
@@ -773,7 +773,7 @@ class EvidenceStore:
         Returns True when the row was enqueued, False when it was written
         synchronously or the queue was full. Never raises.
         """
-        row = {
+        row: dict[str, str | list[str]] = {
             "route_id": route_id,
             "model_id": model_id,
             "client_id": client_id,
@@ -790,7 +790,14 @@ class EvidenceStore:
                 # keeping the row is better than dropping analytics.
                 pass
         try:
-            self.record_repair_event(**row)
+            self.record_repair_event(
+                route_id=str(row["route_id"]),
+                model_id=str(row["model_id"]),
+                client_id=str(row["client_id"]),
+                tool_name=str(row["tool_name"]),
+                outcome=str(row["outcome"]),
+                repair_rules=list(row["repair_rules"]),
+            )
         except Exception:
             logger.warning("failed to record repair event", exc_info=True)
         return False

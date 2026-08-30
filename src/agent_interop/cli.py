@@ -64,6 +64,7 @@ def _gateway_from_config_path(path: str):
 def _canonical_request_from_json(value: dict[str, Any]):
     """Read the documented compact canonical request JSON for ``explain``."""
     from agent_interop.abi import (
+        CanonicalContentBlock,
         CanonicalMessage,
         CanonicalModelReference,
         CanonicalRequest,
@@ -80,8 +81,10 @@ def _canonical_request_from_json(value: dict[str, Any]):
     for raw_message in value.get("messages", []):
         content = raw_message.get("content", "")
         if isinstance(content, list):
-            blocks = [CanonicalTextBlock(text=str(item.get("text", item))) if isinstance(item, dict)
-                      else CanonicalTextBlock(text=str(item)) for item in content]
+            blocks: list[CanonicalContentBlock] = [
+                CanonicalTextBlock(text=str(item.get("text", item))) if isinstance(item, dict)
+                else CanonicalTextBlock(text=str(item)) for item in content
+            ]
         else:
             blocks = [CanonicalTextBlock(text=str(content))]
         messages.append(CanonicalMessage(role=raw_message.get("role", "user"), content=blocks))
@@ -1926,10 +1929,11 @@ def replay(
         from agent_interop.paths import diagnostic_cases_dir
         from agent_interop.replay.store import DiagnosticCaseStore
 
-        case = DiagnosticCaseStore(directory=diagnostic_cases_dir()).get(file)
-        if case is None:
+        loaded = DiagnosticCaseStore(directory=diagnostic_cases_dir()).get(file)
+        if loaded is None:
             console.print(f"[red]Replay case not found:[/] {file}")
             raise typer.Exit(1)
+        case = loaded
     console.print(f"[bold]Replay Case:[/] {case.case_id or 'unknown'}")
     console.print(f"  Client: {case.client_protocol}")
     console.print(f"  Upstream: {case.upstream_protocol}")

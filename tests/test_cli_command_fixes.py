@@ -33,6 +33,7 @@ from agent_interop.abi import (
 )
 from agent_interop.cli import _log_file_path, app
 from agent_interop.config import (
+    ContextConfig,
     InteropServerConfig,
     ModelRoute,
     ToolMode,
@@ -40,7 +41,6 @@ from agent_interop.config import (
     UpstreamConfig,
     UpstreamKind,
     UpstreamProtocol,
-    ContextConfig,
 )
 from agent_interop.context import RequestContext
 from agent_interop.evidence.store import EvidenceStore

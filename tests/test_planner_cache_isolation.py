@@ -29,7 +29,6 @@ from agent_interop.abi import (
     CanonicalToolCallBlock,
     CanonicalToolChoice,
     CanonicalToolResultBlock,
-    ToolChoiceMode,
 )
 from agent_interop.config import (
     CompatibilityConfig,
@@ -66,25 +65,24 @@ def _route(**overrides) -> ModelRoute:
     return route
 
 
-from agent_interop.abi import CanonicalGenerationOptions
 
 
 def _request(**overrides) -> CanonicalRequest:
-    defaults = dict(
-        model=CanonicalModelReference(requested_name="m"),
+    defaults: dict = {
+        "model": CanonicalModelReference(requested_name="m"),
         # stream defaults to True on the abi type — pin the baseline OFF so
         # the stream_vs_nonstream mutation is a real single-dimension change.
-        generation=CanonicalGenerationOptions(max_output_tokens=256, stream=False),
-        messages=[
+        "generation": CanonicalGenerationOptions(max_output_tokens=256, stream=False),
+        "messages": [
             CanonicalMessage(role="user", content=[CanonicalTextBlock(text="hi")]),
         ],
-        tools=[CanonicalTool(
+        "tools": [CanonicalTool(
             name="read_file",
             description="read",
             input_schema={"type": "object", "properties": {"path": {"type": "string"}}},
         )],
-        tool_choice=CanonicalToolChoice.auto(),
-    )
+        "tool_choice": CanonicalToolChoice.auto(),
+    }
     defaults.update(overrides)
     return CanonicalRequest(**defaults)
 
@@ -317,7 +315,6 @@ def test_route_policy_change_changes_cache_key():
 
 
 def test_runtime_capacity_change_changes_cache_key():
-    from types import SimpleNamespace
     request = _request()
     context = RequestContext()
     route = _route()

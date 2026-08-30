@@ -27,6 +27,7 @@ from agent_interop.abi import (
     RepairStatus,
 )
 from agent_interop.config import (
+    ContextConfig,
     FieldAliasPolicy,
     InteropServerConfig,
     ModelRoute,
@@ -35,7 +36,6 @@ from agent_interop.config import (
     UpstreamConfig,
     UpstreamKind,
     UpstreamProtocol,
-    ContextConfig,
 )
 from agent_interop.context import RequestContext
 from agent_interop.evidence.store import EvidenceStore
@@ -191,7 +191,7 @@ class _FakeTransport:
 
 
 def _verified_result(**overrides: Any) -> CompatibilityResult:
-    from datetime import datetime, UTC
+    from datetime import UTC, datetime
     now = datetime.now(UTC).isoformat()
     defaults: dict[str, Any] = {
         "tested_at": now,

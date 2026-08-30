@@ -22,8 +22,6 @@ from __future__ import annotations
 import asyncio
 import json
 
-import pytest
-
 from agent_interop.abi import (
     CanonicalGenerationOptions,
     CanonicalMessage,
@@ -293,12 +291,18 @@ def test_planner_uses_architecture_only_as_clamp():
     not 32K (the historical leak)."""
     from agent_interop.backends.base import ModelRuntimeCapabilities
     from agent_interop.config import (
-        CompatibilityConfig, ContextConfig, ModelRoute, ToolMode,
-        UpstreamConfig, UpstreamKind, UpstreamProtocol,
+        CompatibilityConfig,
+        ContextConfig,
+        ModelRoute,
+        ToolMode,
+        UpstreamConfig,
+        UpstreamKind,
+        UpstreamProtocol,
     )
     from agent_interop.context import RequestContext
     from agent_interop.planning import (
-        BehavioralCapabilities, RequestCompatibilityPlanner,
+        BehavioralCapabilities,
+        RequestCompatibilityPlanner,
     )
     from agent_interop.upstreams.codec import CodecCapabilities
 

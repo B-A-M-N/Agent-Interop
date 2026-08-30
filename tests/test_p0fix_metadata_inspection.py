@@ -47,7 +47,7 @@ class _CountingTransport:
         self.get_urls: list[str] = []
         self.post_urls: list[str] = []
 
-    async def send(self, request):  # noqa: ANN001
+    async def send(self, request):
         if request.method == "GET":
             self.get_urls.append(request.url)
             return UpstreamResponse(
@@ -82,7 +82,7 @@ _GENERATION_PATHS = ("/api/chat", "/api/generate", "/api/embed", "/v1/chat/compl
 
 
 class _NoGenerationTransport(_CountingTransport):
-    async def send(self, request):  # noqa: ANN001
+    async def send(self, request):
         if request.method == "POST" and any(p in request.url for p in _GENERATION_PATHS):
             raise _GenerationSentinel(request.url)
         # Metadata POSTs (/api/show, /api/ps) get an empty object — enough

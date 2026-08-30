@@ -31,6 +31,7 @@ from agent_interop.abi import (
     ProtocolKind,
 )
 from agent_interop.config import (
+    ContextConfig,
     EvidenceConfig,
     InteropServerConfig,
     ModelRoute,
@@ -40,7 +41,6 @@ from agent_interop.config import (
     UpstreamKind,
     UpstreamProtocol,
     validate_config,
-    ContextConfig,
 )
 from agent_interop.context import RequestContext
 from agent_interop.gateway import Gateway

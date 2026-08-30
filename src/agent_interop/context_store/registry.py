@@ -18,7 +18,8 @@ no longer outlive the request that minted them.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterable
+from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from agent_interop.context_store.store import ContextStore
@@ -38,7 +39,7 @@ class RequestRefRegistry:
 
     def __init__(
         self,
-        store: "ContextStore",
+        store: ContextStore,
         session_id: str,
         request_id: str,
     ) -> None:
@@ -65,8 +66,10 @@ class RequestRefRegistry:
         the registry's snapshot trustworthy as a firewall identity.
         """
         if self._closed:
+            # A closed registry can never pin again, so the ref is
+            # unavailable — the same contract as an evicted entry.
             raise ContextStoreError(
-                code=InteropErrorCode.CONTEXT_STORE_ERROR,
+                code=InteropErrorCode.CONTEXT_REF_UNAVAILABLE,
                 message="ref registry is closed for this request",
             )
         ref = str(ref or "")
@@ -101,6 +104,6 @@ class RequestRefRegistry:
             self._store.unpin_refs(
                 self._refs, self._request_id, session_id=self._session_id,
             )
-        except Exception:  # noqa: BLE001 — cleanup must not mask the outcome
+        except Exception:
             pass
         self._refs.clear()

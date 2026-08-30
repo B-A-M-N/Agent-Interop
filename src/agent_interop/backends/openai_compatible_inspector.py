@@ -35,7 +35,7 @@ class OpenAICompatibleInspector:
                 body = candidate if isinstance(candidate, dict) else {}
             except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
-        model = next((item for item in body.get("data", []) if item.get("id") == route.upstream_model), {})
+        model: dict = next((item for item in body.get("data", []) if item.get("id") == route.upstream_model), {})
         digest = str(model.get("digest") or model.get("id") or "")
         serving = hashlib.sha256(json.dumps(model, sort_keys=True, default=str).encode()).hexdigest()[:16] if model else ""
         return ModelRuntimeCapabilities(

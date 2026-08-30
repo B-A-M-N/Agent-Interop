@@ -18,7 +18,6 @@ from agent_interop.qualification.store import (
     record_is_current,
 )
 
-
 # ─── (a) store put/get preserves battery_revision & template_digest ────────
 
 

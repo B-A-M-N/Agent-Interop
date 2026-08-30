@@ -16,12 +16,9 @@ from __future__ import annotations
 import random
 import time
 
-import pytest
-
 from agent_interop.context_store.store import ContextStore
 from agent_interop.evidence.store import EvidenceStore, result_is_stale
 from agent_interop.replay.types import CompatibilityResult
-
 
 # ─── store(): single encode + hash ──────────────────────────────────────────
 
@@ -29,10 +26,9 @@ from agent_interop.replay.types import CompatibilityResult
 def test_store_entry_populated_without_rehash():
     """The entry's byte_size and sha256 come from the caller's single
     encode/hash pass — __post_init__ must not recompute either."""
-    from agent_interop.context_store.store import StoredEntry
 
     entry = ContextStore().store("s", "hello world", kind="tool_result", tool_call_id="c")
-    assert entry.byte_size == len("hello world".encode())
+    assert entry.byte_size == len(b"hello world")
     assert entry.sha256
 
 
@@ -68,7 +64,7 @@ def test_get_slice_matches_historical_fixed_cases():
     ]
     for i, content in enumerate(cases):
         entry = store.store(f"s{i}", content, kind="tool_result", tool_call_id=f"c{i}")
-        for start in range(0, 6):
+        for start in range(6):
             for line_count in (None, 1, 2, 1000):
                 assert store.get_slice(entry.ref, f"s{i}", start, line_count) == (
                     _historical(content, start, line_count)
@@ -155,11 +151,11 @@ def test_pinned_entries_survive_capacity_eviction():
 
 
 def _result(**kwargs) -> CompatibilityResult:
-    defaults = dict(
-        tested_at="2026-01-01T00:00:00+00:00",
-        sample_count=5,
-        passes_expiry_hours=720,
-    )
+    defaults = {
+        "tested_at": "2026-01-01T00:00:00+00:00",
+        "sample_count": 5,
+        "passes_expiry_hours": 720,
+    }
     defaults.update(kwargs)
     return CompatibilityResult(**defaults)
 

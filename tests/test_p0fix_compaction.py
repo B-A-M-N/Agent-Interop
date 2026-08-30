@@ -17,7 +17,6 @@ from agent_interop.context_budget.types import ContextBreakdown, ContextPlan
 from agent_interop.context_store import ContextStore
 from agent_interop.context_store.policy import VirtualizationPolicy
 
-
 # ─── Fix A: stored_refs on ContextAdaptationResult ──────────────────────
 
 

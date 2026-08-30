@@ -27,15 +27,17 @@ dataclass.
 from __future__ import annotations
 
 import threading
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator
+from typing import Any
 
 import httpx
 import pytest
 import pytest_asyncio
-from fastapi import FastAPI, Request as FastAPIRequest
-from fastapi.responses import JSONResponse
 import uvicorn
+from fastapi import FastAPI
+from fastapi import Request as FastAPIRequest
+from fastapi.responses import JSONResponse
 
 from agent_interop.config import (
     ContextConfig,
@@ -50,7 +52,6 @@ from agent_interop.config import (
     UpstreamProtocol,
 )
 from agent_interop.server.app import create_app
-
 
 # ─── capturing fake upstream (records the exact rendered body) ───────────────
 

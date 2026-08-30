@@ -48,6 +48,7 @@ def _cached_validator(schema: dict[str, Any]) -> Any:
                 return cached
             # Negative-cache entry: known-invalid schema.
             return None
+    validator: Draft202012Validator | object
     try:
         Draft202012Validator.check_schema(schema)
         validator = Draft202012Validator(schema)

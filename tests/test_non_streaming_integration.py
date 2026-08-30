@@ -37,6 +37,7 @@ from agent_interop.abi import (
     CanonicalToolChoice,
 )
 from agent_interop.config import (
+    ContextConfig,
     InteropServerConfig,
     ModelRoute,
     ToolMode,
@@ -44,7 +45,6 @@ from agent_interop.config import (
     UpstreamConfig,
     UpstreamKind,
     UpstreamProtocol,
-    ContextConfig,
 )
 from agent_interop.context import RequestContext
 from agent_interop.gateway import Gateway

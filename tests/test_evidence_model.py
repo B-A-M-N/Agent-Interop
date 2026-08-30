@@ -189,14 +189,14 @@ class TestToolCountPreUpstreamRejection:
     @staticmethod
     def _make_gateway(tool_mode=ToolMode.AUTO):
         from agent_interop.config import (
+            ContextConfig,
             InteropServerConfig,
             ModelRoute,
             TranslationMode,
             UpstreamConfig,
             UpstreamKind,
             UpstreamProtocol,
-    ContextConfig,
-)
+        )
         from agent_interop.gateway import Gateway
 
         config = InteropServerConfig(

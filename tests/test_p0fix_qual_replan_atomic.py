@@ -35,8 +35,8 @@ from agent_interop.config import (
     UpstreamKind,
     UpstreamProtocol,
 )
-from agent_interop.gateway import Gateway
 from agent_interop.context import RequestContext
+from agent_interop.gateway import Gateway
 
 
 def _route() -> Any:
@@ -77,10 +77,10 @@ def _gateway() -> Gateway:
 def test_replan_threads_streaming_through_to_resolver():
     """Item 13: the resolver is invoked with streaming=True when the request
     is streaming — the compatibility key fingerprint must reflect streaming."""
-    from agent_interop.execution import InteropRequestExecution
-    from agent_interop.replay.types import CompatibilityKey
     from agent_interop.config import RepairPolicy
+    from agent_interop.execution import InteropRequestExecution
     from agent_interop.gateway import ResolvedInvocation
+    from agent_interop.replay.types import CompatibilityKey
 
     gw = _gateway()
     route = _route()
@@ -183,8 +183,8 @@ def test_replan_rebuilds_model_view_atomically():
         authoritative_request=reconciled,
     )
     # Stub resolver to return a fresh surface.
-    from agent_interop.replay.types import CompatibilityKey
     from agent_interop.config import RepairPolicy
+    from agent_interop.replay.types import CompatibilityKey
     new_surface = SimpleNamespace(visible_tools=("t",), validation_tools=())
     new_plan = SimpleNamespace(requirements=None, tool_surface_plan=new_surface)
 

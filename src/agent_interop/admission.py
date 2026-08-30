@@ -16,11 +16,11 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
-from typing import AsyncIterator, Literal
-
+from typing import Literal, Self
 
 
 @dataclass(frozen=True)
@@ -164,7 +164,7 @@ class _GenerationSlot:
             self.controller.release_by_key(self.key)
             self.released = True
 
-    async def __aenter__(self) -> "_GenerationSlot":
+    async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(self, *args: object) -> None:
@@ -228,7 +228,6 @@ class InferenceAdmissionController:
         """
         if capacity < 1:
             return
-        key = self._key(backend_url, model)
         state = await self._get_state(backend_url, model)
         target = min(capacity, self._config.max_concurrent_generations)
         async with self._lock:
@@ -324,7 +323,7 @@ class InferenceAdmissionController:
             async with self._lock:
                 state.queued = max(0, state.queued - 1)
             raise
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # Release the queued slot we were holding
             async with self._lock:
                 state.queued = max(0, state.queued - 1)
@@ -389,7 +388,7 @@ class InferenceAdmissionController:
                 self.release_by_key(key)
                 slot.released = True
 
-    async def __aenter__(self) -> "InferenceAdmissionController":
+    async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(self, *args: object) -> None:

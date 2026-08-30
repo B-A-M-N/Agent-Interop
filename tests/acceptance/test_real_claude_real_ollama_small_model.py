@@ -65,14 +65,13 @@ Gate A — 16K small-model proof:
 
 from __future__ import annotations
 
-from pathlib import Path
-
+import json
 import os
 import re
-import json
 import subprocess
 import tempfile
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -373,7 +372,6 @@ class TestGateA16KSmallModel:
                 f"{b}. Perform both reads in order, then tell me which held "
                 f"'B content'.",
             )
-            seq = [c["name"] for c in recorder.tool_calls[before:]]
             results["sequential"] = "B content" in r.stdout
 
             # 8. virtualization — enormous result through Interop at 16K.
@@ -430,7 +428,6 @@ class TestGateA16KSmallModel:
                 "sequential",
             }
             arch_ok = all(results[k] for k in architecture_layers)
-            autonomy_ok = all(results[k] for k in autonomy_tasks)
 
             # Record the full picture with per-task classification so a failure
             # is interpretable.

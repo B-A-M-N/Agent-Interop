@@ -115,8 +115,8 @@ def _historical_budget_selection(visible, max_schema):
 def test_incremental_budget_selection_matches_historical():
     """The linear budget loop must select exactly the same tools the O(n²)
     form selected — the optimization changes cost, not outcomes."""
-    from agent_interop.config import ToolSurfaceConfig, ToolSurfaceMode
     from agent_interop.abi import CanonicalToolChoice
+    from agent_interop.config import ToolSurfaceConfig, ToolSurfaceMode
     from agent_interop.tool_surface.selector import ToolSurfacePlanner
 
     rng = random.Random(5)
@@ -138,22 +138,14 @@ def test_incremental_budget_selection_matches_historical():
             )
             order = list(plan.visible_tools)
             rng.shuffle(order)
-            historical = _historical_budget_selection(order, max_schema)
             # The live planner with a budget uses the incremental loop.
             budgeted_plan = ToolSurfacePlanner().plan(
                 request,
                 ToolSurfaceConfig(mode=ToolSurfaceMode.DYNAMIC, max_initial_tools=len(tools), max_schema_tokens=max_schema),
                 cost_snapshot=snapshot,
             )
-            # The planner ranks deterministically, so feed the SAME order to
-            # the historical form for comparison.
-            ranked = sorted(
-                order, key=lambda t: (
-                    -(20 if f" {t.name} " in " work " or t.name in "work" else 0), t.name,
-                ),
-            )
-            # Simply compare incremental vs historical on the ranked order
-            # the planner produced (visible list order is deterministic).
+            # Compare incremental vs historical on the order the planner
+            # produced (visible list order is deterministic).
             assert tuple(budgeted_plan.visible_tools) == _historical_budget_selection(
                 plan.visible_tools, max_schema,
             ), (trial, max_schema)
@@ -190,7 +182,7 @@ def test_budget_loop_performs_no_repeated_serializations(monkeypatch):
     The historical form serialized once PER TOOL (O(n²) total)."""
     import json as _json
 
-    from agent_interop.config import ToolSurfaceConfig, ToolSurfaceMode
+    from agent_interop.config import ToolSurfaceMode
     from agent_interop.tool_surface import selector as selector_mod
 
     calls = {"dumps": 0}

@@ -15,7 +15,6 @@ P0.5.2 / P0.6 (client tool-name aliases)
 
 from __future__ import annotations
 
-
 from agent_interop.abi import CanonicalTool
 from agent_interop.compatibility_packs import (
     ClientCompatibilityPack,

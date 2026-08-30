@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import sys
 import textwrap
-from pathlib import Path
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from agent_interop.abi import (
@@ -31,7 +31,6 @@ from agent_interop.abi import (
     CanonicalToolChoice,
     CanonicalToolResultBlock,
 )
-
 from agent_interop.context_store.store import ContextStore
 from agent_interop.projection.planner import ModelProjector
 

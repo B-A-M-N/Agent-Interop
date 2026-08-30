@@ -117,9 +117,7 @@ def _group_messages_into_semantic_units(
             idx += 1
             while idx < len(messages):
                 nxt = messages[idx]
-                if nxt.role == "tool":
-                    idx += 1
-                elif nxt.role == "user":
+                if nxt.role == "tool" or nxt.role == "user":
                     idx += 1
                 else:
                     break
@@ -130,9 +128,7 @@ def _group_messages_into_semantic_units(
             idx += 1
             while idx < len(messages):
                 nxt = messages[idx]
-                if nxt.role == "tool":
-                    idx += 1
-                elif nxt.role == "assistant" and not _message_has_tool_calls(nxt):
+                if nxt.role == "tool" or nxt.role == "assistant" and not _message_has_tool_calls(nxt):
                     idx += 1
                 else:
                     break
@@ -395,13 +391,7 @@ def project_history(
 
     for i, u in enumerate(units):
         prot = False
-        if u.kind in ("system", "developer"):
-            prot = True
-        elif i == last_user_unit_idx:
-            prot = True
-        elif i == last_tool_exc_idx:
-            prot = True
-        elif i in recent_indices:
+        if u.kind in ("system", "developer") or i == last_user_unit_idx or i == last_tool_exc_idx or i in recent_indices:
             prot = True
         units[i] = replace(u, protected=prot)
 
@@ -593,8 +583,10 @@ def build_history_index_prompt(refs: list[HistoryRef]) -> str:
     if not refs:
         return ""
     lines = [
-        "Earlier conversation (use __interop_recall_history "
-        "or __interop_search_history if needed):"
+        (
+            "Earlier conversation (use __interop_recall_history "
+            "or __interop_search_history if needed):"
+        )
     ]
     for ref in refs:
         lines.append(

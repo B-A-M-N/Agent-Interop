@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-
 from agent_interop.abi import (
     CanonicalMessage,
     CanonicalRequest,

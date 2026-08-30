@@ -12,7 +12,6 @@ unchanged and remains the durable, operator-certified channel.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -97,11 +96,11 @@ def test_cache_roundtrip_and_revoke():
 
 def test_key_discriminates_tuples():
     def k(**over: Any) -> str:
-        base: dict[str, Any] = dict(
-            model_digest="d", template_digest="t", serving_config_digest="s",
-            profile_revision="1", client_protocol="c/proto",
-            tool_surface_fingerprint="f", tool_choice_class="auto",
-        )
+        base: dict[str, Any] = {
+            "model_digest": "d", "template_digest": "t", "serving_config_digest": "s",
+            "profile_revision": "1", "client_protocol": "c/proto",
+            "tool_surface_fingerprint": "f", "tool_choice_class": "auto",
+        }
         base.update(over)
         return stream_safety_key(**base)
 
@@ -226,7 +225,7 @@ class _StreamTransport:
     def __init__(self, data_lines: list[str]) -> None:
         self._data_lines = data_lines
 
-    def stream(self, request: Any):  # noqa: ANN201
+    def stream(self, request: Any):
         from contextlib import asynccontextmanager
 
         outer = self
@@ -243,20 +242,20 @@ class _SseStream:
         self.status_code = 200
         self._data_lines = data_lines
 
-    async def sse_events(self):  # noqa: ANN201
+    async def sse_events(self):
         from agent_interop.transport.sse import SSEFrame
 
         for line in self._data_lines:
             yield SSEFrame(data=line)
 
-    async def raw_lines(self):  # noqa: ANN201
+    async def raw_lines(self):
         return
         yield  # pragma: no cover
 
-    async def __aenter__(self):  # noqa: ANN201
+    async def __aenter__(self):
         return self
 
-    async def __aexit__(self, *a: Any) -> bool:
+    async def __aexit__(self, *a: object) -> bool:
         return False
 
 

@@ -408,7 +408,7 @@ class RequestCompatibilityPlanner:
         # exercises the backend's native tool-array validation even before a
         # model has enough evidence to be selected automatically.
         if requirements.tools_present and route.tool_mode == ToolMode.NATIVE:
-            direct = (CompatibilityAttempt(
+            direct: tuple[CompatibilityAttempt, ...] = (CompatibilityAttempt(
                 AttemptKind.NATIVE_TOOLS, ToolMode.NATIVE,
                 reason="operator_forced_native_tools",
             ),)

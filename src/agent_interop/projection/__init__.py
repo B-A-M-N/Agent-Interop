@@ -6,8 +6,8 @@ selection, withheld-tool index, and ModelView; the gateway only orchestrates ord
 """
 
 from agent_interop.projection.planner import (
-    ProjectionResult,
     ModelProjector,
+    ProjectionResult,
     build_internal_tool_surface,
     rebuild_invocation_atomic,
 )
@@ -20,9 +20,9 @@ from agent_interop.projection.types import (
 )
 
 __all__ = [
+    "ModelProjector",
     "PrivateCapabilityPlan",
     "ProjectionResult",
-    "ModelProjector",
     "SystemProjectionResult",
     "build_internal_tool_surface",
     "project_system",

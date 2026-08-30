@@ -15,17 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
 
 from agent_interop.abi import (
-    CanonicalMessage,
-    CanonicalModelReference,
-    CanonicalRequest,
-    CanonicalTextBlock,
     CanonicalTool,
     CanonicalToolCallBlock,
-    CanonicalToolChoice,
-    CanonicalToolResultBlock,
 )
 from agent_interop.config import (
     ContextConfig,
@@ -40,18 +33,14 @@ from agent_interop.config import (
 )
 from agent_interop.context import RequestContext
 from agent_interop.execution_attempts import AttemptBudget
-from agent_interop.execution_attempts.budget import GenerationReservation
 from agent_interop.gateway import Gateway
 from agent_interop.private_loop import MAX_INTERNAL_TOOL_LOOP_DEPTH, parse_private_arguments
-from agent_interop.transport import UpstreamResponse
-
 from tests.test_p01_private_continuation import (  # reuse proven scaffolding
-    _ScriptedTransport,
-    _VirtualizingContextSize,
-    _client_tools,
     _openai_chat_completion,
+    _ScriptedTransport,
     _session,
     _virtualizing_request,
+    _VirtualizingContextSize,
 )
 
 
@@ -193,7 +182,7 @@ def test_malformed_private_arguments_become_error_not_empty_object():
     is_error result fed back to the model — never a silent {} execution
     (which for read_result would read the head of the ref by default)."""
     gw, session = _private_loop_gateway()
-    ref = gw._context_store.store("sess-private-loop", "data\n", kind="tool_result", tool_call_id="RE").ref
+    gw._context_store.store("sess-private-loop", "data\n", kind="tool_result", tool_call_id="RE")
     malformed = [{
         "id": "bad", "type": "function",
         "function": {"name": "__interop_read_result", "arguments": "{not json"},
@@ -217,7 +206,6 @@ def test_malformed_private_arguments_become_error_not_empty_object():
 def test_missing_required_argument_rejected_strictly():
     """P0-20: read_result requires 'ref' — a call without it is an error,
     not a default-execution."""
-    from agent_interop.gateway import Gateway
 
     parsed, err = parse_private_arguments(
         type("C", (), {"raw_arguments": json.dumps({"start_line": 3})})(),

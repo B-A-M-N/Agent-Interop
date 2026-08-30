@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import asyncio
 
-
 from agent_interop.abi import (
     CanonicalMessage,
     CanonicalModelReference,
@@ -181,9 +180,10 @@ class TestP01AuthoritativeModelView:
         # capability is active (no virtualization, no withheld tools), the
         # prompt contract does NOT include internal tool descriptions.
         has_internal_in_tools = any(t.name.startswith("__interop_") for t in inv.model_request.tools)
-        has_internal_in_contract = "__interop_read_result" in (inv.invocation_plan.prompt_contract or "")
-        # In PROMPTED mode without active capabilities, no internal tools exposed.
+        # In PROMPTED mode without active capabilities, no internal tool
+        # descriptions appear in either the tool list or the contract.
         assert not has_internal_in_tools
+        assert "__interop_read_result" not in (inv.invocation_plan.prompt_contract or "")
         # but the authoritative registry (used for validation) is intact
         assert [t.name for t in inv.authoritative_request.tools] == [t.name for t in tools]
         assert [t.name for t in inv.invocation_plan.validation_tools] == [t.name for t in tools]

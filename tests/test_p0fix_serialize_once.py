@@ -44,7 +44,7 @@ class _CapturingTransport:
     def __init__(self) -> None:
         self.last: PreparedUpstreamRequest | None = None
 
-    async def send(self, request):  # noqa: ANN001
+    async def send(self, request):
         self.last = request
         return UpstreamResponse(
             status_code=200,

@@ -102,10 +102,8 @@ class InternalToolExecutor:
             except (ValueError, TypeError):
                 return InternalToolResult("__interop_read_result", ref, "Invalid line_count: must be an integer", is_error=True)
             # P0.19: cap line_count
-            if line_count < 1:
-                line_count = 1
-            if line_count > MAX_LINE_COUNT:
-                line_count = MAX_LINE_COUNT
+            line_count = max(line_count, 1)
+            line_count = min(line_count, MAX_LINE_COUNT)
         else:
             # P0.19: omission no longer means unbounded remainder
             line_count = DEFAULT_LINE_COUNT
@@ -166,10 +164,8 @@ class InternalToolExecutor:
             return InternalToolResult("__interop_search_history", "", "Invalid max_results: must be an integer", is_error=True)
         if not query:
             return InternalToolResult("__interop_search_history", "", "Missing query", is_error=True)
-        if max_results < 1:
-            max_results = 1
-        if max_results > MAX_SEARCH_RESULTS:
-            max_results = MAX_SEARCH_RESULTS
+        max_results = max(max_results, 1)
+        max_results = min(max_results, MAX_SEARCH_RESULTS)
         results = self._store.search(session_id, query, max_results)
         if not results:
             return InternalToolResult("__interop_search_history", "", f"No matches for: {query}")

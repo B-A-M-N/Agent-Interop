@@ -277,6 +277,7 @@ def _legacy_compact_safe_tool_results(
             if block.is_error or not isinstance(block.content, str):
                 changed_blocks.append(block)
                 continue
+            compacted: str | None
             if policy is ToolResultPolicy.BOUNDED_LINES:
                 compacted = _bounded_lines(block.content)
             elif policy is ToolResultPolicy.STRUCTURED_REDUCTION:
