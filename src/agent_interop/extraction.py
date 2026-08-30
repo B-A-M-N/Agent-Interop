@@ -1115,6 +1115,12 @@ def _normalize_name_and_args_from_json(raw_payload: str) -> tuple[str | None, An
     name: str | None = None
     arguments: Any = raw_payload
 
+    # Authoritative argument-key set shared by every wrapper branch below.
+    # Small models emit varied keys; `params` in particular is common in
+    # `{"tool": "X", "params": {...}}` output and was previously missed by the
+    # `{"tool": ...}` branch, so normalize it through the same key set.
+    _ARGUMENT_KEYS = ("arguments", "parameters", "input", "params", "args")
+
     # {"function": {"name": "x", "arguments": {...}}}
     if "function" in data and isinstance(data["function"], dict):
         fn = data["function"]
@@ -1131,14 +1137,14 @@ def _normalize_name_and_args_from_json(raw_payload: str) -> tuple[str | None, An
     # {"function": "x", "arguments": {...}}
     if "function" in data and isinstance(data.get("function"), str):
         name = data["function"]
-        args_val = _get_first_of(data, ("arguments", "parameters", "input"))
+        args_val = _get_first_of(data, _ARGUMENT_KEYS)
         arguments = args_val if args_val is not None else raw_payload
         return name, arguments
 
     # {"name": "x", ...} — try arguments, parameters, input, params keys
     if "name" in data and isinstance(data["name"], str):
         name = data["name"]
-        args_val = _get_first_of(data, ("arguments", "parameters", "input", "params"))
+        args_val = _get_first_of(data, _ARGUMENT_KEYS)
         if args_val is not None:
             arguments = args_val
         else:
@@ -1146,10 +1152,10 @@ def _normalize_name_and_args_from_json(raw_payload: str) -> tuple[str | None, An
             arguments = raw_payload
         return name, arguments
 
-    # {"tool": "x", "input": {...}}  — Qwen style
+    # {"tool": "x", "input"/"arguments"/"parameters"/"params": {...}}
     if "tool" in data and isinstance(data["tool"], str):
         name = data["tool"]
-        args_val = _get_first_of(data, ("input", "arguments", "parameters"))
+        args_val = _get_first_of(data, _ARGUMENT_KEYS)
         arguments = args_val if args_val is not None else raw_payload
         return name, arguments
 

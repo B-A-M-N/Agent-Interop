@@ -35,6 +35,7 @@ from agent_interop.config import (
     UpstreamConfig,
     UpstreamKind,
     UpstreamProtocol,
+    ContextConfig,
 )
 from agent_interop.context import RequestContext
 from agent_interop.evidence.store import EvidenceStore
@@ -95,6 +96,7 @@ def _make_gateway(
                 ),
                 tool_mode=ToolMode.AUTO,
                 translation_mode=TranslationMode.CANONICAL,
+                context=ContextConfig(context_limit_tokens=32768),
             ),
         },
     )
@@ -189,8 +191,10 @@ class _FakeTransport:
 
 
 def _verified_result(**overrides: Any) -> CompatibilityResult:
+    from datetime import datetime, UTC
+    now = datetime.now(UTC).isoformat()
     defaults: dict[str, Any] = {
-        "tested_at": "2026-07-24T12:00:00+00:00",
+        "tested_at": now,
         "sample_count": 50,
         "tool_selection_rate": 0.9,
         "valid_call_rate_before_repair": 0.7,
@@ -203,8 +207,8 @@ def _verified_result(**overrides: Any) -> CompatibilityResult:
         "history_round_trip_valid": True,
         "verified_capabilities": frozenset({"native"}),
         "known_quirks": (),
-        "created_at": "2026-07-01T00:00:00+00:00",
-        "last_verified_at": "2026-07-24T12:00:00+00:00",
+        "created_at": now,
+        "last_verified_at": now,
         "manually_verified": True,
         "revoked": False,
         "revocation_reason": "",
@@ -519,7 +523,10 @@ class TestLiveWriteBack:
         probe = gw._prepare_invocation(
             canonical, ctx, streaming=False, execution=InteropRequestExecution(),
         )
-        store.store_result(probe.compatibility_key, _verified_result(manually_verified=True))
+        seed = _verified_result(manually_verified=True)
+        store.store_result(probe.compatibility_key, seed)
+        # Capture the seed's certification clock before write-back.
+        original_last_verified = seed.last_verified_at
 
         await gw.handle_request(canonical, ctx)
 
@@ -530,7 +537,7 @@ class TestLiveWriteBack:
         )
         # P0.3: live write-back must NOT refresh the certification clock.
         # last_verified_at must remain exactly what the seed record had.
-        assert result.last_verified_at == "2026-07-24T12:00:00+00:00", (
+        assert result.last_verified_at == original_last_verified, (
             "write-back must not modify last_verified_at (certification clock); "
             f"got {result.last_verified_at!r}"
         )
@@ -701,7 +708,23 @@ class TestLiveWriteBackStreaming:
         gw = _make_gateway(store=store)
         gw._transport = _FakeSseTransport(NORMAL_TEXT_STREAM)
 
-        canonical = _make_request()  # offers READ_FILE_TOOL
+        # Use a small number of tools (no withholding) so the stream goes
+        # through the direct path, not the buffered path. The test only needs
+        # tools to be present for evidence write-back to fire.
+        few_tools = [
+            CanonicalTool(
+                name=f"tool_{i}",
+                description=f"tool {i}",
+                input_schema={"type": "object", "properties": {}},
+            )
+            for i in range(2)
+        ]
+        canonical = CanonicalRequest(
+            model=CanonicalModelReference(requested_name="test-model"),
+            messages=[CanonicalMessage(role="user", content=[CanonicalTextBlock(text="test")])],
+            tools=few_tools,
+            tool_choice=CanonicalToolChoice.auto(),
+        )
         ctx = RequestContext(client_id="claude_code")
 
         # Discover the exact key the gateway computes for a STREAMING request
@@ -922,9 +945,11 @@ def _observe(
     decisions: list[ToolDecisionRecord],
 ) -> None:
     """Fire one live observation directly into the inner write-back path."""
+    from agent_interop.evidence.recorder import record_evidence_observation_inner
+
     execution = InteropRequestExecution()
     execution.tool_decisions = decisions
-    # Any prepared invocation with the right key suffices; the inner method
+    # Any prepared invocation with the right key suffices; the recorder
     # only reads invocation.compatibility_key.
     invocation = gw._prepare_invocation(
         _make_request(), RequestContext(client_id="claude_code"),
@@ -933,7 +958,7 @@ def _observe(
     # Force the key under test (the probe's key is structurally identical in
     # the single-route tests, but pinning it makes intent explicit).
     object.__setattr__(invocation, "compatibility_key", key)
-    gw._record_evidence_observation_inner(invocation, execution, store)
+    record_evidence_observation_inner(invocation, execution, store)
 
 
 class TestCertificationClockNotResetByLiveTraffic:

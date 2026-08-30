@@ -93,10 +93,34 @@ class RepairTelemetry(Protocol):
 
 
 @dataclass(frozen=True)
+class CompiledToolRegistry:
+    """P1-H: name indexes over the request's declared tools, built ONCE.
+
+    The transaction pipeline previously rebuilt ``{t.name: t}`` per
+    candidate (and canonicalization rebuilt its own map again); a batch of
+    N candidates paid 2N dict constructions over the tool list. One
+    compiled registry per request turns those into O(1) lookups with no
+    behavioral change — the maps are identical to the historical forms.
+    """
+
+    tools: tuple[CanonicalTool, ...] = ()
+    by_name: dict[str, CanonicalTool] = field(default_factory=dict)
+
+    @classmethod
+    def compile(cls, tools: Sequence[CanonicalTool]) -> "CompiledToolRegistry":
+        return cls(tools=tuple(tools), by_name={t.name: t for t in tools})
+
+    def get(self, name: str) -> CanonicalTool | None:
+        return self.by_name.get(name)
+
+
+@dataclass(frozen=True)
 class ToolTransactionContext:
     """Context passed through the transaction pipeline.
 
     Carries request identity, tool choice, repair policy, and budget.
+    ``registry`` is the request's compiled tool index — when absent the
+    pipeline builds one from the ``tools`` argument as before.
     """
 
     request_id: str = ""
@@ -109,6 +133,7 @@ class ToolTransactionContext:
     budget: RepairBudget | None = None  # Shared across all candidates in a batch
     compatibility_key: CompatibilityKey | None = None
     compatibility_verified: bool = False
+    registry: CompiledToolRegistry | None = None
 
 
 @dataclass
@@ -282,7 +307,25 @@ async def tool_transaction_service(
         )
 
     # ── Step 1: Tool-name canonicalization ────────────────────────────
-    canonical_name = canonicalize_tool_name(candidate.name, tools, _policy=repair_policy)
+    tool_aliases = None
+    if client_id:
+        from agent_interop.compatibility_packs import get_tool_name_alias_map
+
+        tool_aliases = get_tool_name_alias_map(
+            client_id,
+            client_version=getattr(context.compatibility_key, "client_version", None)
+            if context.compatibility_key is not None
+            else None,
+            tool_schema_fingerprint=getattr(
+                context.compatibility_key, "tool_schema_fingerprint", None
+            )
+            if context.compatibility_key is not None
+            else None,
+            declared_tool_names=tuple(t.name for t in tools),
+        )
+    canonical_name = canonicalize_tool_name(
+        candidate.name, tools, _policy=repair_policy, tool_aliases=tool_aliases
+    )
     if canonical_name is None:
         return ToolCallDecision(
             candidate=candidate,
@@ -295,7 +338,11 @@ async def tool_transaction_service(
             accepted_block=None,
         )
 
-    tool_map = {t.name: t for t in tools}
+    tool_map = (
+        context.registry.by_name
+        if context.registry is not None
+        else {t.name: t for t in tools}
+    )
     tool = tool_map[canonical_name]
 
     # ── Step 2-5: Run the validate-then-repair pipeline ───────────────
@@ -529,6 +576,13 @@ async def process_tool_batch(
             rejected_count=len(candidates),
             choice_error=choice_error,
         )
+
+    # P1-H: compile the registry once per batch when the caller did not
+    # supply one — every candidate then shares the same name index.
+    if context.registry is None:
+        from dataclasses import replace as _replace
+
+        context = _replace(context, registry=CompiledToolRegistry.compile(tools))
 
     decisions = []
     for candidate in candidates:

@@ -2,6 +2,21 @@
 
 ## Agent Compatibility Gateway — local LLM compatibility layer for coding agents
 
+> **Status: Alpha (Development Status :: 3 - Alpha, v0.2.0).** Two claims
+> are kept deliberately separate:
+>
+> 1. **Package maturity — Alpha.** The architecture (canonical pipeline,
+>    attempt ladder, private continuation, context budgeting, admission
+>    control, qualification evidence) is implemented and covered by
+>    regression tests, but the API, config surface, and behavior guarantees
+>    are still settling. Expect breaking changes.
+> 2. **Client evidence tier — no client is release-tested.** The
+>    release-tested *tier* for any client requires a real local-model
+>    backend run plus nonce-gated, build-bound acceptance evidence (see
+>    "Client integration status" below). The recorded Claude Code
+>    acceptance runs used a scripted upstream or were recorded before the
+>    real-backend gate existed, so none qualify today.
+
 Interop sits between a coding agent and a local inference backend and
 translates between the wire formats each side expects.
 
@@ -42,7 +57,7 @@ the gateway-protocol or launch-spec level.
 
 | Client | Backend | Verified as |
 |--------|---------|-------------|
-| Claude Code | Ollama | Reproducibly release-tested client (v2.1.220) |
+| Claude Code | Ollama | Real client binary launched, scripted backend (v2.1.220) — see Known gaps |
 | hermes-agent | Ollama | Manually tested client (v0.19.0) |
 | Codex | Ollama / OpenAI-compatible (vLLM, llama.cpp) | Gateway-tested protocol |
 | Crush | Manual configuration | Unit-tested integration (no automatic launch) |
@@ -67,10 +82,16 @@ Verification tiers, weakest to strongest:
   → correct final answer) via the OpenAI Chat wire — not yet backed by an
   automated, checked-in acceptance test the way Claude Code's is.
 - **Reproducibly release-tested client** — an automated, opt-in
-  acceptance test invokes the real client binary end-to-end and is part
-  of the release gate. Currently earned by Claude Code only — see
-  `acceptance/results/claude-code-2.1.220.json` and
-  `tests/acceptance/test_real_client_claude.py`.
+  acceptance test invokes the real client binary end-to-end against a
+  **real local model backend** (not a scripted fake transport) and is part
+  of the release gate. It must also prove the per-request execution-nonce
+  gate (see `tests/acceptance/_harness.py`'s `nonce_gated_recovery`) and
+  the evidence must be bound to the current build (battery_version +
+  git_commit, verified by `scripts/check_support_claims.sh`). No client
+  currently meets this bar: the recorded Claude Code run (v2.1.220) launched
+  the real binary but against a scripted upstream, so it is listed as
+  "real client binary launched, scripted backend" rather than release-tested
+  — overclaiming it as release-tested would fail the gate.
 
 MVP scope is Linux, Python 3.11+, loopback ingress, and one route per
 process. Multi-route operation, remote ingress exposure, and any client
@@ -131,10 +152,13 @@ Interop shim (intercepts launch subcommand)
   ▼
 Interop Gateway (protocol translation)
   ├── Client protocol adapters (Anthropic Messages, OpenAI Chat, OpenAI Responses)
+  ├── Authoritative state → ModelView projection (bounded, virtualized)
   ├── Model-specific template rendering
   ├── Tool-call parsing (Hermes, Qwen, DeepSeek, Mistral, Llama, generic JSON)
   ├── Schema validation + bounded repair
+  ├── Private compatibility loop (__interop_* tools, separate authority)
   ├── Capability detection + per-route conformance levels
+  ├── Cumulative input budgeting + admission control (streaming + non-streaming)
   └── Loop detection
   │
   ▼
@@ -143,6 +167,13 @@ Ollama / vLLM / llama.cpp
   ▼
 Local model
 ```
+
+The gateway keeps the **authoritative** client request and exposes only a
+bounded **ModelView** to the model. Discovery/internal tools (`__interop_*`)
+run in a **private compatibility loop** with their own authority — their
+arguments are parsed strictly and their results never reach the client. A
+**repair firewall** validates client-visible tool calls against the declared
+schema and applies only bounded, schema-preserving repair.
 
 ### Status
 

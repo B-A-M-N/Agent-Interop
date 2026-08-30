@@ -48,6 +48,7 @@ from agent_interop.config import (
     UpstreamConfig,
     UpstreamKind,
     UpstreamProtocol,
+    ContextConfig,
 )
 from agent_interop.context import RequestContext
 from agent_interop.gateway import Gateway
@@ -122,6 +123,7 @@ def _make_ollama_gateway(*, tool_mode: ToolMode = ToolMode.AUTO) -> Gateway:
                 ),
                 tool_mode=tool_mode,
                 translation_mode=TranslationMode.CANONICAL,
+                context=ContextConfig(context_limit_tokens=32768),
             ),
         },
     )

@@ -44,6 +44,7 @@ from agent_interop.config import (
     UpstreamConfig,
     UpstreamKind,
     UpstreamProtocol,
+    ContextConfig,
 )
 from agent_interop.context import RequestContext
 from agent_interop.gateway import Gateway
@@ -319,6 +320,7 @@ async def interop_app(fake_upstream: FakeUpstreamServer):
                 ),
                 tool_mode=ToolMode.AUTO,
                 translation_mode=TranslationMode.CANONICAL,
+                context=ContextConfig(context_limit_tokens=32768),
             ),
         },
     )
@@ -588,6 +590,7 @@ class TestGatewayDirect:
                         timeout_seconds=30.0,
                     ),
                     tool_mode=ToolMode.AUTO,
+                    context=ContextConfig(context_limit_tokens=32768),
                 ),
             },
         )
@@ -628,6 +631,7 @@ class TestGatewayDirect:
                         timeout_seconds=30.0,
                     ),
                     tool_mode=ToolMode.AUTO,
+                    context=ContextConfig(context_limit_tokens=32768),
                 ),
             },
         )
@@ -676,6 +680,7 @@ class TestGatewayDirect:
                         timeout_seconds=30.0,
                     ),
                     tool_mode=ToolMode.AUTO,
+                    context=ContextConfig(context_limit_tokens=32768),
                 ),
                 "route-b": ModelRoute(
                     id="route-b",
@@ -688,6 +693,7 @@ class TestGatewayDirect:
                         timeout_seconds=30.0,
                     ),
                     tool_mode=ToolMode.AUTO,
+                    context=ContextConfig(context_limit_tokens=32768),
                 ),
             },
         )

@@ -45,4 +45,5 @@ def test_acceptance_artifact_contains_required_provenance(tmp_path, monkeypatch)
         "tool_error_recovery": False,
         "multi_turn_continuation": True,
         "cleanup_verification": False,
+        "nonce_gated_recovery": False,
     }

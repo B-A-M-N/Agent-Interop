@@ -46,6 +46,10 @@ class RequestRequirements:
     structured_output_required: bool = False
     tool_count: int = 0
     tool_schema_bytes: int = 0
+    # P1-F: canonical full-surface fingerprint from the request's single
+    # serialization pass — the same form the evidence key uses, so callers
+    # never re-serialize the schema to fingerprint it.
+    tool_schema_fingerprint: str = ""
     estimated_input_tokens: int = 0
     requested_output_tokens: int = 0
 

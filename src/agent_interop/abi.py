@@ -654,6 +654,10 @@ class CanonicalResponse:
     usage: CanonicalUsage = field(default_factory=CanonicalUsage)
     extra: dict[str, Any] = field(default_factory=dict)
     error: CanonicalError | None = None
+    # P0-17: codec-native raw tool-call candidates, carried so internal
+    # consumers (the private continuation loop) can re-extract the same turn
+    # without re-decoding. Never serialized to clients.
+    tool_candidates: list[Any] = field(default_factory=list)
 
 
 @dataclass

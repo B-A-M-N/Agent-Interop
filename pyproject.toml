@@ -1,6 +1,6 @@
 [project]
 name = "agent-interop"
-version = "0.1.0"
+version = "0.2.0"
 description = "Agent Compatibility Gateway — protocol translation, tool-call normalization, and capability conformance testing for local LLM coding agents."
 requires-python = ">=3.11"
 authors = [

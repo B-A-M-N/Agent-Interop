@@ -25,12 +25,33 @@ import sys
 
 # module path suffix -> minimum percent_covered. Raise a floor (never
 # lower it without a comment explaining why) as a module gets more tests.
+#
+# P0-66: critical correctness/latency modules now carry floors.  The
+# historical streaming-stub regression and the stored_refs constructor
+# mismatch were exactly the integration failures an aggregate-only gate
+# missed.  Floors sit slightly below measured coverage at introduction —
+# they are ratchets, not targets.
 MODULE_FLOORS: dict[str, float] = {
     "src/agent_interop/install.py": 80.0,
     "src/agent_interop/launcher.py": 55.0,
     "src/agent_interop/agents/codex.py": 40.0,
     "src/agent_interop/tool/normalize.py": 40.0,
     "src/agent_interop/cli.py": 45.0,
+    # ── Critical runtime modules (P0-66) ──
+    "src/agent_interop/gateway.py": 80.0,
+    "src/agent_interop/admission.py": 85.0,
+    "src/agent_interop/private_loop.py": 72.0,
+    "src/agent_interop/context_store/store.py": 84.0,
+    "src/agent_interop/context_store/executor.py": 70.0,
+    "src/agent_interop/context_budget/planner.py": 85.0,
+    "src/agent_interop/context_budget/compaction.py": 82.0,
+    "src/agent_interop/projection/planner.py": 88.0,
+    "src/agent_interop/history/projector.py": 78.0,
+    "src/agent_interop/planning/planner.py": 73.0,
+    "src/agent_interop/qualification/bootstrap.py": 88.0,
+    "src/agent_interop/qualification/state.py": 92.0,
+    "src/agent_interop/execution_attempts/budget.py": 85.0,
+    "src/agent_interop/execution_attempts/executor.py": 90.0,
 }
 
 

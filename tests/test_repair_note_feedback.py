@@ -31,6 +31,7 @@ from agent_interop.config import (
     UpstreamConfig,
     UpstreamKind,
     UpstreamProtocol,
+    ContextConfig,
 )
 from agent_interop.context import RequestContext
 from agent_interop.gateway import Gateway
@@ -65,6 +66,7 @@ def _config() -> InteropServerConfig:
                 ),
                 tool_mode=ToolMode.AUTO,
                 translation_mode=TranslationMode.CANONICAL,
+                context=ContextConfig(context_limit_tokens=32768),
             ),
         },
     )
@@ -117,7 +119,9 @@ async def _run(model_text: str):
 
 class TestRepairNoteFeedback:
     @pytest.mark.asyncio
-    async def test_note_present_when_alias_repair_applied(self) -> None:
+    async def test_note_NOT_in_response_when_alias_repair_applied(self) -> None:
+        """P1.4: repair feedback must NOT leak to the coding client via the
+        assistant response. The note is stored on the execution record instead."""
         model_text = '<tool_call>{"name":"read_file","arguments":{"file_path":"/tmp/x"}}</tool_call>'
         resp = await _run(model_text)
 
@@ -126,13 +130,12 @@ class TestRepairNoteFeedback:
         assert len(tool_calls) == 1
         assert tool_calls[0].arguments == {"path": "/tmp/x"}
 
+        # P1.4: no [Interop] note in the client-visible response
         notes = [
             b for b in resp.content
             if isinstance(b, CanonicalTextBlock) and b.text.startswith("[Interop]")
         ]
-        assert len(notes) == 1
-        assert "file_path" in notes[0].text
-        assert "path" in notes[0].text
+        assert notes == []
 
     @pytest.mark.asyncio
     async def test_no_note_when_call_was_already_valid(self) -> None:

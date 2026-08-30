@@ -57,6 +57,10 @@ class InteropErrorCode(str):
     # Capability errors
     CAPABILITY_REQUIRED = "CAPABILITY_REQUIRED"
     CONTEXT_LIMIT_EXCEEDED = "CONTEXT_LIMIT_EXCEEDED"
+    CONTEXT_CAPACITY_UNKNOWN = "CONTEXT_CAPACITY_UNKNOWN"
+    CONTEXT_ENTRY_TOO_LARGE = "CONTEXT_ENTRY_TOO_LARGE"
+    CONTEXT_ENTRY_EVICTED = "CONTEXT_ENTRY_EVICTED"
+    CONTEXT_REF_UNAVAILABLE = "CONTEXT_REF_UNAVAILABLE"
     MODEL_QUALIFICATION_REQUIRED = "MODEL_QUALIFICATION_REQUIRED"
     MODEL_QUALIFICATION_FAILED = "MODEL_QUALIFICATION_FAILED"
     REQUEST_PLAN_UNAVAILABLE = "REQUEST_PLAN_UNAVAILABLE"
@@ -67,6 +71,8 @@ class InteropErrorCode(str):
     CONTROLLER_FAILED = "CONTROLLER_FAILED"
     CONTROLLER_LOOP_DETECTED = "CONTROLLER_LOOP_DETECTED"
     ATTEMPT_BUDGET_EXHAUSTED = "ATTEMPT_BUDGET_EXHAUSTED"
+    INTERNAL_TOOL_LOOP_EXHAUSTED = "INTERNAL_TOOL_LOOP_EXHAUSTED"
+    INTERNAL_LEAK = "INTERNAL_LEAK"
     CLIENT_INTEGRATION_UNAVAILABLE = "CLIENT_INTEGRATION_UNAVAILABLE"
     CLIENT_VERSION_UNSUPPORTED = "CLIENT_VERSION_UNSUPPORTED"
 
@@ -175,6 +181,18 @@ ERROR_REGISTRY: dict[str, ErrorDescriptor] = {
     InteropErrorCode.CONTEXT_LIMIT_EXCEEDED: ErrorDescriptor(
         code=InteropErrorCode.CONTEXT_LIMIT_EXCEEDED, http_status=400, retryable=False,
         anthropic_type="invalid_request_error", openai_type="context_length_exceeded"),
+    InteropErrorCode.CONTEXT_CAPACITY_UNKNOWN: ErrorDescriptor(
+        code=InteropErrorCode.CONTEXT_CAPACITY_UNKNOWN, http_status=422, retryable=False,
+        anthropic_type="invalid_request_error", openai_type="invalid_request_error"),
+    InteropErrorCode.CONTEXT_ENTRY_TOO_LARGE: ErrorDescriptor(
+        code=InteropErrorCode.CONTEXT_ENTRY_TOO_LARGE, http_status=400, retryable=False,
+        anthropic_type="invalid_request_error", openai_type="context_length_exceeded"),
+    InteropErrorCode.CONTEXT_ENTRY_EVICTED: ErrorDescriptor(
+        code=InteropErrorCode.CONTEXT_ENTRY_EVICTED, http_status=400, retryable=False,
+        anthropic_type="invalid_request_error", openai_type="context_length_exceeded"),
+    InteropErrorCode.CONTEXT_REF_UNAVAILABLE: ErrorDescriptor(
+        code=InteropErrorCode.CONTEXT_REF_UNAVAILABLE, http_status=410, retryable=False,
+        anthropic_type="invalid_request_error", openai_type="context_length_exceeded"),
     InteropErrorCode.MODEL_QUALIFICATION_REQUIRED: ErrorDescriptor(
         code=InteropErrorCode.MODEL_QUALIFICATION_REQUIRED, http_status=422, retryable=True,
         anthropic_type="invalid_request_error", openai_type="invalid_request_error"),
@@ -205,6 +223,9 @@ ERROR_REGISTRY: dict[str, ErrorDescriptor] = {
     InteropErrorCode.ATTEMPT_BUDGET_EXHAUSTED: ErrorDescriptor(
         code=InteropErrorCode.ATTEMPT_BUDGET_EXHAUSTED, http_status=504, retryable=True,
         anthropic_type="timeout_error", openai_type="server_error"),
+    InteropErrorCode.INTERNAL_TOOL_LOOP_EXHAUSTED: ErrorDescriptor(
+        code=InteropErrorCode.INTERNAL_TOOL_LOOP_EXHAUSTED, http_status=504, retryable=False,
+        anthropic_type="api_error", openai_type="server_error"),
     InteropErrorCode.CLIENT_INTEGRATION_UNAVAILABLE: ErrorDescriptor(
         code=InteropErrorCode.CLIENT_INTEGRATION_UNAVAILABLE, http_status=422, retryable=False,
         anthropic_type="invalid_request_error", openai_type="invalid_request_error"),
@@ -463,6 +484,47 @@ def err_backend_timeout(backend_url: str, timeout: float) -> InteropError:
         details={"backend_url": backend_url, "timeout_seconds": timeout},
         remediation=["Increase the route timeout", "Check backend load"],
     )
+
+
+# ─── Context store errors ──────────────────────────────────────────────────
+
+
+class ContextStoreError(InteropError):
+    """Base class for context-store errors."""
+
+
+class ContextEntryTooLargeError(ContextStoreError):
+    """A single stored entry exceeds the per-entry byte cap."""
+
+    def __init__(self, message: str, **kw: Any) -> None:
+        super().__init__(
+            code=InteropErrorCode.CONTEXT_ENTRY_TOO_LARGE,
+            message=message,
+            **kw,
+        )
+
+
+class ContextEntryEvictedError(ContextStoreError):
+    """A stored entry was immediately evicted (oversized for the store)."""
+
+    def __init__(self, message: str, **kw: Any) -> None:
+        super().__init__(
+            code=InteropErrorCode.CONTEXT_ENTRY_EVICTED,
+            message=message,
+            **kw,
+        )
+
+
+class ContextStoreCapacityError(ContextStoreError):
+    """The context store cannot accept a new session because all sessions
+    are at capacity and every existing session has pinned entries."""
+
+    def __init__(self, message: str, **kw: Any) -> None:
+        super().__init__(
+            code=InteropErrorCode.CONTEXT_LIMIT_EXCEEDED,
+            message=message,
+            **kw,
+        )
 
 
 _SENSITIVE_DETAIL_KEYS = frozenset({

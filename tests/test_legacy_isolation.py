@@ -105,6 +105,7 @@ def test_gateway_uses_only_v2_repair_pipeline() -> None:
     allowed_repair_imports = {
         "agent_interop.repair.pipeline",
         "agent_interop.repair.invocation",
+        "agent_interop.repair.schema",
     }
 
     violations: list[str] = []

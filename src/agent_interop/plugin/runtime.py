@@ -13,12 +13,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent_interop.abi import (
-    CanonicalMessage,
     CanonicalModelReference,
     CanonicalRequest,
-    CanonicalTextBlock,
-    CanonicalToolCallBlock,
-    CanonicalToolChoice,
     ProtocolKind,
 )
 from agent_interop.config import InteropServerConfig
@@ -26,8 +22,7 @@ from agent_interop.context import RequestContext
 from agent_interop.execution import InteropRequestExecution
 from agent_interop.gateway import Gateway
 from agent_interop.plugin.adapter import LocalModelAdapter
-from agent_interop.qualification import BootstrapQualifier, QualificationRecord
-from agent_interop.qualification.probes import SYNTHETIC_TOOL
+from agent_interop.qualification import QualificationRecord
 from agent_interop.replay.runner import replay_all_policies
 from agent_interop.replay.types import ReplayCase
 
@@ -100,38 +95,16 @@ class InteropRuntime(LocalModelAdapter):
     ) -> QualificationRecord:
         """Run only the bounded synthetic bootstrap battery.
 
-        The probe tool is declarative and never executes locally.  The backend
-        merely emits a request for it, so qualification cannot touch files,
-        shell, or client-owned tools.
+        P0.33: Uses gateway.qualify_route() to avoid recursive qualification.
         """
         gateway = self._require_gateway()
-        ctx = self._context(context)
         resolved_model = model or (self.config.default_route_id if self.config else "")
         runtime = await self.inspect_model(resolved_model)
 
-        async def execute(probe: Any) -> bool:
-            choice = (
-                CanonicalToolChoice.required() if probe.requires_tools
-                else CanonicalToolChoice.none()
-            )
-            request = CanonicalRequest(
-                model=CanonicalModelReference(requested_name=resolved_model),
-                messages=[CanonicalMessage(role="user", content=[CanonicalTextBlock(text=probe.prompt)])],
-                tools=[SYNTHETIC_TOOL] if probe.requires_tools else [],
-                tool_choice=choice,
-            )
-            response = await gateway.handle_request(request, ctx)
-            if response.error is not None:
-                return False
-            calls = [block for block in response.content if isinstance(block, CanonicalToolCallBlock)]
-            if probe.name == "no_tool":
-                return not calls
-            if probe.requires_tools and probe.name != "tool_result_continuation":
-                return bool(calls)
-            return True
-
+        # P0.33: Use the gateway's canonical qualification engine directly
+        # to prevent recursive qualification (qualify inside qualify)
         digest = runtime.model_digest or runtime.model_name or resolved_model
-        record = await BootstrapQualifier().qualify(digest, execute)
+        record = await gateway.qualify_route(digest, runtime, scope="full")
         gateway.record_qualification(record)
         return record
 

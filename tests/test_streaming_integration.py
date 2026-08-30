@@ -31,6 +31,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from agent_interop.abi import (
     CanonicalEvent,
+    CanonicalStopReason,
     CanonicalGenerationOptions,
     CanonicalMessage,
     CanonicalModelReference,
@@ -48,6 +49,7 @@ from agent_interop.config import (
     UpstreamConfig,
     UpstreamKind,
     UpstreamProtocol,
+    ContextConfig,
 )
 from agent_interop.context import RequestContext
 from agent_interop.execution import ExecutionState, InteropRequestExecution
@@ -250,6 +252,7 @@ async def interop_app(fake_upstream: FakeStreamingUpstreamServer):
                 ),
                 tool_mode=ToolMode.AUTO,
                 translation_mode=TranslationMode.CANONICAL,
+                context=ContextConfig(context_limit_tokens=32768),
             ),
         },
     )
@@ -745,6 +748,7 @@ class TestGatewayStreamingDirect:
                         timeout_seconds=30.0,
                     ),
                     tool_mode=ToolMode.AUTO,
+                    context=ContextConfig(context_limit_tokens=32768),
                 ),
             },
         )
@@ -779,13 +783,11 @@ class TestGatewayStreamingDirect:
     async def test_unverified_stream_buffers_until_a_validated_response(
         self, fake_upstream: FakeStreamingUpstreamServer
     ):
-        """Schema-v2-style routes use the non-streaming attempt ladder first.
-
-        This proves the model-visible stream is emitted only after the
-        buffered response has passed ordinary decode/extraction/validation,
-        rather than forwarding speculative textual frames from an unknown
-        compatibility path.
-        """
+        """P0-24: buffering is SELECTIVE. A tool-free chat stream has no tool
+        surface to misinterpret, so it streams directly (no buffered ladder,
+        no synthetic usage_update) even with buffer_unverified_streaming=True.
+        The buffered-ladder contract for tool-bearing streams is proven by the
+        tool-call tests in this module."""
         fake_upstream.set_text_response("validated buffered response")
         config = InteropServerConfig(
             probe_on_startup=False,
@@ -813,7 +815,7 @@ class TestGatewayStreamingDirect:
                 generation=CanonicalGenerationOptions(max_output_tokens=32, stream=True),
             )
             events = [event async for event in gateway.handle_stream(request, RequestContext())]
-            assert [event.type for event in events] == ["text_delta", "usage_update", "message_stop"]
+            assert [event.type for event in events] == ["text_delta", "message_stop"]
             assert events[0].partial == "validated buffered response"
         finally:
             await gateway.close()
@@ -842,6 +844,7 @@ class TestGatewayStreamingDirect:
                         timeout_seconds=30.0,
                     ),
                     tool_mode=ToolMode.AUTO,
+                    context=ContextConfig(context_limit_tokens=32768),
                 ),
             },
         )
@@ -944,6 +947,7 @@ class TestGatewayStreamingDirect:
                         timeout_seconds=30.0,
                     ),
                     tool_mode=ToolMode.AUTO,
+                    context=ContextConfig(context_limit_tokens=32768),
                 ),
             },
         )
@@ -1057,6 +1061,7 @@ class TestGatewayStreamingDirect:
                         timeout_seconds=30.0,
                     ),
                     tool_mode=ToolMode.AUTO,
+                    context=ContextConfig(context_limit_tokens=32768),
                 ),
             },
         )
@@ -1208,3 +1213,269 @@ class TestStreamingArgumentIdentity:
         completed = acc.complete_call(key)
         assert completed is not None
         assert completed.call_id == "tc_late_001"
+
+
+# ─── Direct-stream smoke tests: decode must live INSIDE the transport CM ───
+
+
+class _StreamClosedOnLateUse:
+    """Mimics httpx.StreamClosed: any byte read after ``aclose`` raises.
+
+    The 2026-08 streaming regression was exactly this shape — the decode loop
+    had been left OUTSIDE ``async with self.transport.stream(...)`` during an
+    edit, so every real transport raised StreamClosed on the first frame while
+    every stub-based test (whose streams stay readable after close) passed.
+    A fake whose stream becomes unreadable at close time makes that structural
+    mistake fail loudly instead of silently.
+    """
+
+    def __init__(self, status_code: int, frames: list[str]) -> None:
+        self.status_code = status_code
+        self._frames = frames
+        self._closed = False
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("StreamClosed: response body has been released")
+
+    async def raw_lines(self) -> AsyncIterator[str]:
+        self._check_open()
+        for frame in self._frames:
+            self._check_open()
+            yield frame
+
+    async def sse_events(self) -> AsyncIterator[SSEFrame]:
+        self._check_open()
+        for frame in self._frames:
+            self._check_open()
+            # Frames already carry the "data: " prefix; strip it for SSEFrame.
+            payload = frame.removeprefix("data: ").strip()
+            yield SSEFrame(data=payload)
+
+    async def aclose(self) -> None:
+        self._closed = True
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        await self.aclose()
+
+
+class _GuardedStreamingTransport:
+    """Wraps the real HTTP transport and enforces the decode-context invariant:
+
+    the stream object is only readable inside its context manager (exiting
+    the CM poisons it, like httpx does with StreamClosed).
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.read_after_close = 0
+
+    async def send(self, request: PreparedUpstreamRequest) -> Any:
+        return await self._inner.send(request)
+
+    async def close(self) -> None:
+        await self._inner.close()
+
+    @asynccontextmanager
+    async def stream(self, request: PreparedUpstreamRequest) -> AsyncIterator[Any]:
+        async with self._inner.stream(request) as stream:
+            view = _GuardedStreamView(stream, self)
+            try:
+                yield view
+            finally:
+                view.mark_exited()
+
+
+class _GuardedStreamView:
+    """Forwarding view that fails reads after the CM has been exited."""
+
+    def __init__(self, stream: Any, guard: _GuardedStreamingTransport) -> None:
+        self._stream = stream
+        self._guard = guard
+        self._exited = False
+
+    @property
+    def status_code(self) -> int:
+        return self._stream.status_code
+
+    def _check(self) -> None:
+        if self._exited:
+            self._guard.read_after_close += 1
+            raise RuntimeError("StreamClosed: decode outside the transport context")
+
+    async def raw_lines(self) -> AsyncIterator[str]:
+        async for line in self._stream.raw_lines():
+            self._check()
+            yield line
+
+    async def sse_events(self) -> AsyncIterator[SSEFrame]:
+        async for frame in self._stream.sse_events():
+            self._check()
+            yield frame
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
+
+    def mark_exited(self) -> None:
+        self._exited = True
+
+
+class _SlotSpyAdmission:
+    """Wraps the real admission controller and tracks slot-held state.
+
+    ``live[0]`` counts currently-held generation slots so the test can assert
+    slots are released exactly once per stream (no leak, no double release).
+    """
+
+    def __init__(self, inner: Any, live: list[int]) -> None:
+        self._inner = inner
+        self._live = live
+
+    def generation_slot(self, backend_url: str, model: str, **kwargs: Any):
+        return self._slot_cm(backend_url, model, kwargs)
+
+    @asynccontextmanager
+    async def _slot_cm(self, backend_url: str, model: str, kwargs: dict[str, Any]):
+        async with self._inner.generation_slot(backend_url, model, **kwargs) as slot:
+            self._live[0] += 1
+            try:
+                yield slot
+            finally:
+                self._live[0] -= 1
+
+
+class TestDirectStreamSmoke:
+    """Regression gate for the direct gateway streaming dispatch path.
+
+    These tests run the REAL HTTP transport against a real upstream socket
+    (no stubs) with a guard transport that fails the test if the decode loop
+    ever reads frames outside ``async with self.transport.stream(...)``, or if
+    the transport is opened without an admission slot held.
+    """
+
+    def _config(self, url: str) -> InteropServerConfig:
+        return InteropServerConfig(
+            probe_on_startup=False,
+            routes={
+                "test-route": ModelRoute(
+                    id="test-route",
+                    client_model_aliases=["test-model"],
+                    upstream_model="fake-model",
+                    upstream=UpstreamConfig(
+                        kind=UpstreamKind.OPENAI_COMPATIBLE,
+                        base_url=url,
+                        wire_protocol=UpstreamProtocol.OPENAI_CHAT,
+                        timeout_seconds=30.0,
+                    ),
+                    context=ContextConfig(context_limit_tokens=32768),
+                    tool_mode=ToolMode.AUTO,
+                    translation_mode=TranslationMode.CANONICAL,
+                ),
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_text_decode_inside_transport_context(
+        self, fake_upstream: FakeStreamingUpstreamServer
+    ):
+        """The full text stream decodes while the transport CM is open."""
+        fake_upstream.set_text_response("smoke text")
+
+        gateway = Gateway(self._config(fake_upstream.url))
+        await gateway.startup()
+        try:
+            guard = _GuardedStreamingTransport(gateway.transport)
+            gateway._transport = guard
+            live = [0]
+            gateway._admission_controller = _SlotSpyAdmission(
+                gateway._admission_controller, live,
+            )
+
+            request = CanonicalRequest(
+                model=CanonicalModelReference(requested_name="test-model"),
+                messages=[CanonicalMessage(role="user", content=[CanonicalTextBlock(text="hi")])],
+                generation=CanonicalGenerationOptions(max_output_tokens=64, stream=True),
+            )
+            events = [event async for event in gateway.handle_stream(request, RequestContext())]
+
+            types = [event.type for event in events]
+            assert "text_delta" in types, f"expected streamed text: {types}"
+            assert events[-1].type == "message_stop"
+            assert events[-1].stop_reason == CanonicalStopReason.END_TURN
+
+            # The decode-context invariant this suite exists to protect:
+            assert guard.read_after_close == 0, (
+                "stream frames were decoded outside the transport context manager"
+            )
+            assert live[0] == 0, "admission slot leaked past stream completion"
+        finally:
+            await gateway.close()
+
+    @pytest.mark.asyncio
+    async def test_stream_tool_call_decode_inside_transport_context(
+        self, fake_upstream: FakeStreamingUpstreamServer
+    ):
+        """Tool-call fragments also decode inside the transport CM."""
+        fake_upstream.set_tool_call_response("read_file", {"path": "/tmp/x"})
+
+        gateway = Gateway(self._config(fake_upstream.url))
+        await gateway.startup()
+        try:
+            guard = _GuardedStreamingTransport(gateway.transport)
+            gateway._transport = guard
+            live = [0]
+            gateway._admission_controller = _SlotSpyAdmission(
+                gateway._admission_controller, live,
+            )
+
+            request = CanonicalRequest(
+                model=CanonicalModelReference(requested_name="test-model"),
+                messages=[CanonicalMessage(role="user", content=[CanonicalTextBlock(text="read it")])],
+                generation=CanonicalGenerationOptions(max_output_tokens=64, stream=True),
+                tools=[
+                    CanonicalTool(
+                        name="read_file",
+                        description="Read a file",
+                        input_schema={
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                        },
+                    )
+                ],
+                tool_choice=CanonicalToolChoice.auto(),
+            )
+            events = [event async for event in gateway.handle_stream(request, RequestContext())]
+
+            types = [event.type for event in events]
+            assert "tool_use" in types, f"expected tool_use event: {types}"
+            assert events[-1].type == "message_stop"
+            assert events[-1].stop_reason == CanonicalStopReason.TOOL_CALL
+
+            assert guard.read_after_close == 0
+            assert live[0] == 0, "admission slot leaked past stream completion"
+        finally:
+            await gateway.close()
+
+    @pytest.mark.asyncio
+    async def test_stream_decode_after_close_raises(self):
+        """The guard itself: a stream read after CM exit raises StreamClosed.
+
+        Pins the fake's semantics to the real httpx behavior the 2026-08
+        regression depended on, so the guard cannot silently decay into a
+        stub that hides the structural bug again.
+        """
+        frames = ["data: " + json.dumps({
+            "id": "x",
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"content": "hi"}}],
+        }) + "\n\n"]
+        stream = _StreamClosedOnLateUse(200, frames)
+        async with stream:
+            lines = [line async for line in stream.raw_lines()]
+        assert len(lines) == 1
+        with pytest.raises(RuntimeError, match="StreamClosed"):
+            [line async for line in stream.raw_lines()]

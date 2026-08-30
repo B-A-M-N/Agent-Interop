@@ -102,6 +102,7 @@ class TestSessionTokenAuth:
         from agent_interop.config import (
             InteropServerConfig,
             ModelRoute,
+            RuntimeInspectionConfig,
             ToolMode,
             TranslationMode,
             UpstreamConfig,
@@ -179,6 +180,7 @@ class TestIngressAuthProtocolNativeErrors:
         from agent_interop.config import (
             InteropServerConfig,
             ModelRoute,
+            RuntimeInspectionConfig,
             ToolMode,
             TranslationMode,
             UpstreamConfig,
@@ -262,6 +264,7 @@ class TestIngressAuthProtocolNativeErrors:
         from agent_interop.config import (
             InteropServerConfig,
             ModelRoute,
+            RuntimeInspectionConfig,
             ToolMode,
             TranslationMode,
             UpstreamConfig,
@@ -310,6 +313,7 @@ class TestGracefulShutdown:
         from agent_interop.config import (
             InteropServerConfig,
             ModelRoute,
+            RuntimeInspectionConfig,
             ToolMode,
             TranslationMode,
             UpstreamConfig,
@@ -377,6 +381,7 @@ class TestBackendUnavailable:
         from agent_interop.config import (
             InteropServerConfig,
             ModelRoute,
+            RuntimeInspectionConfig,
             ToolMode,
             TranslationMode,
             UpstreamConfig,
@@ -418,6 +423,7 @@ class TestTransportConfigWiring:
         from agent_interop.config import (
             InteropServerConfig,
             ModelRoute,
+            RuntimeInspectionConfig,
             ToolMode,
             TranslationMode,
             UpstreamConfig,
@@ -466,6 +472,7 @@ class TestTransportConfigWiring:
         from agent_interop.config import (
             InteropServerConfig,
             ModelRoute,
+            RuntimeInspectionConfig,
             ToolMode,
             TranslationMode,
             UpstreamConfig,
@@ -551,6 +558,7 @@ class TestMalformedUpstreamResponse:
         from agent_interop.config import (
             InteropServerConfig,
             ModelRoute,
+            RuntimeInspectionConfig,
             ToolMode,
             TranslationMode,
             UpstreamConfig,
@@ -612,6 +620,7 @@ class TestRetryLogic:
         from agent_interop.config import (
             InteropServerConfig,
             ModelRoute,
+            RuntimeInspectionConfig,
             ToolMode,
             TranslationMode,
             UpstreamConfig,
@@ -624,6 +633,9 @@ class TestRetryLogic:
 
         config = InteropServerConfig(
             probe_on_startup=False,
+            # Hermetic: the retry tests count raw transport calls, so the
+            # request path must not issue metadata reads either.
+            runtime_inspection=RuntimeInspectionConfig(mode="off"),
             max_retries=2,
             routes={
                 "test": ModelRoute(
@@ -706,6 +718,7 @@ class TestRetryLogic:
         from agent_interop.config import (
             InteropServerConfig,
             ModelRoute,
+            RuntimeInspectionConfig,
             ToolMode,
             TranslationMode,
             UpstreamConfig,
@@ -718,6 +731,8 @@ class TestRetryLogic:
 
         config = InteropServerConfig(
             probe_on_startup=False,
+            # Hermetic: raw transport-call counting (see test_retries_on_500).
+            runtime_inspection=RuntimeInspectionConfig(mode="off"),
             max_retries=3,
             routes={
                 "test": ModelRoute(
@@ -763,17 +778,41 @@ class TestRetryLogic:
 class TestRequestLocalCopy:
     @pytest.mark.asyncio
     async def test_canonical_request_not_mutated_by_render(self):
-        """Gateway must make a request-local copy so codec rendering doesn't
-        mutate the original canonical request."""
-        import inspect
+        """P0-28: codecs must not mutate the canonical request — the send
+        paths render the request IN PLACE (no defensive deepcopy), which is
+        only sound if every codec render is pure. This asserts the invariant
+        directly instead of the old mechanism (copy.deepcopy in Gateway)."""
+        import dataclasses
 
-        from agent_interop.gateway import Gateway
+        from agent_interop.abi import (
+            CanonicalMessage,
+            CanonicalModelReference,
+            CanonicalRequest,
+            CanonicalTextBlock,
+            CanonicalTool,
+            CanonicalToolChoice,
+        )
+        from agent_interop.config import UpstreamProtocol
+        from agent_interop.upstreams.registry import get_codec
 
-        src = inspect.getsource(Gateway)
-        # Verify deepcopy is used before render
-        assert "deepcopy" in src, "Gateway should use copy.deepcopy for request-local copy"
-        assert "request_local" in src or "copy.deepcopy(reconciled_request)" in src, \
-            "Gateway should create a deep copy of the request before rendering"
+        tool = CanonicalTool(
+            name="t0", description="d",
+            input_schema={"type": "object", "properties": {}},
+        )
+        for proto in (UpstreamProtocol.OPENAI_CHAT, UpstreamProtocol.OLLAMA_CHAT):
+            req = CanonicalRequest(
+                model=CanonicalModelReference(requested_name="m"),
+                messages=[CanonicalMessage(
+                    role="user", content=[CanonicalTextBlock(text="hi")],
+                )],
+                tools=[tool],
+                tool_choice=CanonicalToolChoice.auto(),
+            )
+            before = dataclasses.asdict(req)
+            codec = get_codec(proto)
+            codec.render_request(req, "m", stream=False)
+            after = dataclasses.asdict(req)
+            assert before == after, f"{proto.value} render mutated the canonical request"
 
 
 # ─── Service Unit Generation ────────────────────────────────────────────────

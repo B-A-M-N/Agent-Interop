@@ -49,7 +49,22 @@ def _git_info(module_path: Path) -> tuple[str, bool | None]:
         return "", None
 
 
+_BUILD_INFO: BuildInfo | None = None
+
+
 def get_build_info() -> BuildInfo:
+    """Build provenance, computed once per process.
+
+    Two git subprocess calls plus two full bundle digests per invocation;
+    none of it can change while running (the git tree of a running process
+    is sampled at first call by design). The historical per-call recompute
+    was ~65ms of per-request CPU on the warm chat path via the evidence
+    key — the Interop-CPU perf budget exists to catch exactly this class
+    of leak.
+    """
+    global _BUILD_INFO
+    if _BUILD_INFO is not None:
+        return _BUILD_INFO
     import agent_interop
     module_path = Path(agent_interop.__file__ or "").resolve()
     commit, dirty = _git_info(module_path)
@@ -61,7 +76,7 @@ def get_build_info() -> BuildInfo:
         from agent_interop.testing.levels import BATTERY_VERSION
     except ImportError:
         BATTERY_VERSION = ""
-    return BuildInfo(
+    _BUILD_INFO = BuildInfo(
         package_version=version,
         git_commit=commit,
         git_dirty=dirty,
@@ -72,3 +87,4 @@ def get_build_info() -> BuildInfo:
         agent_manifest_digest=_bundle_digest("agents"),
         battery_version=BATTERY_VERSION,
     )
+    return _BUILD_INFO

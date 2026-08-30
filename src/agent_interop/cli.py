@@ -13,6 +13,7 @@ from rich.console import Console
 from rich.table import Table
 
 from agent_interop.config import (
+    ContextConfig,
     InteropServerConfig,
     ModelRoute,
     ToolMode,
@@ -126,7 +127,11 @@ def explain(
     request: str = typer.Option(..., "--request", help="Canonical request JSON file"),
     path: str = typer.Option("./interop.yaml", "--path", "-p", help="Configuration path"),
 ) -> None:
-    """Show a compatibility plan without submitting an inference request."""
+    """Show a compatibility plan without submitting an inference request.
+
+    P1.8: prints a resource breakdown showing client tokens vs model-visible
+    tokens, projection ratio, visible tools, virtualization, etc.
+    """
     import asyncio
 
     try:
@@ -154,6 +159,34 @@ def explain(
     console.print(f"Attempts: {', '.join(item.kind.value for item in plan.attempts)}")
     if plan.missing_capabilities:
         console.print(f"Missing capability evidence: {', '.join(plan.missing_capabilities)}")
+
+    # P1.8: resource breakdown
+    console.print()
+    console.print("[bold]Resource breakdown:")
+    _print_resource_breakdown(invocation)
+
+
+def _print_resource_breakdown(invocation: Any) -> None:
+    """Print a client-tokens vs model-visible-tokens breakdown (P1.8)."""
+    breakdown = getattr(invocation.context_plan, "after", None)
+    before = getattr(invocation.context_plan, "before", None)
+    view = getattr(invocation, "model_view", None)
+    if breakdown is None or before is None:
+        console.print("  No context plan available.")
+        return
+    console.print(f"  System:              {before.system_tokens}")
+    console.print(f"  History:            {before.message_tokens}")
+    console.print(f"  Tool schemas:       {before.tool_schema_tokens}")
+    console.print(f"  Requested output:   {before.output_reserve_tokens}")
+    console.print(f"  Raw total:          {before.total_required_tokens}")
+    console.print("  ---")
+    console.print(f"  Model-visible total: {breakdown.total_required_tokens}")
+    if view:
+        console.print(f"  Visible tools: {view.visible_tool_count} / {view.authorized_tool_count}")
+        console.print(f"  Virtualized results: {getattr(view, 'virtualized_result_count', 0)}")
+        console.print(f"  System projected: {view.system_projected}")
+    console.print(f"  Projection ratio: {getattr(view, 'tool_reduction_ratio', 0):.0%}")
+    console.print(f"  Status: {'FIT' if getattr(invocation.context_plan, 'fits_directly', False) else 'ADAPTED'}")
 
 
 @app.command()
@@ -728,6 +761,11 @@ def test(
                 ),
                 tool_mode=ToolMode.AUTO,
                 profile=profile,
+                # The synthetic conformance route has no live backend to
+                # inspect at config-build time; give it a conservative
+                # explicit capacity so tool-bearing conformance requests
+                # are budgeted instead of rejected as CONTEXT_CAPACITY_UNKNOWN.
+                context=ContextConfig(context_limit_tokens=32768),
             ),
         },
     )

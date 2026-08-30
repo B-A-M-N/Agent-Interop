@@ -12,6 +12,7 @@ build/
 .coverage
 .coverage.*
 coverage.xml
+coverage.json
 htmlcov/
 
 # Local tool/editor state

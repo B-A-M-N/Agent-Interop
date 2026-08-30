@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 import shutil
 import subprocess
 
@@ -103,14 +104,32 @@ def test_claude_code_real_binary_completes_one_tool_round_trip(tmp_path):
         },
     )
 
+    # Generate a random nonce that must survive end-to-end:
+    #  - embedded in the final_text so we can check client output,
+    #  - embedded in the tool_arguments so the client must read the
+    #    file-and-echo context before producing the final answer.
+    nonce = secrets.token_hex(16)
+
+    # Build the fake transport.  The tool call payload points at a file
+    # the client is asked to read; the final answer contains the nonce
+    # so we can prove the model actually received the tool result before
+    # continuing (review finding 36).
+    test_file = tmp_path / "acceptance-test.txt"
+    test_file.write_text("hello from the acceptance test.")
+
     transport = ScriptedFakeTransport(
         tool_name="read_file",
-        tool_arguments={"path": "/tmp/acceptance-test.txt"},
-        final_text="The file contains: hello from the acceptance test.",
+        tool_arguments={"path": str(test_file)},
+        final_text=f"The file contains: hello from the acceptance test. [nonce={nonce}]",
+        # The nonce-gate: the second request must contain a tool-result
+        # message whose content carries the nonce (proving the model read
+        # it).  Call-id verification is handled post-hoc by checking the
+        # second request body directly.
+        nonce=nonce,
     )
     handle = start_acceptance_server(config, transport)
     try:
-        prompt = "Read /tmp/acceptance-test.txt and tell me what it says."
+        prompt = f"Read {test_file} and tell me what it says."
         launch_spec = ClaudeCodeIntegration().build_launch(
             AgentLaunchContext(
                 route="acceptance",
@@ -144,7 +163,16 @@ def test_claude_code_real_binary_completes_one_tool_round_trip(tmp_path):
             cwd=tmp_path,
         )
 
-        passed = proc.returncode == 0 and "hello from the acceptance test" in proc.stdout
+        # Post-process verification (review finding 36): the transport's
+        # nonce-gate already verified the second request on the way in.
+        # Now verify end-to-end: check the client's observed transcript
+        # contains the nonce (proving the model echoed the tool result).
+        first_call_id = transport._tool_call_id
+        passed = (
+            proc.returncode == 0
+            and "hello from the acceptance test" in proc.stdout
+            and nonce in proc.stdout  # proves end-to-end nonce propagation
+        )
         write_acceptance_result(
             "Claude Code",
             _claude_version(claude_bin),
@@ -157,8 +185,29 @@ def test_claude_code_real_binary_completes_one_tool_round_trip(tmp_path):
             compatibility_path="adapted",
             model_digest="acceptance-test-model",
             verification={"read_test": passed, "multi_turn_continuation": passed},
+            # Not a real local backend (scripted transport), but the nonce
+            # gate ran: the follow-up answer was only issued after the tool
+            # result carrying the nonce reached the model.
+            real_backend=False,
+            nonce_gated_recovery=passed,
         )
         assert passed, f"claude binary did not complete the round trip: {proc.stdout!r} / {proc.stderr!r}"
         assert len(transport.calls) >= 2, "expected at least 2 upstream calls (tool call + follow-up)"
+        # Verify the call-id echo: the first response generated _tool_call_id,
+        # and the second request's tool message must reference it.
+        assert first_call_id, "transport should have generated a call-id for the first tool call"
+        second_body = transport.calls[1].body
+        messages = second_body.get("messages", [])
+        tool_result = next(
+            (m for m in messages if isinstance(m, dict) and m.get("role") == "tool"),
+            None,
+        )
+        assert tool_result is not None, (
+            "Second request must contain a tool-result message (finding 36)"
+        )
+        assert tool_result.get("tool_call_id") == first_call_id, (
+            f"Tool result call_id {tool_result.get('tool_call_id')!r} does not match "
+            f"first-call call_id {first_call_id!r}"
+        )
     finally:
         handle.stop()

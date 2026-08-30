@@ -64,7 +64,18 @@ from agent_interop.planning import (
 )
 from agent_interop.planning.types import AttemptKind, CompatibilityAttempt
 from agent_interop.qualification import BootstrapQualifier, QualificationRecord, QualificationState
+from agent_interop.qualification.revision import QUALIFICATION_BATTERY_REVISION
 from agent_interop.qualification.store import QualificationStore
+
+
+def _current_record(**kwargs: object) -> QualificationRecord:
+    """A qualification record stamped with the CURRENT battery revision so
+    it passes the P0-52 currency check (template digest empty matches the
+    default runtime's empty digest)."""
+    return QualificationRecord(
+        battery_revision=QUALIFICATION_BATTERY_REVISION,
+        **kwargs,
+    )
 from agent_interop.repair.invocation import build_invocation_plan
 from agent_interop.replay.capture import sanitize_body
 from agent_interop.replay.store import DiagnosticCaseStore
@@ -89,7 +100,10 @@ def _route(**kwargs) -> ModelRoute:
         ),
         tool_mode=ToolMode.AUTO,
         tool_surface=ToolSurfaceConfig(mode=ToolSurfaceMode.DYNAMIC, max_initial_tools=1),
-        context=ContextConfig(output_reserve_tokens=32),
+        # Explicit capacity: these tests exercise routing/controller/diagnostic
+        # behavior, not the unknown-capacity policy (which would hard-reject
+        # tool-bearing requests at beta defaults).
+        context=ContextConfig(output_reserve_tokens=32, context_limit_tokens=32768),
         compatibility=CompatibilityConfig(**kwargs),
     )
 
@@ -132,7 +146,21 @@ def test_named_tool_is_never_hidden_by_surface_reduction() -> None:
 
 
 def test_effective_context_limit_cannot_exceed_runtime() -> None:
-    assert effective_context_limit(32768, 16384, 65536) == 16384
+    # P0-49: architecture_context_tokens is a CEILING, never a source.  The
+    # route override is usable capacity (operator assertion) and clamps only
+    # when it exceeds the architecture maximum.
+    assert effective_context_limit(32768, 16384, 65536) == 32768, (
+        "route cap above the architecture ceiling must clamp to it"
+    )
+    assert effective_context_limit(0, 16384, 65536) == 65536, (
+        "no known ceiling — the operator cap stands"
+    )
+    # Observed serving context wins over everything, still ceiling-clamped.
+    assert effective_context_limit(32768, 16384, 65536, 8192) == 8192
+    # Architecture capacity alone supplies NOTHING (P0-49 core fix).
+    assert effective_context_limit(32768, 0, 0) == 0, (
+        "architecture max with no allocation evidence must not look like capacity"
+    )
 
 
 def test_planner_honors_route_context_override_as_a_hard_ceiling() -> None:
@@ -155,7 +183,9 @@ def test_planner_honors_route_context_override_as_a_hard_ceiling() -> None:
         ),
         behavioral_capabilities=BehavioralCapabilities(),
     ))
-    assert plan.context_plan.runtime_limit_tokens == 1024
+    # P0.20: resolve_context_capacity prefers observed_runtime > route_config.
+    # With effective_context_tokens=8192 (observed), it wins over route_config=1024.
+    assert plan.context_plan.runtime_limit_tokens == 8192
 
 
 def test_direct_path_requires_codec_runtime_and_behavioral_evidence() -> None:
@@ -242,7 +272,7 @@ def test_auto_controller_selection_uses_a_verified_distinct_route() -> None:
         controller=ControllerConfig(auto_select_route=True, require_verified=True),
         probe_on_startup=False,
     ))
-    gateway.record_qualification(QualificationRecord(
+    gateway.record_qualification(_current_record(
         model_digest="verified-model",
         state=QualificationState.SEQUENTIAL_AGENT,
         prompted_forced_tool=True,
@@ -415,7 +445,9 @@ def test_gateway_replans_after_safe_context_adaptation() -> None:
         request, RequestContext(), False, InteropRequestExecution(),
     ))
     assert invocation.context_plan.fits_directly
-    assert "[interop: compacted" in invocation.reconciled_request.messages[1].content[0].content
+    # P0.1: compaction markers are in model_request (the bounded view),
+    # not in authoritative_request (which retains full state)
+    assert "[interop: compacted" in invocation.model_request.messages[1].content[0].content
 
 
 def test_gateway_returns_structured_error_when_no_compatibility_path_exists() -> None:
@@ -516,7 +548,7 @@ def test_qualification_store_restores_digest_scoped_safe_facts(tmp_path) -> None
 
 def test_gateway_uses_only_bootstrap_proven_qualification_capabilities() -> None:
     gateway = Gateway(InteropServerConfig(default_route_id="local", routes={"local": _route()}))
-    gateway.record_qualification(QualificationRecord(
+    gateway.record_qualification(_current_record(
         model_digest="sha256:qualified",
         state=QualificationState.SEQUENTIAL_AGENT,
         prompted_forced_tool=True,
@@ -582,7 +614,9 @@ def test_blocking_bootstrap_qualification_is_limited_to_required_or_named_tools(
         ),
     )
     assert asyncio.run(gateway._ensure_bootstrap_qualification(required))
-    assert len(probes) == 5
+    # P0.30: Staged — native_forced only; no unnecessary exact_text
+    assert len(probes) == 1
+    assert "native_forced_tool" in probes
     automatic = SimpleNamespace(
         route=route,
         runtime_capabilities=ModelRuntimeCapabilities(backend_kind=UpstreamKind.OLLAMA, model_name="new"),
@@ -635,13 +669,13 @@ def test_controller_qualification_requires_sequential_agent_level() -> None:
         probe_on_startup=False,
     ))
     assert not asyncio.run(gateway._controller_route_is_qualified(controller, "L3"))
-    gateway.record_qualification(QualificationRecord(
+    gateway.record_qualification(_current_record(
         model_digest="controller-model",
         state=QualificationState.FORCED_TOOL,
         prompted_forced_tool=True,
     ))
     assert not asyncio.run(gateway._controller_route_is_qualified(controller, "L3"))
-    gateway.record_qualification(QualificationRecord(
+    gateway.record_qualification(_current_record(
         model_digest="controller-model",
         state=QualificationState.SEQUENTIAL_AGENT,
         prompted_forced_tool=True,
@@ -749,17 +783,21 @@ def test_attempt_ladder_replans_one_withheld_tool_once() -> None:
 
 
 def test_attempt_ladder_returns_structured_error_when_token_budget_is_exhausted() -> None:
+    """The executor counts ATTEMPT RUNGS, not tokens (P0-15: token accounting
+    lives in the generation seam). Exhaustion here is exercised via the rung
+    ceiling; the token ceilings are enforced where generations happen."""
     class Invocation:
         compatibility_plan = type("Plan", (), {"attempts": (
             CompatibilityAttempt(AttemptKind.PROMPTED_TOOLS, ToolMode.PROMPTED),
             CompatibilityAttempt(AttemptKind.CONSTRAINED_JSON, ToolMode.PROMPTED),
+            CompatibilityAttempt(AttemptKind.PROMPTED_TOOLS, ToolMode.PROMPTED),
         )})()
         reconciled_request = type("Request", (), {"tool_choice": CanonicalToolChoice.required()})()
 
     async def send(_invocation):
         return CanonicalResponse(content=[CanonicalTextBlock(text="x" * 100)])
 
-    result = asyncio.run(CompatibilityAttemptExecutor(AttemptBudget(max_total_generated_tokens=1)).execute(
+    result = asyncio.run(CompatibilityAttemptExecutor(AttemptBudget(max_upstream_attempts=2)).execute(
         Invocation(), build_invocation=lambda invocation, _: invocation, execute_attempt=send,
     ))
     assert result.error is not None

@@ -30,4 +30,21 @@ class ToolCallDialect(str, Enum):
     GENERIC_JSON = "generic"
 
 
-__all__ = ["ProtocolKind", "ToolCallDialect"]
+class ToolAuthority(str, Enum):
+    """Who may execute a tool call.
+
+    CLIENT-declared tools are forwarded to the coding client. INTEROP_INTERNAL
+    tools are executed inside Interop and never reach the client — generalizing
+    the ``controller_delegate_tool`` precedent.
+    """
+
+    CLIENT = "client"
+    INTEROP_INTERNAL = "interop_internal"
+
+
+# Reserved internal tool namespace. Client declarations MUST NOT use this
+# prefix; inbound client tools that collide are rejected at preparation time.
+RESERVED_INTERNAL_TOOL_PREFIX = "__interop_"
+
+
+__all__ = ["RESERVED_INTERNAL_TOOL_PREFIX", "ProtocolKind", "ToolAuthority", "ToolCallDialect"]

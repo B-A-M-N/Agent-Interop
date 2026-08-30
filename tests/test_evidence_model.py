@@ -195,7 +195,8 @@ class TestToolCountPreUpstreamRejection:
             UpstreamConfig,
             UpstreamKind,
             UpstreamProtocol,
-        )
+    ContextConfig,
+)
         from agent_interop.gateway import Gateway
 
         config = InteropServerConfig(
@@ -216,6 +217,7 @@ class TestToolCountPreUpstreamRejection:
                     ),
                     tool_mode=tool_mode,
                     translation_mode=TranslationMode.CANONICAL,
+                    context=ContextConfig(context_limit_tokens=32768),
                 ),
             },
         )

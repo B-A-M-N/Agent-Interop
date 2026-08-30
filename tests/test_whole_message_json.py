@@ -435,6 +435,7 @@ class TestGatewayEndToEnd:
         import json
 
         from agent_interop.config import (
+            ContextConfig,
             InteropServerConfig,
             ModelRoute,
             RepairConfig,
@@ -475,6 +476,7 @@ class TestGatewayEndToEnd:
                         base_url="http://x",
                         wire_protocol=UpstreamProtocol.OLLAMA_CHAT,
                     ),
+                    context=ContextConfig(context_limit_tokens=32768),
                     tool_mode=ToolMode.AUTO,
                     translation_mode=TranslationMode.CANONICAL,
                     repair=RepairConfig(),

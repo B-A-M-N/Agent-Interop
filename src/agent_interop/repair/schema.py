@@ -8,11 +8,58 @@ hand-rolled partial check in the old validator.
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from jsonschema import Draft202012Validator
 
 from agent_interop.repair.types import SchemaIssue
+
+# P1-H: compiling a Draft202012Validator (plus check_schema) is expensive —
+# and the same tool schemas arrive on every request. Cache the compiled
+# validator per canonical schema serialization. Bounded LRU: schemas are
+# (name, schema-shape) stable within a deployment, so a modest bound never
+# thrashes in practice.
+_VALIDATOR_CACHE: dict[str, Any] = {}
+_VALIDATOR_CACHE_ORDER: list[str] = []
+_VALIDATOR_CACHE_LOCK = threading.Lock()
+_VALIDATOR_CACHE_MAX = 256
+
+_UNVALIDATABLE = object()
+
+
+def _cached_validator(schema: dict[str, Any]) -> Any:
+    """Return a compiled validator, or _UNVALIDATABLE when the schema is invalid.
+
+    The compiled validator is itself thread-safe for iter_errors (jsonschema
+    compiles to a resolution tree with no per-call mutable state), so one
+    compiled instance can be shared across requests.
+    """
+    import json
+
+    try:
+        cache_key = json.dumps(schema, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return None  # unhashable schema — fall through to the direct path
+    with _VALIDATOR_CACHE_LOCK:
+        cached = _VALIDATOR_CACHE.get(cache_key)
+        if cached is not None:
+            if cached is not _UNVALIDATABLE:
+                return cached
+            # Negative-cache entry: known-invalid schema.
+            return None
+    try:
+        Draft202012Validator.check_schema(schema)
+        validator = Draft202012Validator(schema)
+    except Exception:
+        validator = _UNVALIDATABLE
+    with _VALIDATOR_CACHE_LOCK:
+        if cache_key not in _VALIDATOR_CACHE:
+            _VALIDATOR_CACHE[cache_key] = validator
+            _VALIDATOR_CACHE_ORDER.append(cache_key)
+            while len(_VALIDATOR_CACHE_ORDER) > _VALIDATOR_CACHE_MAX:
+                _VALIDATOR_CACHE.pop(_VALIDATOR_CACHE_ORDER.pop(0), None)
+    return None if validator is _UNVALIDATABLE else validator
 
 
 def validate_against_schema(
@@ -24,6 +71,10 @@ def validate_against_schema(
     Returns a list of :class:`SchemaIssue`. An empty list means the instance
     is valid. Each issue carries the JSON-path where the error occurred so
     that repair rules can target it precisely.
+
+    P1-H: the compiled validator is cached per canonical schema form —
+    recompiling on every tool-call decision was the dominant CPU cost of
+    the repair path under load.
     """
     if not schema or not isinstance(schema, dict):
         return []
@@ -33,16 +84,16 @@ def validate_against_schema(
         # A bare {"type": "object"} with no constraints — everything is valid.
         return []
 
-    try:
-        Draft202012Validator.check_schema(schema)
-        validator = Draft202012Validator(schema)
-    except Exception as exc:
+    validator = _cached_validator(schema)
+    if validator is None:
         # Invalid schema — return a schema issue so the caller knows validation
         # could not be performed. Do NOT return [] (which means "valid").
+        # (Compiled-cache miss on an unhashable schema is impossible: the
+        # cache-key serialization of any dict succeeds with default=str.)
         return [SchemaIssue(
             path=[],
             keyword="invalid_schema",
-            message=f"Tool schema is not valid JSON Schema: {exc}",
+            message="Tool schema is not valid JSON Schema",
         )]
 
     issues: list[SchemaIssue] = []

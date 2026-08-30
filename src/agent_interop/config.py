@@ -117,6 +117,12 @@ class UpstreamConfig:
     # explicit route setting so a managed coding-agent launch does not get
     # silently reset to the server's small default context by a probe.
     ollama_num_ctx: int = 0
+    # P1-H: per-route concurrency cap. 0 means "use resources.
+    # max_concurrent_generations". Several served models often share one
+    # backend URL but have very different concurrency budgets (a small
+    # quantized model vs a 70B on the same host); the effective cap for a
+    # route is min(this, the global default) — a route may only TIGHTEN.
+    max_concurrent_generations: int = 0
 
 
 @dataclass
@@ -156,7 +162,7 @@ class ToolSurfaceConfig:
 
 @dataclass
 class ContextConfig:
-    strategy: str = "auto"
+    strategy: str = "auto"  # transparent | adaptive | strict_bounded
     output_reserve_tokens: int = 4096
     context_limit_tokens: int = 0
     allow_tool_reduction: bool = True
@@ -165,11 +171,36 @@ class ContextConfig:
 
 
 @dataclass
+class RuntimeInspectionConfig:
+    """How live request traffic learns backend/model runtime facts.
+
+    ``mode``:
+      * ``off``             — never inspect at request time; planning uses
+                              static conservative capabilities.
+      * ``cached_metadata`` — metadata-only inspection (digests, context,
+                              template, wire support). NO model generations,
+                              ever. Results are TTL-cached; a fresh snapshot
+                              can also be warmed at startup.
+    There is deliberately no behavioral mode here: behavioral qualification
+    belongs to the explicit qualification/evidence systems, not to the
+    ordinary request path.
+    """
+
+    mode: str = "cached_metadata"
+    warm_on_startup: bool = True
+    ttl_seconds: float = 300.0
+
+
+@dataclass
 class QualificationConfig:
     """When bounded model qualification is allowed to run."""
 
-    # Programmatic/legacy routes stay opt-in. Schema-v2 configuration opts
-    # into the target blocking behavior below, preserving existing callers.
+    # Programmatic/legacy routes stay opt-in. Blocking the first REQUIRED /
+    # NAMED tool request behind synthetic probe generations is never a
+    # schema-v2 default: the safe unknown-model path is already
+    # ADAPTED/PROMPTED, and qualification is about earning the faster native
+    # path — via `interop qualify`, explicit startup prequalification, or
+    # accumulated evidence — not about taxing the user's first request.
     bootstrap: str = "on_demand"
     full_battery: str = "on_demand"
     cache_by_digest: bool = True
@@ -200,12 +231,20 @@ class ControllerConfig:
     require_verified: bool = False
     max_controller_turns: int = 4
     max_primary_turns: int = 4
+    # P1.4: bound controller work-product growth. Each loop iteration sends
+    # ALL prior primary work products back to the controller; without a cap
+    # the controller context grows without bound. When the concatenated work
+    # product exceeds the cap, retain only the most recent (refined) product
+    # rather than appending every prior turn verbatim.
+    max_primary_work_product_tokens: int = 4000
+    max_controller_context_tokens: int = 12000
     allow_primary_tool_calls: bool = False
     preserve_primary_reasoning: bool = False
 
 
 @dataclass
 class CompatibilityConfig:
+    # P0.39: mode resolves to allow_* flags
     mode: str = "auto"
     allow_direct: bool = True
     allow_adapted: bool = True
@@ -214,6 +253,23 @@ class CompatibilityConfig:
     # same ladder that protects non-streaming output has accepted one.
     buffer_unverified_streaming: bool = False
     max_attempts: int = 3
+
+    def resolve_mode(self) -> dict[str, bool]:
+        """P0.39: Resolve mode to allow_* flags.
+        
+        - auto: direct → adapted → controlled (all enabled)
+        - direct: direct only
+        - adapted: adapted only (or direct → adapted)
+        - controlled: controller only
+        """
+        if self.mode == "direct":
+            return {"allow_direct": True, "allow_adapted": False, "allow_controlled": False}
+        elif self.mode == "adapted":
+            return {"allow_direct": True, "allow_adapted": True, "allow_controlled": False}
+        elif self.mode == "controlled":
+            return {"allow_direct": False, "allow_adapted": False, "allow_controlled": True}
+        # auto: all enabled
+        return {"allow_direct": True, "allow_adapted": True, "allow_controlled": True}
 
 
 class MalformedJsonPolicy(str, Enum):
@@ -364,6 +420,39 @@ class EvidenceConfig:
 
 
 @dataclass
+class ResourceConfig:
+    """P0.15: Resource limits for the gateway.
+
+    P0.19 (review finding #14): The operator controls how the gateway
+    behaves when a request's context capacity cannot be established.
+    Without this policy, unknown context capacity silently meant 8K
+    tokens — a guessing game for tool-bearing requests.
+    """
+
+    max_concurrent_generations: int = 1
+    max_queued_generations: int = 16
+    admission_timeout_seconds: float = 30.0
+    max_bytes_per_session: int = 2_000_000
+    max_total_bytes: int = 10_000_000
+    max_sessions: int = 100
+    ttl_seconds: float = 3600.0
+    max_entry_bytes: int = 2_000_000
+    # P0.19: Operator policy for unknown context capacity.
+    # "reject" (alias: "reject_tool_requests") fails a TOOL-BEARING request
+    # whose context capacity cannot be established
+    # (CONTEXT_CAPACITY_UNKNOWN).  P0-50: the name now states the real
+    # scope — chat-only requests proceed on a conservative flagged
+    # default, because no tool surface can overflow them; a lower layer
+    # must never invent a different capacity policy than the operator set.
+    # "fallback" applies unknown_capacity_fallback_tokens as a
+    # conservative limit for ALL such requests.
+    # Beta default is "reject": a local-model coding gateway must
+    # not guess capacity for tool-bearing requests.
+    unknown_capacity_policy: str = "reject"
+    unknown_capacity_fallback_tokens: int = 8192
+
+
+@dataclass
 class InteropServerConfig:
     """Top-level server configuration (replaces old InteropConfig)."""
 
@@ -378,6 +467,8 @@ class InteropServerConfig:
     evidence: EvidenceConfig | None = None  # Opt-in; None = no evidence store
     controller: ControllerConfig = field(default_factory=ControllerConfig)
     diagnostics: DiagnosticsConfig = field(default_factory=DiagnosticsConfig)
+    resources: ResourceConfig = field(default_factory=ResourceConfig)
+    runtime_inspection: RuntimeInspectionConfig = field(default_factory=RuntimeInspectionConfig)
 
     # Operational transport settings (P0.6)
     connect_timeout: float = 5.0
@@ -460,6 +551,24 @@ def validate_config(config: InteropServerConfig) -> list[str]:
     if config.default_route_id and config.default_route_id not in config.routes:
         issues.append(f"default_route_id '{config.default_route_id}' not found in routes")
 
+    if config.runtime_inspection.mode not in ("off", "cached_metadata"):
+        issues.append(
+            f"runtime_inspection.mode '{config.runtime_inspection.mode}' is invalid — "
+            "use 'off' or 'cached_metadata' (metadata-only; behavioral probes "
+            "are never part of the request path)"
+        )
+    if config.runtime_inspection.ttl_seconds <= 0:
+        issues.append("runtime_inspection.ttl_seconds must be positive")
+
+    _valid_bootstrap = {"off", "on_demand", "blocking", "blocking_for_tool_requests"}
+    for route_id, route in config.routes.items():
+        bootstrap = getattr(route.qualification, "bootstrap", "on_demand")
+        if bootstrap not in _valid_bootstrap:
+            issues.append(
+                f"Route '{route_id}': qualification.bootstrap '{bootstrap}' is invalid — "
+                "use off|on_demand|blocking"
+            )
+
     # Check alias collisions
     all_aliases: dict[str, str] = {}
     for route_id, route in config.routes.items():
@@ -508,6 +617,8 @@ def validate_config(config: InteropServerConfig) -> list[str]:
             issues.append(f"Route '{route_id}': timeout_seconds must be positive")
         if route.upstream.ollama_num_ctx < 0:
             issues.append(f"Route '{route_id}': ollama_num_ctx must be nonnegative")
+        if route.upstream.max_concurrent_generations < 0:
+            issues.append(f"Route '{route_id}': max_concurrent_generations must be nonnegative (0 = inherit)")
 
         # Validate upstream kind/protocol combination
         supported_protocols = _supported_kind_protocol.get(route.upstream.kind, set())
@@ -704,6 +815,46 @@ def validate_config(config: InteropServerConfig) -> list[str]:
             f"log_level {config.log_level!r} is not valid (valid: {sorted(_valid_log_levels)})"
         )
 
+    # P0.19: Validate resource config
+    rc = config.resources
+    if rc.max_concurrent_generations < 1:
+        issues.append(f"resources.max_concurrent_generations must be >= 1 (got {rc.max_concurrent_generations})")
+    if rc.max_queued_generations < 0:
+        issues.append(f"resources.max_queued_generations must be >= 0 (got {rc.max_queued_generations})")
+    if rc.admission_timeout_seconds <= 0:
+        issues.append(f"resources.admission_timeout_seconds must be positive (got {rc.admission_timeout_seconds})")
+    if rc.max_bytes_per_session <= 0:
+        issues.append(f"resources.max_bytes_per_session must be positive (got {rc.max_bytes_per_session})")
+    if rc.max_total_bytes < rc.max_bytes_per_session:
+        issues.append(f"resources.max_total_bytes ({rc.max_total_bytes}) must be >= max_bytes_per_session ({rc.max_bytes_per_session})")
+    if rc.max_sessions < 1:
+        issues.append(f"resources.max_sessions must be >= 1 (got {rc.max_sessions})")
+    if rc.max_entry_bytes <= 0:
+        issues.append(f"resources.max_entry_bytes must be positive (got {rc.max_entry_bytes})")
+    if rc.max_entry_bytes > rc.max_bytes_per_session:
+        issues.append(f"resources.max_entry_bytes ({rc.max_entry_bytes}) must be <= max_bytes_per_session ({rc.max_bytes_per_session})")
+    if rc.ttl_seconds < 0:
+        issues.append(f"resources.ttl_seconds must be >= 0 (got {rc.ttl_seconds})")
+    # P0.19: Validate unknown capacity policy.  P0-50 adds the explicit
+    # alias "reject_tool_requests" — the SAME semantics as "reject", under
+    # a name that says what actually happens.
+    if rc.unknown_capacity_policy not in {"reject", "reject_tool_requests", "fallback"}:
+        issues.append(
+            f"resources.unknown_capacity_policy must be one of "
+            f"{{'reject', 'reject_tool_requests', 'fallback'}} "
+            f"(got {rc.unknown_capacity_policy!r})"
+        )
+    if rc.unknown_capacity_fallback_tokens <= 0:
+        issues.append(
+            f"resources.unknown_capacity_fallback_tokens must be > 0 "
+            f"(got {rc.unknown_capacity_fallback_tokens})"
+        )
+    if rc.unknown_capacity_fallback_tokens > 1_000_000:
+        issues.append(
+            f"resources.unknown_capacity_fallback_tokens must be <= 1_000_000 "
+            f"(got {rc.unknown_capacity_fallback_tokens})"
+        )
+
     return issues
 
 
@@ -770,8 +921,17 @@ def load_config_from_dict(data: dict[str, Any]) -> InteropServerConfig:
             allow_controller_decomposition=context_data.get("allow_controller_decomposition", True),
         )
         qualification_data = dict(rd.get("qualification", {}))
-        if schema_version == 2 and "bootstrap" not in qualification_data:
-            qualification_data["bootstrap"] = "blocking_for_tool_requests"
+        # Blocking the first REQUIRED/NAMED tool request behind synthetic
+        # probe generations is opt-in only. An operator who explicitly writes
+        # `bootstrap: blocking_for_tool_requests` still gets it.
+        _bootstrap_value = qualification_data.get("bootstrap")
+        if _bootstrap_value is not None and _bootstrap_value not in (
+            "on_demand", "off", "blocking", "blocking_for_tool_requests",
+        ):
+            raise ValueError(
+                f"qualification.bootstrap must be one of off|on_demand|blocking "
+                f"(got {_bootstrap_value!r})"
+            )
         qualification = QualificationConfig(**qualification_data)
         controller_data = rd.get("controller")
         if schema_version == 2 and isinstance(controller_data, dict) and "require_verified" not in controller_data:
@@ -817,6 +977,33 @@ def load_config_from_dict(data: dict[str, Any]) -> InteropServerConfig:
         diagnostics_data["persist"] = True
     diagnostics = DiagnosticsConfig(**diagnostics_data)
 
+    # P0.19: Parse ResourceConfig from the config dict.
+    resources_data = data.get("resources", {})
+    resources = ResourceConfig(
+        max_concurrent_generations=resources_data.get("max_concurrent_generations", ResourceConfig().max_concurrent_generations),
+        max_queued_generations=resources_data.get("max_queued_generations", ResourceConfig().max_queued_generations),
+        admission_timeout_seconds=resources_data.get("admission_timeout_seconds", ResourceConfig().admission_timeout_seconds),
+        max_bytes_per_session=resources_data.get("max_bytes_per_session", ResourceConfig().max_bytes_per_session),
+        max_total_bytes=resources_data.get("max_total_bytes", ResourceConfig().max_total_bytes),
+        max_sessions=resources_data.get("max_sessions", ResourceConfig().max_sessions),
+        ttl_seconds=resources_data.get("ttl_seconds", ResourceConfig().ttl_seconds),
+        max_entry_bytes=resources_data.get("max_entry_bytes", ResourceConfig().max_entry_bytes),
+        unknown_capacity_policy=resources_data.get("unknown_capacity_policy", ResourceConfig().unknown_capacity_policy),
+        unknown_capacity_fallback_tokens=resources_data.get(
+            "unknown_capacity_fallback_tokens", ResourceConfig().unknown_capacity_fallback_tokens
+        ),
+    )
+
+    # Metadata-only runtime inspection policy (never behavioral).
+    inspection_data = dict(data.get("runtime_inspection", {}))
+    if inspection_data.get("mode", "cached_metadata") not in ("off", "cached_metadata"):
+        raise ValueError(
+            "runtime_inspection.mode must be one of off|cached_metadata "
+            f"(got {inspection_data.get('mode')!r}); there is no behavioral "
+            "mode — qualification belongs to explicit qualification tooling"
+        )
+    runtime_inspection = RuntimeInspectionConfig(**inspection_data)
+
     return InteropServerConfig(
         host=data.get("host", "127.0.0.1"),
         port=data.get("port", 8090),
@@ -846,6 +1033,8 @@ def load_config_from_dict(data: dict[str, Any]) -> InteropServerConfig:
         evidence=evidence,
         controller=controller,
         diagnostics=diagnostics,
+        resources=resources,
+        runtime_inspection=runtime_inspection,
     )
 
 

@@ -65,14 +65,32 @@ def external_manifest_paths(project_root: Path | None = None) -> list[Path]:
     return [path for root in roots if root.is_dir() for path in sorted(root.glob("*.yaml"))]
 
 
+_BUILTIN_DESCRIPTORS: list[AgentDescriptor] | None = None
+
+
+def _builtin_descriptors() -> list[AgentDescriptor]:
+    """Parse the bundled manifests once per process.
+
+    These files ship inside the wheel and cannot change while running; the
+    historical re-parse of every YAML on EVERY resolution call was ~150ms
+    of per-request CPU on the warm chat path (the Interop-CPU perf budget
+    exists to catch exactly this class of leak).
+    """
+    global _BUILTIN_DESCRIPTORS
+    if _BUILTIN_DESCRIPTORS is None:
+        root = files("agent_interop.data").joinpath("agents")
+        descriptors: list[AgentDescriptor] = []
+        for resource in root.iterdir():
+            if not resource.name.endswith(".yaml"):
+                continue
+            descriptors.append(descriptor_from_manifest(yaml.safe_load(resource.read_text())))
+        _BUILTIN_DESCRIPTORS = descriptors
+    return _BUILTIN_DESCRIPTORS
+
+
 def load_builtin_descriptor(agent_id: str) -> AgentDescriptor | None:
     """Resolve a bundled manifest by canonical ID or alias."""
-    root = files("agent_interop.data").joinpath("agents")
-    for resource in root.iterdir():
-        if not resource.name.endswith(".yaml"):
-            continue
-        data = yaml.safe_load(resource.read_text())
-        descriptor = descriptor_from_manifest(data)
+    for descriptor in _builtin_descriptors():
         if agent_id == descriptor.canonical_id or agent_id in descriptor.aliases:
             return descriptor
     return None

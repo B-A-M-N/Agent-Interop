@@ -40,6 +40,7 @@ from agent_interop.config import (
     UpstreamKind,
     UpstreamProtocol,
     validate_config,
+    ContextConfig,
 )
 from agent_interop.context import RequestContext
 from agent_interop.gateway import Gateway
@@ -91,6 +92,7 @@ def _make_config(**overrides: Any) -> InteropServerConfig:
                 ),
                 tool_mode=ToolMode.AUTO,
                 translation_mode=TranslationMode.CANONICAL,
+                context=ContextConfig(context_limit_tokens=32768),
             ),
         },
     }
@@ -672,6 +674,7 @@ class TestCredentialPassthroughHeaders:
             ),
             tool_mode=ToolMode.AUTO,
             translation_mode=TranslationMode.CANONICAL,
+            context=ContextConfig(context_limit_tokens=32768),
         )
         config = InteropServerConfig(
             host="127.0.0.1",
@@ -727,6 +730,7 @@ class TestApiKeyEnvConsolidation:
             ),
             tool_mode=ToolMode.AUTO,
             translation_mode=TranslationMode.CANONICAL,
+            context=ContextConfig(context_limit_tokens=32768),
         )
         config = InteropServerConfig(
             probe_on_startup=False, routes={"test-route": route}
@@ -752,6 +756,7 @@ class TestApiKeyEnvConsolidation:
             ),
             tool_mode=ToolMode.AUTO,
             translation_mode=TranslationMode.CANONICAL,
+            context=ContextConfig(context_limit_tokens=32768),
         )
         config = InteropServerConfig(
             probe_on_startup=False, routes={"test-route": route}

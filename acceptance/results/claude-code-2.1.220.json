@@ -4,5 +4,20 @@
   "timestamp": "2026-07-29T23:55:46.511804+00:00",
   "scenario": "single_tool_round_trip",
   "passed": true,
-  "detail": "The file contains: hello from the acceptance test.\n"
+  "detail": "The file contains: hello from the acceptance test.\n",
+  "argv": [],
+  "configuration_strategy": "",
+  "protocol": "",
+  "compatibility_path": "adapted",
+  "controller_used": false,
+  "model_digest": "acceptance-test-model",
+  "real_backend": false,
+  "verification": {
+    "read_test": true,
+    "edit_test": false,
+    "tool_error_recovery": false,
+    "multi_turn_continuation": true,
+    "cleanup_verification": false,
+    "nonce_gated_recovery": false
+  }
 }

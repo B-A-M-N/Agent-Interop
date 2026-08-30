@@ -316,7 +316,7 @@ class TestManagedDeploymentFlow:
         gw = Gateway(config)
         await gw.startup()
         # Gateway should have no probe results (probe_on_startup=False)
-        assert gw._probe_results == {}
+        assert gw._readiness.results == {}
         await gw.close()
 
     def test_config_validate_rejects_invalid(self, tmp_path: Path) -> None:

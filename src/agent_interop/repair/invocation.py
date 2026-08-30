@@ -294,6 +294,7 @@ def build_invocation_plan(
     *,
     upstream_tools: Sequence[CanonicalTool] | None = None,
     validation_tools: Sequence[CanonicalTool] | None = None,
+    capabilities: Any = None,  # P0.6: PrivateCapabilityPlan for enabled private tools
 ) -> InvocationPlan:
     """Build an InvocationPlan given tools, choice, and resolved mode.
 
@@ -386,6 +387,12 @@ def build_invocation_plan(
         )
 
     if resolved == ToolMode.PROMPTED and visible_tools:
+        from agent_interop.context_store.schema_tools import get_tool_schema_tool
+        from agent_interop.context_store.tools import (
+            read_result_tool,
+            recall_history_tool,
+            search_history_tool,
+        )
         from agent_interop.model.contract_templates import render_contract
 
         tool_descriptions = build_tool_descriptions(visible_tools)
@@ -394,6 +401,28 @@ def build_invocation_plan(
             tool_descriptions=tool_descriptions,
             choice_instructions=choice_instructions,
         )
+        # P0.6: Include only ENABLED private tools in the PROMPTED contract,
+        # with their exact schemas (not just names/descriptions). This avoids
+        # exposing all internal tools regardless of capability, and gives the
+        # model the real argument schemas so it doesn't have to guess.
+        if capabilities is not None and capabilities.has_any:
+            enabled_private = []
+            if capabilities.read_result:
+                enabled_private.append(read_result_tool())
+            if capabilities.recall_history or capabilities.search_history:
+                enabled_private.append(recall_history_tool())
+                enabled_private.append(search_history_tool())
+            if capabilities.get_tool_schema:
+                enabled_private.append(get_tool_schema_tool())
+            if enabled_private:
+                internal_lines = ["\n\nInternal tools (for Interop use, not the client):"]
+                for tool in enabled_private:
+                    desc = tool.description.split(".")[0] if tool.description else ""
+                    internal_lines.append(f"- {tool.name}: {desc}")
+                    # Include the full schema so the model can construct valid calls.
+                    schema_str = serialize_tool_schema(tool.input_schema)
+                    internal_lines.append(f"  Schema: {schema_str}")
+                prompt_contract += "\n".join(internal_lines)
         # Digest is taken over the base contract BEFORE any per-request nonce
         # text is appended below, so prompt-cache diagnostics stay meaningful
         # for the (overwhelming majority of) requests that never need one.

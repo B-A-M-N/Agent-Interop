@@ -53,7 +53,13 @@ class UpstreamResponseTooLargeError(Exception):
 
 @dataclass
 class PreparedUpstreamRequest:
-    """A fully prepared upstream request ready to send."""
+    """A fully prepared upstream request ready to send.
+
+    ``serialized_body`` (P0-10): pre-serialized JSON bytes. When set, the
+    transport sends these bytes verbatim instead of re-serializing ``body`` —
+    the request is serialized exactly once, and diagnostics/accounting see
+    byte-identical content to what goes on the wire.
+    """
 
     method: str = "POST"
     url: str = ""
@@ -61,6 +67,7 @@ class PreparedUpstreamRequest:
     body: dict[str, Any] = field(default_factory=dict)
     stream: bool = True
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    serialized_body: bytes | None = None
 
 
 @dataclass
@@ -376,12 +383,20 @@ class UpstreamTransport:
         for attempt in range(self._max_retries + 1):
             try:
                 json_body = request.body if request.method not in ("GET", "HEAD") else None
+                # P0-10: pre-serialized bytes win — the request is serialized
+                # exactly once by the caller, never re-traversed here.
+                request_kwargs: dict[str, Any] = {
+                    "headers": request.headers,
+                    "timeout": self._request_timeout(request.timeout_seconds),
+                }
+                if request.serialized_body is not None and request.method not in ("GET", "HEAD"):
+                    request_kwargs["content"] = request.serialized_body
+                else:
+                    request_kwargs["json"] = json_body
                 async with self.client.stream(
                     request.method,
                     request.url,
-                    headers=request.headers,
-                    json=json_body,
-                    timeout=self._request_timeout(request.timeout_seconds),
+                    **request_kwargs,
                 ) as resp:
                     # Retry on configured retryable statuses (e.g. 500, 503, 429).
                     # httpx does not raise on 4xx/5xx by default, so an explicit
@@ -488,12 +503,18 @@ class UpstreamTransport:
         body is consumed on the first attempt. If the stream fails
         mid-flight, the caller should retry at a higher level.
         """
+        stream_kwargs: dict[str, Any] = {
+            "headers": request.headers,
+            "timeout": self._request_timeout(request.timeout_seconds),
+        }
+        if request.serialized_body is not None:
+            stream_kwargs["content"] = request.serialized_body
+        else:
+            stream_kwargs["json"] = request.body
         async with self.client.stream(
             request.method,
             request.url,
-            headers=request.headers,
-            json=request.body,
-            timeout=self._request_timeout(request.timeout_seconds),
+            **stream_kwargs,
         ) as resp:
             yield UpstreamStream(
                 response=resp,

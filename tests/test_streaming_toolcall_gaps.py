@@ -41,6 +41,7 @@ from agent_interop.config import (
     UpstreamConfig,
     UpstreamKind,
     UpstreamProtocol,
+    ContextConfig,
 )
 from agent_interop.context import RequestContext
 from agent_interop.errors import InteropErrorCode
@@ -140,6 +141,7 @@ def _make_gateway(
                 ),
                 tool_mode=tool_mode,
                 translation_mode=TranslationMode.CANONICAL,
+                context=ContextConfig(context_limit_tokens=32768),
             ),
         },
     )
@@ -450,9 +452,9 @@ class TestGap4AtomicPerTurn:
 
         codec.decode_stream_chunk = patched_decode
 
-        # Spy on process_tool_batch via the binding gateway.py actually uses
-        # (it imported the name into its own namespace, so we must patch there).
-        from agent_interop import gateway as gateway_mod
+        # Spy on process_tool_batch via the binding the stream engine actually
+        # uses (it imported the name into its own namespace, so we patch there).
+        from agent_interop import stream_engine as gateway_mod
 
         call_count = 0
         candidate_counts: list[int] = []

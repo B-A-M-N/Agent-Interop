@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -22,12 +23,20 @@ def _digest(value: Any) -> str:
 
 def _context_from_options(*sources: dict[str, Any]) -> int:
     for source in sources:
+        # Check flat keys first
         for key in ("num_ctx", "context_length", "context_window", "num_ctx_train"):
             value = source.get(key)
             if isinstance(value, int) and value > 0:
                 return value
             if isinstance(value, str) and value.isdigit():
                 return int(value)
+        # Check architecture-qualified keys (e.g. 'llama.context_length')
+        for key, value in source.items():
+            if key.endswith(".context_length") or key.endswith(".num_ctx"):
+                if isinstance(value, int) and value > 0:
+                    return value
+                if isinstance(value, str) and value.isdigit():
+                    return int(value)
     return 0
 
 
@@ -56,6 +65,9 @@ def _headers(route: ModelRoute) -> dict[str, str]:
 
 class OllamaInspector:
     """Read Ollama's model/runtime metadata without creating an httpx client."""
+
+    def __init__(self) -> None:
+        self._qualification_cache: dict[str, ModelRuntimeCapabilities] = {}
 
     async def _request(
         self, transport: UpstreamTransport, route: ModelRoute, method: str, path: str,
@@ -97,9 +109,16 @@ class OllamaInspector:
             payload = {}
         return True, payload if isinstance(payload, dict) else {}
 
-    async def inspect(
+    async def inspect_runtime_metadata(
         self, route: ModelRoute, transport: UpstreamTransport,
     ) -> ModelRuntimeCapabilities:
+        """Cheaply determine model/runtime metadata WITHOUT generations.
+
+        P1.3: Split from behavioral qualification. Metadata reads
+        (digest, architecture, quantization, context, template,
+        advertised capabilities) are cheap and should not require
+        running /api/chat probes.
+        """
         version, tags, shown, running = await __import__("asyncio").gather(
             self._request(transport, route, "GET", "/api/version"),
             self._request(transport, route, "GET", "/api/tags"),
@@ -113,13 +132,72 @@ class OllamaInspector:
         capabilities = {str(item).lower() for item in shown.get("capabilities", [])}
         template = str(shown.get("template", ""))
         architecture_limit = _context_from_options(model_info, details)
+        # P0.21: configured_limit = serving allocation (from /api/ps), only
+        # valid when the model is actually loaded with a num_ctx. When the
+        # model isn't loaded, this is 0 (unknown), NOT architecture_limit.
         configured_limit = _context_from_options(loaded, loaded.get("details", {}) if isinstance(loaded.get("details"), dict) else {})
-        effective = min((limit for limit in (architecture_limit, configured_limit) if limit > 0), default=architecture_limit or configured_limit)
+        # P0.21: effective = the actual serving allocation. Falls back to 0
+        # (unknown) when the model isn't loaded and no serving config exists.
+        # Architecture limit is a ceiling, not a serving guarantee.
+        if configured_limit > 0:
+            effective = configured_limit
+        elif architecture_limit > 0:
+            # Model not loaded; architecture_limit is the model family maximum,
+            # not what Ollama is serving. Report 0 as unknown serving capacity.
+            effective = 0
+        else:
+            effective = 0
         declared_tools = "tools" in capabilities
         declared_images = "vision" in capabilities or "images" in capabilities
-        # Metadata says what Ollama believes a model advertises.  These probes
-        # establish only transport acceptance/shape, never automatic tool
-        # selection or task competence (those require qualification evidence).
+        family = details.get("family")
+        families = details.get("families") or []
+        architecture = str(family or (families[0] if families else ""))
+        return ModelRuntimeCapabilities(
+            backend_kind=route.upstream.kind,
+            backend_version=str(version.get("version", "")),
+            model_name=route.upstream_model,
+            model_digest=str(tag.get("digest") or shown.get("digest") or loaded.get("digest") or ""),
+            architecture=architecture,
+            quantization=str(details.get("quantization_level", "")),
+            parameter_count=str(details.get("parameter_size", "")),
+            architecture_context_tokens=architecture_limit,
+            configured_context_tokens=configured_limit,
+            effective_context_tokens=effective,
+            chat_template=template,
+            chat_template_digest=_digest(template),
+            accepts_native_tools=CapabilityState.DECLARED if declared_tools else CapabilityState.UNSUPPORTED,
+            returns_native_tool_calls=CapabilityState.DECLARED if declared_tools else CapabilityState.UNSUPPORTED,
+            accepts_named_tool_choice=CapabilityState.UNSUPPORTED,
+            accepts_required_tool_choice=CapabilityState.UNSUPPORTED,
+            accepts_parallel_tool_flag=CapabilityState.UNSUPPORTED,
+            supports_json_schema=CapabilityState.DECLARED if "structured_output" in capabilities else CapabilityState.UNSUPPORTED,
+            supports_json_mode=CapabilityState.DECLARED if "structured_output" in capabilities else CapabilityState.UNSUPPORTED,
+            supports_grammar=CapabilityState.UNSUPPORTED,
+            supports_streaming=CapabilityState.PROBED,
+            supports_images=CapabilityState.DECLARED if declared_images else CapabilityState.UNSUPPORTED,
+            serving_config_digest=_digest({"loaded": loaded, "template": template}),
+            probed_at=datetime.now(UTC).isoformat(),
+        )
+
+    async def qualify_behavior(
+        self, route: ModelRoute, transport: UpstreamTransport,
+        metadata: ModelRuntimeCapabilities | None = None,
+    ) -> ModelRuntimeCapabilities:
+        """Run behavioral qualification probes (P1.3).
+
+        Actual generations that probe tool/JSON/schema behavior. Only run
+        when behavioral qualification is needed (not on every request).
+        Digest-cached so repeated inspections don't re-run probes.
+        """
+        # Check cache first
+        if metadata is not None:
+            cache_key = f"{metadata.model_digest}:{metadata.chat_template_digest}"
+            cached = self._qualification_cache.get(cache_key)
+            if cached is not None:
+                return cached
+        else:
+            cache_key = None
+
         probe_options: dict[str, Any] = {"temperature": 0}
         if route.upstream.ollama_num_ctx:
             probe_options["num_ctx"] = route.upstream.ollama_num_ctx
@@ -159,54 +237,60 @@ class OllamaInspector:
                 "required": ["marker"],
             },
         })
-        # ``/api/ps`` sampled concurrently with the probes may describe the
-        # old default allocation.  Re-read it after the explicit-num_ctx
-        # probes so planning is based on the runtime this route will use.
-        if route.upstream.ollama_num_ctx:
-            running = await self._request(transport, route, "GET", "/api/ps")
-            loaded = next(
-                (item for item in running.get("models", []) if item.get("name") == route.upstream_model),
-                {},
-            )
-            configured_limit = _context_from_options(
-                loaded,
-                loaded.get("details", {}) if isinstance(loaded.get("details"), dict) else {},
-            )
-            # A successful context-configured probe establishes a route
-            # request constraint even when a backend omits it from /api/ps.
-            configured_limit = configured_limit or route.upstream.ollama_num_ctx
-            effective = min(
-                (limit for limit in (architecture_limit, configured_limit) if limit > 0),
-                default=architecture_limit or configured_limit,
-            )
         tool_calls = tool_payload.get("message", {}).get("tool_calls", [])
-        return ModelRuntimeCapabilities(
+        result = ModelRuntimeCapabilities(
             backend_kind=route.upstream.kind,
-            backend_version=str(version.get("version", "")),
+            backend_version="",
             model_name=route.upstream_model,
-            model_digest=str(tag.get("digest") or shown.get("digest") or loaded.get("digest") or ""),
-            architecture=str(details.get("family") or details.get("families", [""])[0] if details.get("families") else ""),
-            quantization=str(details.get("quantization_level", "")),
-            parameter_count=str(details.get("parameter_size", "")),
-            architecture_context_tokens=architecture_limit,
-            configured_context_tokens=configured_limit,
-            effective_context_tokens=effective,
-            chat_template=template,
-            chat_template_digest=_digest(template),
-            accepts_native_tools=(CapabilityState.PROBED if tools_ok else
-                                  CapabilityState.DECLARED if declared_tools else CapabilityState.UNSUPPORTED),
-            returns_native_tool_calls=(CapabilityState.PROBED if isinstance(tool_calls, list) and tool_calls else
-                                       CapabilityState.DECLARED if declared_tools else CapabilityState.UNSUPPORTED),
+            model_digest="",
+            architecture="",
+            quantization="",
+            parameter_count="",
+            architecture_context_tokens=0,
+            configured_context_tokens=0,
+            effective_context_tokens=0,
+            chat_template="",
+            chat_template_digest="",
+            accepts_native_tools=(CapabilityState.PROBED if tools_ok else CapabilityState.UNSUPPORTED),
+            returns_native_tool_calls=(CapabilityState.PROBED if isinstance(tool_calls, list) and tool_calls else CapabilityState.UNSUPPORTED),
             accepts_named_tool_choice=CapabilityState.UNSUPPORTED,
             accepts_required_tool_choice=CapabilityState.UNSUPPORTED,
             accepts_parallel_tool_flag=CapabilityState.UNSUPPORTED,
-            supports_json_schema=(CapabilityState.PROBED if schema_ok else
-                                  CapabilityState.DECLARED if "structured_output" in capabilities else CapabilityState.UNSUPPORTED),
-            supports_json_mode=(CapabilityState.PROBED if json_ok else
-                                CapabilityState.DECLARED if "structured_output" in capabilities else CapabilityState.UNSUPPORTED),
+            supports_json_schema=(CapabilityState.PROBED if schema_ok else CapabilityState.UNSUPPORTED),
+            supports_json_mode=(CapabilityState.PROBED if json_ok else CapabilityState.UNSUPPORTED),
             supports_grammar=CapabilityState.UNSUPPORTED,
             supports_streaming=CapabilityState.PROBED,
-            supports_images=CapabilityState.DECLARED if declared_images else CapabilityState.UNSUPPORTED,
-            serving_config_digest=_digest({"loaded": loaded, "template": template}),
+            supports_images=CapabilityState.UNSUPPORTED,
+            serving_config_digest="",
             probed_at=datetime.now(UTC).isoformat(),
+        )
+        if cache_key is not None:
+            self._qualification_cache[cache_key] = result
+        return result
+
+    async def inspect(
+        self, route: ModelRoute, transport: UpstreamTransport,
+    ) -> ModelRuntimeCapabilities:
+        """P0.36: DEPRECATED — use inspect_runtime_metadata instead.
+
+        This legacy method runs metadata + behavioral qualification
+        (3 model generations). It is only called as a fallback for
+        inspectors that don't implement inspect_runtime_metadata.
+        """
+        import warnings
+        warnings.warn(
+            "OllamaInspector.inspect() is deprecated. "
+            "Use inspect_runtime_metadata() for metadata-only inspection.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        metadata = await self.inspect_runtime_metadata(route, transport)
+        behavior = await self.qualify_behavior(route, transport, metadata=metadata)
+        # Merge: metadata provides identity, behavior provides probed capabilities
+        return replace(metadata,
+            accepts_native_tools=behavior.accepts_native_tools,
+            returns_native_tool_calls=behavior.returns_native_tool_calls,
+            supports_json_schema=behavior.supports_json_schema,
+            supports_json_mode=behavior.supports_json_mode,
+            supports_streaming=behavior.supports_streaming,
         )

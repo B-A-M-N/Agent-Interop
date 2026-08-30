@@ -8,7 +8,6 @@ from typing import Any
 from agent_interop.abi import (
     CanonicalError,
     CanonicalResponse,
-    CanonicalTextBlock,
     CanonicalToolCallBlock,
     ToolChoiceMode,
 )
@@ -20,6 +19,17 @@ from agent_interop.planning.types import CompatibilityAttempt
 ExecuteAttempt = Callable[[Any], Awaitable[CanonicalResponse]]
 BuildAttemptInvocation = Callable[[Any, CompatibilityAttempt], Any]
 ReplanWithheldTool = Callable[[Any, str], Any]
+HintKeyFn = Callable[[Any], str]
+HintGetFn = Callable[[str], Any | None]
+HintRecordFn = Callable[[str, Any], None]
+
+
+def _max_selection_rounds(invocation: Any) -> int:
+    """P0.38: Get max_selection_rounds from invocation's route, defaulting to 1."""
+    try:
+        return getattr(invocation.route.tool_surface, "max_selection_rounds", 1)
+    except AttributeError:
+        return 1
 
 
 class CompatibilityAttemptExecutor:
@@ -33,7 +43,7 @@ class CompatibilityAttemptExecutor:
     def __init__(self, budget: AttemptBudget | None = None) -> None:
         self.budget = budget or AttemptBudget()
         self.results: list[AttemptResult] = []
-        self._withheld_replanned = False
+        self._selection_replans = 0  # P0.38: track selection replans
 
     @staticmethod
     def _satisfies_tool_requirement(response: CanonicalResponse, invocation: Any) -> bool:
@@ -45,17 +55,6 @@ class CompatibilityAttemptExecutor:
             return bool(calls)
         return any(call.name == choice.name for call in calls)
 
-    @staticmethod
-    def _output_tokens(response: CanonicalResponse) -> int:
-        usage = getattr(response, "usage", None)
-        if usage is not None and getattr(usage, "output_tokens", 0):
-            return int(usage.output_tokens)
-        text = "".join(
-            block.text if isinstance(block, CanonicalTextBlock) else str(getattr(block, "arguments", ""))
-            for block in response.content
-        )
-        return (len(text) + 3) // 4
-
     async def execute(
         self,
         invocation: Any,
@@ -63,9 +62,21 @@ class CompatibilityAttemptExecutor:
         build_invocation: BuildAttemptInvocation,
         execute_attempt: ExecuteAttempt,
         replan_withheld_tool: ReplanWithheldTool | None = None,
+        hint_key: HintKeyFn | None = None,
+        hint_get: HintGetFn | None = None,
+        hint_record: HintRecordFn | None = None,
     ) -> CanonicalResponse:
         plan = invocation.compatibility_plan
         attempts = plan.attempts if plan is not None else ()
+        # P0-45: a recorded operational hint reorders the ladder — moving the
+        # previously-accepted kind to the front — but never adds, removes, or
+        # authorizes an attempt.  (hints are keyed by serving tuple; only
+        # kinds the planner already deemed permissible can be promoted.)
+        if attempts and hint_key is not None and hint_get is not None:
+            from agent_interop.planning.hints import reorder_attempts_by_hint
+
+            preferred = hint_get(hint_key(invocation))
+            attempts = reorder_attempts_by_hint(attempts, preferred)
         if not attempts:
             # Preparation can intentionally return a planless invocation for
             # unsafe history.  It still needs the gateway's ordinary
@@ -82,25 +93,36 @@ class CompatibilityAttemptExecutor:
             if execution is not None:
                 execution.record_attempt()
             response = await execute_attempt(candidate)
-            self.budget.record_generated_tokens(self._output_tokens(response))
+            # P0-15: no token accounting here — every model token is recorded
+            # by the generation seam (reserve/commit in the send path). This
+            # executor counts only attempt-ladder rungs and selection replans;
+            # two accounting sources would double-count every generation.
             details = response.error.details if response.error is not None else {}
             requested_tool = details.get("withheld_tool_requested", "") if isinstance(details, dict) else ""
             if (
                 requested_tool
-                and not self._withheld_replanned
+                and self._selection_replans < _max_selection_rounds(invocation)
                 and replan_withheld_tool is not None
                 and self.budget.allow(False)
             ):
-                self._withheld_replanned = True
+                self._selection_replans += 1
                 candidate = replan_withheld_tool(candidate, requested_tool)
                 if execution is not None:
                     execution.record_attempt()
                 response = await execute_attempt(candidate)
-                self.budget.record_generated_tokens(self._output_tokens(response))
             latest = response
             accepted = response.error is None and self._satisfies_tool_requirement(response, candidate)
             self.results.append(AttemptResult(attempt, accepted, "accepted" if accepted else "tool_contract_unsatisfied"))
             if accepted:
+                # P0-45: record what actually worked for this serving tuple —
+                # an observed preference only, never trusted evidence.
+                if hint_key is not None and hint_record is not None:
+                    try:
+                        key = hint_key(candidate)
+                        if key:
+                            hint_record(key, attempt.kind)
+                    except Exception:  # hints must never fail a request
+                        pass
                 return response
             # No-tool automatic selection remains a legitimate model decision.
             if candidate.reconciled_request.tool_choice.mode == ToolChoiceMode.AUTO:

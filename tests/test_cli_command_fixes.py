@@ -40,6 +40,7 @@ from agent_interop.config import (
     UpstreamConfig,
     UpstreamKind,
     UpstreamProtocol,
+    ContextConfig,
 )
 from agent_interop.context import RequestContext
 from agent_interop.evidence.store import EvidenceStore
@@ -82,6 +83,7 @@ def valid_config(tmp_path: Path) -> Path:
                 },
                 "tool_mode": "auto",
                 "translation_mode": "canonical",
+                "context": {"context_limit_tokens": 32768},
             }
         },
     }
@@ -192,6 +194,7 @@ def _certify_config_with(tmp_path: Path) -> Path:
                 },
                 "tool_mode": "auto",
                 "translation_mode": "canonical",
+                "context": {"context_limit_tokens": 32768},
             }
         },
     }
@@ -244,6 +247,7 @@ def _certify_with_fake_upstream(
                 ),
                 tool_mode=ToolMode.AUTO,
                 translation_mode=TranslationMode.CANONICAL,
+                context=ContextConfig(context_limit_tokens=32768),
             ),
         },
     )
@@ -646,6 +650,7 @@ class TestLegacyTestCommandKeyMatchesLiveGate:
                 ),
                 tool_mode=ToolMode.AUTO,
                 profile="auto",
+                context=ContextConfig(context_limit_tokens=32768),
             )
             live_config = InteropServerConfig(
                 probe_on_startup=False,

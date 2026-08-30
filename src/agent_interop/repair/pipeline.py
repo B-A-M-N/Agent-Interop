@@ -208,16 +208,22 @@ def _get_conditional_schema(
     """
     if "if" not in schema:
         return None
-    import jsonschema
+    # P1-H: cached compiled validator (same cache validate_against_schema
+    # uses) — this runs per tool-call decision on conditional schemas.
+    from agent_interop.repair.schema import _cached_validator
+
+    validator = _cached_validator(schema["if"])
+    if validator is None:
+        return None
     try:
-        jsonschema.validate(instance, schema["if"])
+        errors = list(validator.iter_errors(instance))
+    except Exception:
+        return None
+    if not errors:
         if "then" in schema and isinstance(schema["then"], dict):
             return schema["then"]
-    except jsonschema.ValidationError:
-        if "else" in schema and isinstance(schema["else"], dict):
-            return schema["else"]
-    except Exception:
-        pass
+    elif "else" in schema and isinstance(schema["else"], dict):
+        return schema["else"]
     return None
 
 
@@ -323,6 +329,7 @@ def canonicalize_tool_name(
     name: str,
     tools: list[CanonicalTool],
     _policy: Any = None,
+    tool_aliases: dict[str, str] | None = None,
 ) -> str | None:
     """Canonicalize a tool name, returning the exact registered name.
 
@@ -330,9 +337,18 @@ def canonicalize_tool_name(
       - case (Read_File → read_file)
       - hyphen/underscore (list-files → list_files)
       - namespace strip (mcp__server__read_file → read_file)
+      - client compatibility-pack tool-name aliases (e.g. read_file → Read),
+        applied last and only when the alias resolves to exactly one declared
+        tool (never fuzzy / embedding-based).
 
     When _policy is provided and its unknown_tool_policy is REJECT,
     only exact match is performed — all normalizations are skipped.
+
+    ``tool_aliases`` is an optional ``{alias_lower: canonical_tool_name}`` map
+    sourced from the resolved client compatibility pack (see
+    ``compatibility_packs.get_tool_name_alias_map``). It is consulted only
+    after the structural normalizations above fail, and only resolves to a
+    declared tool.
 
     Returns None if no unique match exists.
     """
@@ -369,6 +385,14 @@ def canonicalize_tool_name(
         ns_matches = [t for t in tool_map if t == short or t.lower() == short.lower()]
         if len(ns_matches) == 1:
             return ns_matches[0]
+
+    # Client compatibility-pack tool-name alias (semantic recovery). Applied
+    # only when the map contains the lowercased model name and it points to a
+    # declared tool — i.e. exactly one resolved candidate.
+    if tool_aliases:
+        canonical = tool_aliases.get(name_lower)
+        if canonical is not None and canonical in tool_map:
+            return canonical
 
     return None
 
@@ -477,7 +501,27 @@ def repair_one(
     max_input = policy.max_input_bytes if hasattr(policy, 'max_input_bytes') else 65536
 
     # ── Step 1: Tool-name canonicalization ────────────────────────────
-    canonical_name = canonicalize_tool_name(call_name, tools, _policy=policy)
+    # Build the client tool-name alias map (semantic recovery, e.g.
+    # read_file → Read) from the resolved compatibility identity. This is
+    # gated by a strong client/version/fingerprint tuple — never a bare
+    # client_id — and only resolves to a declared tool.
+    tool_aliases = None
+    if client_id:
+        from agent_interop.compatibility_packs import get_tool_name_alias_map
+
+        tool_aliases = get_tool_name_alias_map(
+            client_id,
+            client_version=getattr(compatibility_key, "client_version", None)
+            if compatibility_key is not None
+            else None,
+            tool_schema_fingerprint=getattr(compatibility_key, "tool_schema_fingerprint", None)
+            if compatibility_key is not None
+            else None,
+            declared_tool_names=tuple(t.name for t in tools),
+        )
+    canonical_name = canonicalize_tool_name(
+        call_name, tools, _policy=policy, tool_aliases=tool_aliases
+    )
     if canonical_name is None:
         if telemetry and request_id:
             telemetry.emit_rejected(request_id, call_name, paths=["tool_name"])
@@ -698,7 +742,14 @@ def repair_one(
                     break
 
         if not fixed:
-            pass  # Issue remains in next iteration's list but won't re-trigger same rule
+            # P1-H (item 43): no rule made progress this iteration — stop.
+            # The state is byte-identical, so the next iteration would
+            # produce the same issues, the same cursor, and the same
+            # rejections: up to 20 wasted full validate+rule passes on a
+            # call no rule can fix. (The historical comment claimed the
+            # issue "won't re-trigger same rule" but nothing recorded
+            # that — only a successful repair advances the state.)
+            break
 
     # ── Step 5: Final validation ─────────────────────────────────────────
     final_issues = validate_against_schema(current, schema)

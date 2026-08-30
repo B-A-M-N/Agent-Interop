@@ -236,4 +236,9 @@ def build_compatibility_key(
         context_strategy=_strval(getattr(context_plan, "selected_strategy", "")),
         context_plan_revision="1" if context_plan is not None else "",
         streaming_policy=streaming_policy,
+        # P1.5: projection dimensions
+        projection_policy_id="p08_system_projection" if inputs.context_plan is not None else "",
+        projection_revision="1",
+        model_view_fingerprint=_strval(getattr(inputs.context_plan, "model_view_fingerprint", "")),
+        internal_tool_surface_revision="p04_internal_tools_v1",
     )

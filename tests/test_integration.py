@@ -36,6 +36,7 @@ from agent_interop.config import (
     UpstreamConfig,
     UpstreamKind,
     UpstreamProtocol,
+    ContextConfig,
 )
 from agent_interop.protocols.anthropic_messages import AnthropicMessagesAdapter
 from agent_interop.protocols.openai_chat import OpenAIChatAdapter
@@ -338,6 +339,7 @@ def _make_route(tool_mode: ToolMode) -> ModelRoute:
             wire_protocol=UpstreamProtocol.OPENAI_CHAT,
         ),
         tool_mode=tool_mode,
+        context=ContextConfig(context_limit_tokens=32768),
     )
 
 
@@ -384,6 +386,7 @@ class TestDisabledToolModeFailsClosed:
                         wire_protocol=UpstreamProtocol.OPENAI_CHAT,
                     ),
                     tool_mode=tool_mode,
+                    context=ContextConfig(context_limit_tokens=32768),
                 ),
             },
         )
@@ -596,10 +599,13 @@ class TestStreamingSupportedIsEnforced:
 
     @staticmethod
     def _config() -> Any:
-        from agent_interop.config import InteropServerConfig
+        from agent_interop.config import InteropServerConfig, RuntimeInspectionConfig
 
         return InteropServerConfig(
             probe_on_startup=False,
+            # Hermetic: the pre-upstream rejection contract is "zero backend
+            # contact", which metadata reads would also violate.
+            runtime_inspection=RuntimeInspectionConfig(mode="off"),
             routes={
                 "r": ModelRoute(
                     id="r",
@@ -611,6 +617,7 @@ class TestStreamingSupportedIsEnforced:
                         wire_protocol=UpstreamProtocol.OPENAI_CHAT,
                     ),
                     tool_mode=ToolMode.AUTO,
+                    context=ContextConfig(context_limit_tokens=32768),
                 ),
             },
         )

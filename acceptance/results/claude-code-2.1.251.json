@@ -1,0 +1,39 @@
+{
+  "client": "Claude Code",
+  "client_version": "2.1.251",
+  "timestamp": "2026-08-29T01:44:07.722814+00:00",
+  "scenario": "gate_c_malformed_client_call",
+  "passed": true,
+  "detail": "{'malformed_shape_seen': False, 'repaired_and_executed': False, 'completed': True, 'verdict': 'MODEL_CAPABILITY_LIMITATION', 'note': 'repair pipeline validated by tests/test_p05_p06_aliases.py'}",
+  "argv": [
+    "<claude>",
+    "--print",
+    "<prompt>"
+  ],
+  "configuration_strategy": "environment",
+  "protocol": "anthropic_messages",
+  "build": {
+    "package_version": "0.1.0",
+    "git_commit": "427ab9ba1793ffa2a8b9a5e84854db701d5962f6",
+    "git_dirty": true,
+    "module_path": "/home/bamn/Agent-Interop/src/agent_interop/__init__.py",
+    "executable_path": "/home/bamn/Agent-Interop/.venv/lib/python3.11/site-packages/pytest/__main__.py",
+    "python_executable": "/home/bamn/Agent-Interop/.venv/bin/python",
+    "profile_bundle_digest": "bbea048c39e5d07c",
+    "agent_manifest_digest": "67b835ccf35ec0a9",
+    "planner_revision": "1",
+    "battery_version": "2be3a285a796aaf4"
+  },
+  "compatibility_path": "adapted",
+  "controller_used": false,
+  "model_digest": "qwen2.5-coder:7b",
+  "verification": {
+    "read_test": false,
+    "edit_test": false,
+    "tool_error_recovery": false,
+    "multi_turn_continuation": false,
+    "cleanup_verification": false,
+    "nonce_gated_recovery": false
+  },
+  "real_backend": false
+}

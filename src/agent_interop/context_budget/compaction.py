@@ -1,12 +1,16 @@
 """Safe, deterministic context adaptation.
 
-Interop is not allowed to silently discard a client's current execution
-state.  This module therefore performs only the one loss-bounded adaptation
-that is safe without another model call: reducing *older*, known pageable
-tool results while retaining exact first/last source lines, correlation IDs,
-error state, and an integrity digest.  Older conversational turns are never
-removed here; controller-mediated summarisation remains an explicit future
-execution step.
+P0.7: Replace lossy truncation with virtualization by default. ALL large
+tool results are virtualized (stored in the ContextStore, replaced with
+bounded handles) rather than truncated. This is safer because nothing is
+lost — the full result is retained behind a ref.
+
+``stored_refs`` on ``ContextAdaptationResult`` carries the ContextStore refs
+that callers must pin for the request lifecycle (so they survive eviction).
+``compacted_tool_result_ids`` remains semantic bookkeeping of tool_call_ids
+that were virtualized — it is not a storage handle.
+
+Legacy lossy truncation is kept as fallback when no store is available.
 """
 
 from __future__ import annotations
@@ -31,7 +35,8 @@ class ContextAdaptationResult:
 
     request: CanonicalRequest
     transformations: tuple[str, ...] = ()
-    compacted_tool_result_ids: tuple[str, ...] = ()
+    compacted_tool_result_ids: tuple[str, ...] = ()  # tool_call_ids (semantic identity)
+    stored_refs: tuple[str, ...] = ()  # ContextStore refs, safe to pin
 
     @property
     def changed(self) -> bool:
@@ -60,15 +65,7 @@ def _bounded_lines(content: str, *, max_lines: int = 16) -> str:
 
 
 def _structured_reduction(content: str, *, max_items: int = 8, max_depth: int = 4) -> str | None:
-    """Reduce an older known-JSON result without producing invalid JSON.
-
-    This policy is intentionally narrower than ordinary text compaction: it
-    only activates for a tool explicitly classified as a JSON-query shape and
-    keeps scalar values byte-for-byte after JSON decoding.  Large arrays and
-    mappings retain deterministic head/tail samples plus an integrity digest
-    and omission count, so a later model turn can see that the representation
-    is incomplete instead of treating it as a complete query result.
-    """
+    """Reduce an older known-JSON result without producing invalid JSON."""
     try:
         parsed = json.loads(content)
     except (TypeError, ValueError):
@@ -117,20 +114,149 @@ def _structured_reduction(content: str, *, max_items: int = 8, max_depth: int = 
     return json.dumps(reduced, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+# ─── UTF-8 helpers ─────────────────────────────────────────────────────────
+
+
+def truncate_utf8(text: str, max_bytes: int) -> str:
+    """Truncate *text* to at most *max_bytes* in UTF-8.
+
+    Never splits a multibyte sequence: encodes to UTF-8, trims the byte
+    buffer, then decodes with ``errors="ignore"`` so the caller always
+    gets a valid string.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+# ─── P0.7 virtualization-based compaction ──────────────────────────────────
+
+
+def virtualize_tool_results_compaction(
+    request: CanonicalRequest,
+    *,
+    store: Any,
+    session_id: str,
+    exchanges: tuple[Any, ...] | list[Any],
+    plan: ContextPlan,
+    policy: Any = None,
+) -> ContextAdaptationResult:
+    """Apply virtualization-based result compaction (P0.7).
+
+    Replaces the old lossy truncation policy (known tool => maybe truncate,
+    unknown tool => verbatim) with: ALL large results => virtualize by default.
+
+    The full result is stored in the ContextStore; the message content becomes
+    a head/tail + ref that the model can page through via __interop_read_result.
+    This is safer than silent truncation because nothing is lost.
+    """
+    if policy is None:
+        from agent_interop.context_store.policy import VirtualizationPolicy
+
+        policy = VirtualizationPolicy()
+    if not plan.compaction_required:
+        return ContextAdaptationResult(request)
+    candidate_indices = set(plan.compacted_message_indices)
+    messages = list(request.messages)
+    changed_ids: list[str] = []
+    stored_refs: list[str] = []
+    transformations: list[str] = []
+    for index, message in enumerate(messages):
+        if index not in candidate_indices or message.role != "tool":
+            continue
+        changed_blocks: list[Any] = []
+        message_changed = False
+        for block in message.content:
+            if not isinstance(block, CanonicalToolResultBlock):
+                changed_blocks.append(block)
+                continue
+            if block.is_error or not isinstance(block.content, str):
+                # Errors are preserved exactly — they are action-critical
+                changed_blocks.append(block)
+                continue
+            decision = policy.decide(block)
+            if not decision.should_virtualize:
+                changed_blocks.append(block)
+                continue
+            # Virtualize: store full content, replace with handle + head/tail
+            text = block.content
+            entry = store.store(
+                session_id=session_id,
+                content=text,
+                kind="tool_result",
+                tool_call_id=block.tool_call_id,
+            )
+            stored_refs.append(entry.ref)
+            lines = text.splitlines(keepends=True)
+            head_count = decision.max_inline_lines // 2
+            tail_count = decision.max_inline_lines - head_count
+            # Determine visible content, ensuring we never exceed max_inline_bytes.
+            if len(lines) <= decision.max_inline_lines:
+                # Few lines: keep as-is unless the total byte size exceeds the cap.
+                visible = "".join(lines)
+                if len(visible.encode("utf-8", "replace")) > policy._max_inline_bytes:
+                    # Single-line (or few-line) result that exceeds the byte cap.
+                    # Use truncate_utf8 to avoid splitting multibyte characters.
+                    visible = truncate_utf8(visible, policy._max_inline_bytes)
+            else:
+                visible = "".join(lines[:head_count] + lines[-tail_count:])
+            new_content = (
+                f"[Interop result ref: {entry.ref}] Original: {len(text.splitlines())} lines. "
+                f"Visible: {decision.max_inline_lines} lines. Full retained (sha256:{entry.sha256[:16]}). "
+                f"Use __interop_read_result if more is required.\n{visible}"
+            )
+            changed_blocks.append(replace(block, content=new_content))
+            message_changed = True
+            changed_ids.append(block.tool_call_id)
+        if message_changed:
+            messages[index] = replace(message, content=changed_blocks)
+            transformations.append("virtualize_large_tool_results")
+    if not changed_ids:
+        return ContextAdaptationResult(request)
+    return ContextAdaptationResult(
+        replace(request, messages=messages),
+        transformations=tuple(transformations),
+        compacted_tool_result_ids=tuple(changed_ids),
+        stored_refs=tuple(stored_refs),
+    )
+
+
 def compact_safe_tool_results(
     request: CanonicalRequest,
     *,
     exchanges: tuple[Any, ...] | list[Any],
     plan: ContextPlan,
+    store: Any = None,
+    session_id: str = "",
 ) -> ContextAdaptationResult:
     """Apply safe result compaction selected by ``ContextPlan``.
 
+    When a ContextStore is provided (P0.7), large results are virtualized
+    (stored in full, replaced with bounded handles) rather than truncated.
+    Falls back to the legacy lossy truncation when no store is available.
+
     Unknown tools, error output, and current result messages remain
-    byte-for-byte intact. Explicit JSON-query tools may use structure-aware
-    reduction; other known pageable text tools preserve exact head/tail
-    source lines. A model-visible omission marker is intentionally included
-    so a later turn cannot mistake a partial result for the complete original.
+    byte-for-byte intact.
     """
+    if store is not None and session_id:
+        return virtualize_tool_results_compaction(
+            request,
+            store=store,
+            session_id=session_id,
+            exchanges=exchanges,
+            plan=plan,
+        )
+    return _legacy_compact_safe_tool_results(request, exchanges=exchanges, plan=plan)
+
+
+def _legacy_compact_safe_tool_results(
+    request: CanonicalRequest,
+    *,
+    exchanges: tuple[Any, ...] | list[Any],
+    plan: ContextPlan,
+) -> ContextAdaptationResult:
+    """Legacy lossy truncation (kept for fallback / tests)."""
     if not plan.compaction_required:
         return ContextAdaptationResult(request)
     call_names = _call_names(exchanges)

@@ -39,6 +39,7 @@ from agent_interop.abi import (
     CanonicalUsage,
 )
 from agent_interop.config import (
+    ContextConfig,
     InteropServerConfig,
     ModelRoute,
     RepairConfig,
@@ -88,6 +89,7 @@ def _make_gateway() -> Gateway:
                     wire_protocol=UpstreamProtocol.OLLAMA_CHAT,
                     timeout_seconds=30.0,
                 ),
+                context=ContextConfig(context_limit_tokens=32768),
                 tool_mode=ToolMode.AUTO,
                 translation_mode=TranslationMode.CANONICAL,
             ),
@@ -265,9 +267,9 @@ class TestStreamingConfidenceGatedRepairPolicy:
             from agent_interop.transaction import ToolBatchDecision
             return ToolBatchDecision(is_accepted=True)
 
-        with patch("agent_interop.gateway.process_tool_batch", side_effect=fake_process_tool_batch):
+        with patch("agent_interop.stream_engine.process_tool_batch", side_effect=fake_process_tool_batch):
             await _collect(
-                gw._process_completed_stream_tools([call], invocation, coordinator)
+                gw._stream_engine._process_completed_stream_tools([call], invocation, coordinator)
             )
 
         ctx = captured.get("context")
@@ -348,13 +350,13 @@ class TestStreamingBudgetSharing:
             )
 
         # Batch 1.
-        await _collect(gw._process_completed_stream_tools([make_call("tc_1")], invocation, coordinator))
+        await _collect(gw._stream_engine._process_completed_stream_tools([make_call("tc_1")], invocation, coordinator))
         assert shared_budget.repair_operations == 1, (
             f"after batch 1 expected 1 repair op, got {shared_budget.repair_operations}"
         )
 
         # Batch 2 — same invocation, same budget. Must accumulate to 2, not reset.
-        await _collect(gw._process_completed_stream_tools([make_call("tc_2")], invocation, coordinator))
+        await _collect(gw._stream_engine._process_completed_stream_tools([make_call("tc_2")], invocation, coordinator))
         assert shared_budget.repair_operations == 2, (
             f"after batch 2 expected 2 accumulated repair ops, got "
             f"{shared_budget.repair_operations}"
@@ -620,6 +622,7 @@ class TestLogSummaryOncePerRequest:
                         wire_protocol=UpstreamProtocol.OPENAI_CHAT,
                         timeout_seconds=30.0,
                     ),
+                    context=ContextConfig(context_limit_tokens=32768),
                     tool_mode=ToolMode.AUTO,
                     translation_mode=TranslationMode.CANONICAL,
                 ),

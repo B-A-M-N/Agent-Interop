@@ -279,6 +279,7 @@ def create_app_from_env() -> FastAPI:
     import os
 
     from agent_interop.config import (
+        ContextConfig,
         InteropServerConfig,
         ModelRoute,
         RepairConfig,
@@ -345,9 +346,12 @@ def create_app_from_env() -> FastAPI:
                     wire_protocol=wire_protocol,
                     ollama_num_ctx=ollama_num_ctx,
                 ),
+                # P1.7: managed launch automatically selects adaptive
+                # projection when the runtime model context requires it.
                 tool_mode=ToolMode.AUTO,
                 translation_mode=TranslationMode.CANONICAL,
                 repair=RepairConfig(),
+                context=ContextConfig(strategy="adaptive"),
             ),
         },
         ingress_auth=ingress_auth,

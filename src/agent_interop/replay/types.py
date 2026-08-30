@@ -66,6 +66,12 @@ class CompatibilityKey:
     context_strategy: str = ""
     context_plan_revision: str = ""
     streaming_policy: str = ""
+    # P1.5: projection dimensions — evidence from one model view must not be
+    # reused for another merely because model/profile match.
+    projection_policy_id: str = ""
+    projection_revision: str = ""
+    model_view_fingerprint: str = ""
+    internal_tool_surface_revision: str = ""
 
 
 @dataclass(frozen=True)

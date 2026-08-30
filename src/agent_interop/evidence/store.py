@@ -132,6 +132,11 @@ class EvidenceStore:
         self._db_path = db_path
         self._lock = threading.Lock()
         self._local = threading.local()
+        # P1-G write-behind state (see install_write_behind).
+        self._write_behind: bool | None = None
+        self._write_behind_queue: Any = None
+        self._write_behind_worker: Any = None
+        self._write_behind_stop: Any = None
         self._ensure_db()
 
     def _ensure_db(self) -> None:
@@ -613,25 +618,12 @@ class EvidenceStore:
         never touches ``last_verified_at``, ordinary traffic cannot keep a
         once-certified record looking freshly-verified forever.
         """
-        result = self.get_result(key)
-        if result is None:
-            return True
-        if result.revoked:
-            return True
-        from datetime import datetime
+        return result_is_stale(self.get_result(key))
 
-        reference = result.last_verified_at or result.tested_at or result.created_at
-        if not reference:
-            return True
-        try:
-            tested = datetime.fromisoformat(reference)
-            now = datetime.now(UTC)
-            if tested.tzinfo is None:
-                tested = tested.replace(tzinfo=UTC)
-            age_hours = (now - tested).total_seconds() / 3600.0
-        except (ValueError, OverflowError):
-            return True
-        return age_hours > result.passes_expiry_hours
+    @staticmethod
+    def _freshness_reference(result: CompatibilityResult) -> str:
+        """The timestamp staleness is measured from (diagnostic helper)."""
+        return result.last_verified_at or result.tested_at or result.created_at
 
     def mark_verified(self, key: CompatibilityKey, attestation: str = "") -> None:
         """Mark evidence as manually verified, updating last_verified_at.
@@ -677,12 +669,158 @@ class EvidenceStore:
         self.store_result(key, updated)
 
     def close(self) -> None:
-        """Close the database connection."""
+        """Close the database connection (draining any write-behind queue)."""
+        self.close_write_behind()
         if hasattr(self._local, "conn") and self._local.conn is not None:
             self._local.conn.close()
             self._local.conn = None
 
     # ── Repair stats (schema v7) ────────────────────────────────────────
+
+    # ── Write-behind queue (P1-G) ────────────────────────────────────────
+
+    def install_write_behind(self, *, max_pending: int = 10_000) -> None:
+        """Start a background worker that drains queued repair-event rows.
+
+        P1-G: repair events are pure appends with no request-path read-back,
+        so they can persist off the request path. While installed,
+        :meth:`record_repair_event_async` enqueues instead of writing;
+        certification, revocation, and the compatibility-result merge are
+        NOT affected (they stay synchronous by contract). Reads
+        (``query_repair_stats``) drain the queue first, so a reader never
+        observes a tail the writer already accepted.
+
+        Idempotent: a second install is a no-op. Refused for ``:memory:``
+        databases — the worker's thread-local connection would open a
+        DIFFERENT in-memory database with no schema.
+        """
+        if self._write_behind is not None:
+            return
+        if str(self._db_path) == ":memory:":
+            logger.debug("write-behind refused for :memory: evidence store")
+            return
+        import queue as _queue
+        import threading as _threading
+
+        self._write_behind_queue: _queue.Queue = _queue.Queue(maxsize=max_pending)
+        stop = _threading.Event()
+        self._write_behind_stop = stop
+
+        def _drain() -> None:
+            # task_done() after every write lets a reader's queue.join()
+            # wait for rows this worker already dequeued — the flush path
+            # must never return while a row is in flight.
+            while True:
+                item = self._write_behind_queue.get()
+                try:
+                    if item is None or stop.is_set():
+                        return
+                    try:
+                        self.record_repair_event(**item)
+                    except Exception:  # pragma: no cover - defensive
+                        logger.warning("write-behind repair event failed", exc_info=True)
+                finally:
+                    self._write_behind_queue.task_done()
+
+        worker = _threading.Thread(
+            target=_drain, name="evidence-write-behind", daemon=True,
+        )
+        self._write_behind_worker = worker
+        self._write_behind = True
+        worker.start()
+
+    def close_write_behind(self, *, drain: bool = True, timeout: float = 5.0) -> None:
+        """Stop the background worker, optionally flushing the pending queue."""
+        worker = getattr(self, "_write_behind_worker", None)
+        if worker is None:
+            return
+        queue_obj = self._write_behind_queue
+        if drain:
+            try:
+                while True:
+                    item = queue_obj.get_nowait()
+                    if item is None:
+                        continue
+                    self.record_repair_event(**item)
+            except Exception:  # queue.Empty or a row failed — never raise from shutdown
+                logger.warning("write-behind drain failed", exc_info=True)
+        self._write_behind_stop.set()
+        queue_obj.put(None)  # wake the worker so it observes the stop flag
+        # The worker task_done()s the sentinel itself in its finally block.
+        worker.join(timeout=timeout)
+        self._write_behind = None
+        self._write_behind_worker = None
+        self._write_behind_queue = None
+        self._write_behind_stop = None
+
+    def record_repair_event_async(
+        self,
+        *,
+        route_id: str,
+        model_id: str,
+        client_id: str,
+        tool_name: str,
+        outcome: str,
+        repair_rules: Sequence[str] = (),
+    ) -> bool:
+        """Persist one repair-event row, via write-behind when installed.
+
+        Enqueues for the background worker when one is installed (the happy
+        path performs no synchronous disk write). WITHOUT a worker this is
+        exactly the synchronous ``record_repair_event`` — one fire-and-forget
+        entry point, no caller-side fallback branch to get wrong.
+
+        Returns True when the row was enqueued, False when it was written
+        synchronously or the queue was full. Never raises.
+        """
+        row = {
+            "route_id": route_id,
+            "model_id": model_id,
+            "client_id": client_id,
+            "tool_name": tool_name,
+            "outcome": outcome,
+            "repair_rules": list(repair_rules),
+        }
+        if self._write_behind:
+            try:
+                self._write_behind_queue.put_nowait(row)
+                return True
+            except Exception:
+                # Full queue: fall through to the synchronous write —
+                # keeping the row is better than dropping analytics.
+                pass
+        try:
+            self.record_repair_event(**row)
+        except Exception:
+            logger.warning("failed to record repair event", exc_info=True)
+        return False
+
+    def _flush_write_behind_for_read(self) -> None:
+        """Drain pending rows before a read so readers never miss accepted rows.
+
+        Drains the queue itself, then joins on the worker's in-flight items:
+        once this returns, every row accepted before the read started is
+        persisted — never a lost tail raced between worker and reader.
+        """
+        if not self._write_behind:
+            return
+        queue_obj = self._write_behind_queue
+        while True:
+            try:
+                item = queue_obj.get_nowait()
+            except Exception:
+                break
+            try:
+                if item is not None:
+                    self.record_repair_event(**item)
+            except Exception:
+                logger.warning("write-behind flush failed", exc_info=True)
+            finally:
+                queue_obj.task_done()
+        try:
+            queue_obj.join()
+        except Exception:  # pragma: no cover - defensive
+            pass
 
     def record_repair_event(
         self,
@@ -735,7 +873,11 @@ class EvidenceStore:
         `interop evidence list` — so a caller filtering by only
         ``route_id`` gets one group per distinct model/client pair
         observed for that route, not a merged total.
+
+        P1-G: drains the write-behind queue first so a reader never
+        observes a tail the store already accepted.
         """
+        self._flush_write_behind_for_read()
         query = (
             "SELECT route_id, model_id, client_id, outcome, repair_rules "
             "FROM repair_events WHERE 1=1"
@@ -789,6 +931,34 @@ class EvidenceStore:
             RepairStatsGroup(route_id=k[0], model_id=k[1], client_id=k[2], **v)
             for k, v in sorted(acc.items())
         ]
+
+
+def result_is_stale(result: CompatibilityResult | None) -> bool:
+    """Staleness of an ALREADY-FETCHED evidence record.
+
+    P1-G: the gateway's evidence gate calls get_result() and then is_stale(),
+    which re-fetched the same row — two SQLite round trips per request where
+    one suffices. This is the pure predicate over the fetched record; keep
+    the predicate logic IDENTICAL to the historical is_stale.
+    """
+    if result is None:
+        return True
+    if result.revoked:
+        return True
+    from datetime import datetime
+
+    reference = result.last_verified_at or result.tested_at or result.created_at
+    if not reference:
+        return True
+    try:
+        tested = datetime.fromisoformat(reference)
+        now = datetime.now(UTC)
+        if tested.tzinfo is None:
+            tested = tested.replace(tzinfo=UTC)
+        age_hours = (now - tested).total_seconds() / 3600.0
+    except (ValueError, OverflowError):
+        return True
+    return age_hours > result.passes_expiry_hours
 
 
 def capability_source(result: CompatibilityResult) -> str:

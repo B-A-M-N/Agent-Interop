@@ -68,21 +68,36 @@ There are exactly two release tracks:
 - **Supported / release-tested claim for a specific client** — requires a
   REAL run of `tests/acceptance/test_real_client_<client>.py` (opt-in, see
   `tests/acceptance/README.md`) to have produced an
-  `acceptance/results/<client-slug>-<version>.json` record. Until that
-  exists for a given client, `scripts/check_support_claims.sh` (step 16
-  above) fails the release gate the moment README/cli.py tries to claim
-  that tier for it — the CLI/README can never claim more than recorded
-  evidence supports, enforced mechanically rather than by convention.
+  `acceptance/results/<client-slug>-<version>.json` record. The record must
+  (a) set `real_backend: true` — i.e. the run exercised a real local model
+  backend (Ollama/vLLM/llama.cpp), not `ScriptedFakeTransport`; (b) prove
+  the per-request execution-nonce gate (`verification.nonce_gated_recovery`);
+  and (c) be bound to the current build — its `build.battery_version` and
+  `build.git_commit` must match `agent_interop.build_info.get_build_info()`,
+  checked mechanically by `scripts/check_support_claims.sh` (step 15 above).
+  An evidence file recorded against a different conformance battery or git
+  commit is stale and fails the gate until re-run. Until a client meets all
+  three, the README/client-status table must NOT claim the release-tested
+  tier for it — the gate fails the moment it does. The CLI/README can never
+  claim more than recorded evidence supports, enforced mechanically rather
+  than by convention.
 
-As of this writing, **Claude Code has a recorded acceptance run**:
-`acceptance/results/claude-code-2.1.220.json`, produced by an actual run
-of `tests/acceptance/test_real_client_claude.py` against the real
-`claude` binary (v2.1.220) — it launched with the exact `LaunchSpec`
-`interop run claude` builds, completed a full round trip through a live
-Interop gateway (request → tool call → tool result → final response),
-and passed. Codex and the generic-integration clients (Cline, OpenCode,
-Aider, Continue, Qwen Code) have no recorded run yet and stay on the
-alpha/unverified track until someone runs their harnesses for real.
+As of this writing, **no client meets the release-tested tier.** Claude
+Code has recorded acceptance runs (`acceptance/results/claude-code-2.1.220.json`,
+`claude-code-2.1.251.json`) produced by actual runs of
+`tests/acceptance/test_real_client_claude.py` against the real `claude`
+binary — they launched with the exact `LaunchSpec` `interop run claude`
+builds and completed a round trip through a live Interop gateway — but
+those runs drove a **scripted upstream** (`ScriptedFakeTransport`), so
+they sit at the "real client binary launched, scripted backend" tier, NOT
+release-tested: `real_backend` is false and the nonce gate did not run in
+those recordings. Reaching release-tested requires the
+`test_real_claude_real_ollama_small_model.py` gate (real ~7B model,
+`num_ctx <= 16,384`) to pass and record with `real_backend: true` and
+`verification.nonce_gated_recovery: true`. Codex and the
+generic-integration clients (Cline, OpenCode, Aider, Continue, Qwen Code)
+have no recorded run yet and stay on the alpha/unverified track until
+someone runs their harnesses for real.
 
 ### 2. Version bump
 

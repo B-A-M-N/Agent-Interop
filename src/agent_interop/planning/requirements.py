@@ -27,19 +27,36 @@ def derive_request_requirements(
     context: RequestContext,
     client_profile: Any,
     token_estimate: TokenEstimate,
+    *,
+    cost_snapshot: Any | None = None,
 ) -> RequestRequirements:
     """Build a request requirement vector without trusting an agent name.
 
     Tool-result history is an actual continuation requirement, even if the
     last tool choice is auto.  Integration constraints can only add required
     capabilities; they never erase requirements observed in the request.
+
+    ``cost_snapshot`` supplies the tool-schema byte count and fingerprint
+    from the request's single serialization pass; without it the canonical
+    schema JSON is serialized locally (compatibility path for callers
+    outside the gateway's planning pipeline).
     """
     requested = request.requested_capabilities
     tool_choice = request.tool_choice
-    schema_bytes = len(json.dumps(
-        [{"name": tool.name, "schema": tool.input_schema} for tool in request.tools],
-        sort_keys=True, default=str,
-    ).encode()) if request.tools else 0
+    if cost_snapshot is not None:
+        schema_bytes = cost_snapshot.tool_schema_bytes
+        schema_fingerprint = cost_snapshot.tool_schema_fingerprint
+    elif request.tools:
+        canonical_json = json.dumps(
+            [{"name": tool.name, "schema": tool.input_schema} for tool in request.tools],
+            sort_keys=True, default=str,
+        ).encode()
+        schema_bytes = len(canonical_json)
+        import hashlib
+        schema_fingerprint = hashlib.sha256(canonical_json).hexdigest()[:16]
+    else:
+        schema_bytes = 0
+        schema_fingerprint = ""
     # Client manifests describe capabilities for tool-bearing turns.  A plain
     # chat turn must not be rejected merely because the surrounding agent
     # normally requires tool-result continuation.
@@ -70,6 +87,7 @@ def derive_request_requirements(
         structured_output_required=bool(requested.structured_output),
         tool_count=len(request.tools),
         tool_schema_bytes=schema_bytes,
+        tool_schema_fingerprint=schema_fingerprint,
         estimated_input_tokens=token_estimate.input_tokens,
         requested_output_tokens=request.generation.max_output_tokens,
     )

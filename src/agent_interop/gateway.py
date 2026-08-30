@@ -21,13 +21,10 @@ Production path:
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import logging
-import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
 from typing import Any
 
 from agent_interop import __version__
@@ -41,53 +38,50 @@ from agent_interop.abi import (
     CanonicalStopReason,
     CanonicalTextBlock,
     CanonicalToolCallBlock,
-    CanonicalToolChoice,
-    CanonicalToolResultBlock,
     CanonicalUsage,
     RawToolCallCandidate,
     RepairStatus,
     ToolChoiceMode,
 )
+from agent_interop.admission import AdmissionConfig, InferenceAdmissionController
 from agent_interop.config import (
     InteropServerConfig,
     ModelRoute,
     RepairPolicy,
     ToolMode,
 )
+from agent_interop.context_budget.adaptation import (
+    AdaptationState,
+    run_context_adaptation,
+)
+from agent_interop.context_budget.meter import TokenMeter
+from agent_interop.context_store.executor import InternalToolExecutor
+from agent_interop.context_store.store import ContextStore
+from agent_interop.enums import RESERVED_INTERNAL_TOOL_PREFIX, ToolAuthority
 from agent_interop.errors import InteropErrorCode, classify_http_status
+from agent_interop.evidence.recorder import (
+    record_evidence_observation,
+    selected_evidence_key,
+)
 from agent_interop.evidence.store import EvidenceStore
 from agent_interop.execution import InteropRequestExecution
 from agent_interop.extraction import get_default_registry
 from agent_interop.history.reconcile import reconcile_history
+from agent_interop.history.summary import (
+    replace_compacted_history_with_controller_summary,
+)
 from agent_interop.model.registry import ModelProfileRegistry
 from agent_interop.model.registry import get_default_registry as get_default_profile_registry
-from agent_interop.repair.invocation import StreamExtractionMode, build_invocation_plan
-from agent_interop.replay.types import CompatibilityResult
-from agent_interop.streaming.coordinator import (
-    PendingToolCall,
-    StreamCoordinator,
-    StreamLimits,
-    ToolCallLimitExceeded,
-    ToolStreamKey,
-)
+from agent_interop.projection import rebuild_invocation_atomic
+from agent_interop.qualification import QualificationCoordinator, state_meets_controller_level
+from agent_interop.repair.invocation import build_invocation_plan
 from agent_interop.transaction import ToolBatchPolicy, ToolTransactionContext, process_tool_batch
 from agent_interop.transport.http import (
-    PreparedUpstreamRequest,
-    UpstreamResponseTooLargeError,
     UpstreamTransport,
 )
-from agent_interop.transport.ndjson import MalformedNDJSONLine
 from agent_interop.types import ServerInfo
 from agent_interop.upstreams.codec import (
     DecodedModelResponse,
-    DecodedStreamComplete,
-    DecodedStreamError,
-    DecodedStreamEvent,
-    DecodedTextDelta,
-    DecodedToolBatchComplete,
-    DecodedToolCallComplete,
-    DecodedToolFragment,
-    DecodedUsageUpdate,
 )
 from agent_interop.upstreams.registry import get_codec
 
@@ -100,6 +94,19 @@ MIN_EVIDENCE_SAMPLE_COUNT = 5
 
 
 # ─── ResolvedInvocation (P0.1 contract) ────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class PrivateCapabilityPlan:
+    """P0.7: Request-scoped set of private tools that may be used."""
+    read_result: bool = False
+    recall_history: bool = False
+    search_history: bool = False
+    get_tool_schema: bool = False
+
+    @property
+    def has_any(self) -> bool:
+        return bool(self.read_result or self.recall_history or self.search_history or self.get_tool_schema)
 
 
 @dataclass(frozen=True)
@@ -133,6 +140,27 @@ class ResolvedInvocation:
     context_plan: Any | None = None
     tool_surface_plan: Any | None = None
     compatibility_attempt: Any | None = None
+    authoritative_request: Any | None = None
+    model_request: Any | None = None
+    model_view: Any | None = None
+    # P0.4: Private capability plan — which __interop_* tools are usable.
+    private_capabilities: Any | None = None  # PrivateCapabilityPlan
+    # P0.4: The actual model-visible tool surface (client + selected private).
+    model_visible_tools: tuple[Any, ...] = ()
+    # P0.3/P0.6: ContextStore refs this request created/pinned. The gateway
+    # pins them for the WHOLE request lifecycle (private continuations may
+    # still need the data after the first worker generation) and unpins in
+    # the caller's finally block.
+    pinned_refs: tuple[str, ...] = ()
+
+
+def _no_private_capabilities() -> Any:
+    """Review #21: all-off PrivateCapabilityPlan for tool-free sub-requests
+    (controller primary worker turns).  Built lazily to avoid an import
+    cycle at module load."""
+    from agent_interop.projection.types import PrivateCapabilityPlan
+    return PrivateCapabilityPlan(read_result=False, recall_history=False,
+                                 search_history=False, get_tool_schema=False)
 
 
 def _canonicalize_json_ish(value: Any) -> str:
@@ -164,6 +192,112 @@ class Gateway:
     Dependency injection via constructor arguments enables tests to prove
     which codec, transport, profile, and evidence records were selected.
     """
+
+    @staticmethod
+    def prepare_model_request_for_attempt(
+        invocation: Any,
+        plan: Any,
+    ) -> Any:
+        """P0-1: Produce the canonical request the codec should render.
+
+        The codec is presentation-agnostic: it renders whatever tools are on
+        the request as a native tool array. The compatibility mode is applied
+        HERE, before rendering, so a PROMPTED/TEXTUAL/DISABLED attempt can
+        never leak private Interop tools (or client tools) into the native
+        array — a model being prompted precisely because native tools are
+        unreliable must not receive them back as a native surface.
+        """
+        from agent_interop.config import ToolMode
+
+        model_request = getattr(invocation, "model_request", None)
+        if model_request is None:
+            return model_request
+
+        mode = getattr(plan, "effective_tool_mode", ToolMode.NATIVE) if plan is not None else ToolMode.NATIVE
+
+        if mode == ToolMode.NATIVE:
+            return model_request
+
+        from dataclasses import replace
+        return replace(model_request, tools=[], tool_choice=None)
+
+    @staticmethod
+    def _classify_tool_authority(name: str) -> ToolAuthority:
+        """P0.4: Classify a tool call by execution authority."""
+        if name.startswith(RESERVED_INTERNAL_TOOL_PREFIX):
+            return ToolAuthority.INTEROP_INTERNAL
+        return ToolAuthority.CLIENT
+
+    @staticmethod
+    def _check_reserved_namespace_collision(tools: list[Any]) -> None:
+        """Reject client-declared tools that collide with Interop's reserved
+        private namespace.
+
+        The ``__interop_*`` prefix is Interop's execution boundary: the model
+        only ever sees internal tools that the private capability plan admits,
+        and their execution is resolved through the ContextStore — never
+        through client authority.  A client tool named ``__interop_evil``
+        would otherwise be projected onto the model surface as if it were
+        Interop infrastructure (and classified INTEROP_INTERNAL if the model
+        ever called it), bypassing the public/private firewall.
+        """
+        from agent_interop.enums import RESERVED_INTERNAL_TOOL_PREFIX as _prefix
+        for tool in tools or []:
+            name = getattr(tool, "name", "")
+            if isinstance(name, str) and name.startswith(_prefix):
+                raise ValueError(
+                    f"Client tool '{name}' uses the reserved '{_prefix}*' namespace "
+                    "(Interop private tools); rename the tool."
+                )
+
+    def _partition_accepted_by_authority(
+        self, decision: Any, session_id: str = "",
+    ) -> tuple[list[Any], list[Any]]:
+        """Split accepted tool-call blocks into (client, internal) by authority.
+
+        Unlike ``private_loop.partition_blocks_by_authority`` (which is
+        isinstance-strict as a firewall), this adapter partitions whatever the
+        transaction already accepted — authority here is a property of the
+        tool NAME, so real and validated-duck-typed blocks partition the same.
+        """
+        from agent_interop.enums import ToolAuthority
+        from agent_interop.private_loop import classify_tool_authority
+        client: list[Any] = []
+        internal: list[Any] = []
+        for block in getattr(decision, "accepted_blocks", ()) or ():
+            if classify_tool_authority(getattr(block, "name", "")) == ToolAuthority.INTEROP_INTERNAL:
+                internal.append(block)
+            else:
+                client.append(block)
+        return client, internal
+
+    @staticmethod
+    def _build_internal_tool_surface(base_tools, capabilities=None):
+        """P0.7: Append private Interop retrieval tools to the model-visible surface."""
+        existing = {t.name for t in base_tools}
+        from agent_interop.context_store.schema_tools import all_schema_tools
+        from agent_interop.context_store.tools import all_internal_tools
+        extra = []
+        if capabilities is None:
+            extra.extend(t for t in all_internal_tools() if t.name not in existing)
+            extra.extend(t for t in all_schema_tools() if t.name not in existing)
+        else:
+            if capabilities.read_result:
+                extra.extend(
+                    t for t in all_internal_tools()
+                    if t.name == "__interop_read_result" and t.name not in existing
+                )
+            if capabilities.recall_history or capabilities.search_history:
+                extra.extend(
+                    t for t in all_internal_tools()
+                    if t.name in ("__interop_recall_history", "__interop_search_history")
+                    and t.name not in existing
+                )
+            if capabilities.get_tool_schema:
+                extra.extend(
+                    t for t in all_schema_tools() if t.name not in existing
+                )
+        return list(base_tools) + extra
 
     def __init__(
         self,
@@ -209,32 +343,143 @@ class Gateway:
         # Keyed by route_id (not append-only) and cleared at the start of
         # every probe pass, so a route that stops failing doesn't leave its
         # earlier failure entries lingering alongside the new success.
-        self._probe_results: dict[str, dict[str, Any]] = {}
-        # Timestamped so /health/ready and /health can serve a cached
-        # snapshot instead of re-probing every configured backend (with a
-        # 10s-per-route timeout) on every single health check request —
-        # see _probe_routes()'s ttl handling.
-        self._probe_last_run: float = 0.0
-        self._probe_lock = asyncio.Lock()
+        from agent_interop.readiness import ReadinessProber
+
+        self._readiness = ReadinessProber(gateway=self)
+        from agent_interop.history.summary import ControllerHistorySummarizer
+
+        self._history_summarizer = ControllerHistorySummarizer(gateway=self)
         from agent_interop.controller import ControllerStateStore
 
         self._controller_state = ControllerStateStore()
         # Bootstrap qualification is deliberately scoped to the immutable
         # served-model identity. It informs low-risk presentation decisions;
         # it never enables semantic/coercive repair on its own.
-        self._qualification_records: dict[str, Any] = {}
-        self._qualification_locks: dict[str, asyncio.Lock] = {}
         # New schema-v2 configurations opt into durable diagnostics/state;
         # legacy programmatic setups retain the historical in-memory scope.
-        self._qualification_store: Any | None = None
+        qualification_store: Any | None = None
         if config.diagnostics.persist:
             from agent_interop.paths import qualification_file
             from agent_interop.qualification import QualificationStore
 
-            self._qualification_store = QualificationStore(qualification_file())
+            qualification_store = QualificationStore(qualification_file())
+        self._qualification = QualificationCoordinator(
+            gateway=self, store=qualification_store,
+        )
         from agent_interop.backends.runtime_cache import RuntimeCapabilityCache
 
-        self._runtime_capability_cache = RuntimeCapabilityCache()
+        self._runtime_capability_cache = RuntimeCapabilityCache(
+            ttl_seconds=config.runtime_inspection.ttl_seconds,
+        )
+        # P0-45: operational attempt-path hints.  NOT compatibility evidence —
+        # a short-lived "this serving tuple already failed native, prompted
+        # worked" note that only reorders ladder rungs the planner already
+        # permitted.  Keyed by the complete serving tuple; any change to
+        # model/template/serving/client/surface invalidates it.
+        from agent_interop.planning.hints import AttemptHintCache
+
+        self._attempt_hints = AttemptHintCache()
+
+        # P1.8: ONE planner for the gateway's lifetime so its plan cache can
+        # actually serve across requests — instantiating per request made
+        # the cache a permanent miss.
+        from agent_interop.planning import RequestCompatibilityPlanner
+
+        self._compatibility_planner = RequestCompatibilityPlanner()
+
+        # Resource initialization
+        rc = config.resources
+        self._context_store = ContextStore(
+            max_bytes_per_session=rc.max_bytes_per_session,
+            max_total_bytes=rc.max_total_bytes,
+            max_sessions=rc.max_sessions,
+            max_entry_bytes=rc.max_entry_bytes,
+            ttl_seconds=rc.ttl_seconds,
+        )
+        self._internal_executor = InternalToolExecutor(self._context_store)
+        self._admission_controller = InferenceAdmissionController(
+            AdmissionConfig(
+                max_concurrent_generations=rc.max_concurrent_generations,
+                max_queued_generations=rc.max_queued_generations,
+                queue_timeout_seconds=rc.admission_timeout_seconds,
+            ),
+        )
+        self._token_meter = TokenMeter(
+            backend_tokenizer_endpoint=getattr(config, "backend_tokenizer_endpoint", None)
+        )
+
+        # P1.13: THE single model-generation seam (render → gate → reserve →
+        # admit → transport → reconcile), extracted out of this class so the
+        # public, private, and streaming paths cannot drift on presentation,
+        # serialization, budgeting, or admission — the drift that produced
+        # the historical bypass/double-reservation bug class. One instance
+        # per gateway; it holds no request-scoped state.
+        from agent_interop.generation_seam import GenerationSeam
+
+        self._generation_seam = GenerationSeam(
+            gateway=self,
+            admission_controller=self._admission_controller,
+            token_meter=self._token_meter,
+            apply_invocation_plan=self._apply_invocation_plan_to_request,
+            build_upstream_headers=self._build_upstream_headers,
+        )
+
+        # P0.4/P0.5: the bounded private-tool continuation loop, extracted
+        # alongside the seam — the gateway supplies the machinery (step
+        # sending, internal execution authority, extraction, identity) and
+        # the loop owns the iteration/firewall discipline.
+        from agent_interop.private_loop import PrivateContinuationLoop
+
+        self._private_loop = PrivateContinuationLoop(
+            send_step=self._send_one_model_step,
+            internal_executor=self._internal_executor,
+            extract_candidates=self._extract_tool_candidates,
+            enabled_internal_tools=self._enabled_internal_tools,
+            request_identity=self._request_identity,
+        )
+
+        # The streaming engine: frame loop, tool-fragment accumulation,
+        # atomic batch decision, event emission, and the stream tail's
+        # budget reconciliation — extracted so the frame machinery is not
+        # Gateway's. The generation seam supplies the render/gate prologue
+        # so both dispatch paths render byte-identical bodies.
+        from agent_interop.stream_engine import StreamEngine
+
+        self._stream_engine = StreamEngine(
+            config=config,
+            admission_controller=self._admission_controller,
+            transport_provider=lambda: self.transport,
+            prepare_generation=self._prepare_model_generation,
+            context_limit_error=self._context_limit_error,
+            build_upstream_headers=self._build_upstream_headers,
+            disabled_tool_choice_conflict=self._disabled_tool_choice_conflict,
+            extract_tool_candidates=self._extract_tool_candidates,
+            dedup_tool_candidates=self._dedup_tool_candidates,
+            enabled_internal_tools=self._enabled_internal_tools,
+            private_loop=self._private_loop,
+            build_transaction_context=self._build_transaction_context,
+            record_repairs_to_session=self._record_repairs_to_session,
+            record_tool_decisions=self._record_tool_decisions,
+            record_evidence_observation=self._record_evidence_observation,
+            build_batch_rejection_error=self._build_batch_rejection_error,
+        )
+
+        # The controlled (controller-mediated) attempt loop: route selection,
+        # session turn budgets, work-product selection, decision cycle,
+        # tool-choice enforcement, provenance labelling.
+        from agent_interop.controller.attempt import ControllerAttemptExecutor
+
+        self._controller_attempt = ControllerAttemptExecutor(
+            gateway=self,
+            config=config,
+            controller_state=self._controller_state,
+            select_controller_route=self._select_controller_route,
+            inspect_model_runtime=self._inspect_model_runtime,
+            backend_metadata_from_runtime=self._backend_metadata_from_runtime,
+            resolve_profile=self._resolve_profile,
+            no_private_capabilities=_no_private_capabilities,
+        )
+
         from agent_interop.paths import diagnostic_cases_dir
         from agent_interop.replay.store import DiagnosticCaseStore
 
@@ -311,215 +556,31 @@ class Gateway:
             self.config.default_route_id,
         )
 
+        # P1-H: per-route admission caps are applied ONCE at startup — each
+        # route may tighten (never widen) the global
+        # resources.max_concurrent_generations for its own (backend URL,
+        # served model) key. Doing this here, not per request, keeps route
+        # resolution free of admission bookkeeping.
+        for route in self.config.routes.values():
+            route_capacity = getattr(route.upstream, "max_concurrent_generations", 0)
+            if route_capacity:
+                await self._admission_controller.set_route_capacity(
+                    route.upstream.base_url, route.upstream_model, route_capacity,
+                )
+
         if self.config.probe_on_startup:
             await self._probe_routes()
 
-    _PROBE_CONCURRENCY = 8
+        # P0-1: warm planning metadata concurrently with (or after) health
+        # probing so first-request latency carries no inspection cost.
+        # Metadata-only — never a behavioral generation.
+        await self._warm_runtime_metadata()
 
     async def _probe_routes(self, *, force: bool = False, ttl: float = 5.0) -> None:
-        """Refresh readiness state for every configured route, from a
-        cached snapshot when possible.
-
-        Previously this cleared and fully re-probed every route (each with
-        a 10s timeout) on EVERY call — and both /health/ready and /health
-        called it on every single request, so a slow or unreachable
-        backend meant every health check blocked for up to
-        ``10 * len(routes)`` seconds, sequentially. Now: a snapshot younger
-        than ``ttl`` seconds is served as-is; only a stale (or ``force``d)
-        snapshot triggers a real re-probe, and that re-probe runs all
-        routes CONCURRENTLY (bounded by _PROBE_CONCURRENCY) instead of one
-        at a time. An asyncio.Lock prevents two concurrent callers (e.g.
-        two health-check requests arriving while a probe is already in
-        flight) from each starting their own redundant full probe pass.
-        """
-        if not self.config.routes:
-            return
-
-        now = time.monotonic()
-        if not force and self._probe_results and (now - self._probe_last_run) < ttl:
-            return
-
-        async with self._probe_lock:
-            # Re-check inside the lock: another caller may have just
-            # finished refreshing while we were waiting for the lock.
-            now = time.monotonic()
-            if not force and self._probe_results and (now - self._probe_last_run) < ttl:
-                return
-
-            semaphore = asyncio.Semaphore(self._PROBE_CONCURRENCY)
-
-            async def _bounded_probe(route_id: str, route: ModelRoute) -> tuple[str, dict[str, Any]]:
-                async with semaphore:
-                    return route_id, await self._probe_one_route(route_id, route)
-
-            results = await asyncio.gather(
-                *(_bounded_probe(rid, r) for rid, r in self.config.routes.items())
-            )
-            self._probe_results = dict(results)
-            self._probe_last_run = time.monotonic()
-
-    async def _probe_one_route(self, route_id: str, route: ModelRoute) -> dict[str, Any]:
-        """Probe a single route's backend reachability, auth, model
-        presence, and profile resolution. Factored out of _probe_routes()
-        so routes can be probed concurrently via asyncio.gather."""
-        result: dict[str, Any] = {
-            "reachable": False,
-            "authenticated": False,
-            "model_present": None,  # None = backend exposes no inventory to check against
-            "codec_ready": False,
-            "profile_resolved": False,
-            "profile_id": None,
-            "profile_source": None,
-            "reason": "",
-        }
-
-        try:
-            codec = get_codec(route.upstream.wire_protocol)
-            result["codec_ready"] = True
-        except Exception as exc:
-            result["reason"] = f"codec resolution failed: {exc}"
-            return result
-
-        # Actually resolve a profile (cheap — no I/O) rather than
-        # hardcoding profile_resolved=True unconditionally: "resolved"
-        # now means "matched a real builtin/explicit profile", not merely
-        # "resolution didn't raise" — every model, even one nobody has
-        # ever seen, successfully resolves to the conservative fallback
-        # tier, so treating that as equivalent to a real match made the
-        # field report true for literally every route.
-        try:
-            resolved_profile = self._resolve_profile(route)
-            result["profile_id"] = getattr(resolved_profile, "profile_id", None)
-            result["profile_source"] = getattr(resolved_profile, "source", None)
-            result["profile_resolved"] = result["profile_source"] not in (None, "fallback")
-        except Exception as exc:
-            result["reason"] = f"profile resolution failed: {exc}"
-
-        try:
-            base_url = route.upstream.base_url.rstrip("/")
-            url = f"{base_url}{codec.probe_endpoint()}"
-            # Resolve upstream auth the SAME way real requests do (via the
-            # typed UpstreamAuthConfig mechanism) so probing, inference,
-            # streaming, and count_tokens all resolve auth identically —
-            # including the legacy api_key_env field.
-            auth_config = self._build_upstream_auth_config(route)
-            from agent_interop.auth import build_upstream_headers
-            headers = build_upstream_headers(
-                {}, auth_config, route.upstream.static_headers,
-            )
-            # Codec-required headers (Content-Type, etc.)
-            headers.update(codec.required_headers())
-
-            probe_request = PreparedUpstreamRequest(
-                method="GET",
-                url=url,
-                headers=headers,
-                stream=False,
-                timeout_seconds=10.0,
-            )
-            r = await self.transport.send(probe_request)
-            if r.transport_failed:
-                # The backend never actually answered — send() returns a
-                # synthetic status_code=503 after exhausting retries on a
-                # connect/timeout failure. That is NOT "reachable"; a
-                # real 503 response from a reachable backend also lands
-                # here as a normal status check below, distinguished by
-                # this flag rather than by status code alone.
-                result["reason"] = "unreachable (connection failed)"
-                logger.warning("route '%s' probe failed: unreachable", route_id)
-            elif r.status_code == 200:
-                result["reachable"] = True
-                result["authenticated"] = True
-                # Verify the configured model is present when the
-                # backend exposes model inventory (Ollama /api/tags
-                # style "models", OpenAI-compatible /v1/models "data").
-                models: list[str] = []
-                try:
-                    data = r.json()
-                    if "models" in data:
-                        models = [m.get("name", "") for m in data["models"]]
-                    elif "data" in data:
-                        models = [m.get("id", "") for m in data["data"]]
-                except Exception:
-                    pass
-                if models:
-                    from agent_interop.model_names import model_names_match
-                    # Tag-aware, not exact string match — the same
-                    # normalizer the managed launcher uses (model_names.py)
-                    # so "qwen3-coder" configured against a backend that
-                    # reports "qwen3-coder:latest" isn't reported missing.
-                    result["model_present"] = any(
-                        model_names_match(route.upstream_model, m) for m in models
-                    )
-                    if not result["model_present"]:
-                        result["reason"] = (
-                            f"model '{route.upstream_model}' not found in "
-                            f"backend inventory ({len(models)} available)"
-                        )
-                logger.info(
-                    "route '%s' probe OK — %d models", route_id, len(models),
-                )
-            elif r.status_code == 401:
-                result["reachable"] = True
-                result["reason"] = "unauthenticated"
-                logger.warning("route '%s' probe: unauthenticated", route_id)
-            else:
-                result["reachable"] = True
-                result["reason"] = f"probe returned status {r.status_code}"
-                logger.warning("route '%s' probe returned %d", route_id, r.status_code)
-        except Exception as exc:
-            result["reason"] = str(exc)
-            logger.warning("route '%s' probe failed: %s", route_id, exc)
-
-        return result
+        await self._readiness.probe_routes(force=force, ttl=ttl)
 
     def readiness(self) -> dict[str, Any]:
-        """Return structured per-route readiness from the most recent probe.
-
-        Distinct from liveness: a process can be alive (accepting
-        connections) while every route is unreachable, unauthenticated, or
-        missing its configured model. Call ``_probe_routes()`` first (or
-        rely on startup probing) for this to reflect live backend state —
-        a route with no probe on record reports not-ready with
-        reason="not probed", never a false "ok".
-        """
-        routes_status: dict[str, Any] = {}
-        for route_id in self.config.routes:
-            probed = self._probe_results.get(route_id)
-            if probed is None:
-                entry = {
-                    "reachable": False,
-                    "authenticated": False,
-                    "model_present": None,
-                    "codec_ready": False,
-                    "profile_resolved": False,
-                    "profile_id": None,
-                    "profile_source": None,
-                    "reason": "not probed",
-                }
-            else:
-                entry = dict(probed)
-            entry["ready"] = bool(
-                entry["reachable"]
-                and entry["authenticated"]
-                and entry["codec_ready"]
-                and entry["model_present"] is not False
-            )
-            routes_status[route_id] = entry
-
-        if self.config.default_route_id:
-            default_entry = routes_status.get(self.config.default_route_id)
-            overall_ready = bool(default_entry and default_entry["ready"])
-        else:
-            overall_ready = bool(routes_status) and all(
-                r["ready"] for r in routes_status.values()
-            )
-
-        return {
-            "ready": overall_ready,
-            "default_route": self.config.default_route_id,
-            "routes": routes_status,
-        }
+        return self._readiness.readiness()
 
     # ─── Server info ──────────────────────────────────────────────────────
 
@@ -549,8 +610,21 @@ class Gateway:
         """Resolve a model name to a route."""
         return self.config.get_route_for_model(model_name)
 
-    def _resolve_route(self, canonical: CanonicalRequest) -> ModelRoute:
-        """Resolve the route for a request, raising on unknown model."""
+    def _resolve_route(
+        self,
+        canonical: CanonicalRequest,
+        *,
+        route_override: ModelRoute | None = None,
+    ) -> ModelRoute:
+        """Resolve the route for a request, raising on unknown model.
+
+        ``route_override`` (review #22) lets an internal caller — currently
+        the bootstrap probe executor — run an isolated route configuration
+        (e.g. a forced tool_mode) WITHOUT mutating ``self.config.routes``.
+        The override must already be resolved; it is never registered.
+        """
+        if route_override is not None:
+            return route_override
         requested = canonical.model.requested_name
         route = self.config.get_route_for_model(requested)
         if route is None:
@@ -673,257 +747,17 @@ class Gateway:
         """Persist a single-request compatibility observation.
 
         Read-modify-write: merges this request's outcome into any existing
-        record for the exact compatibility tuple. Per-tool-call counters are
-        accumulated exactly (each decision contributes one unit, so a request
-        with 10 decisions moves the aggregate 10x as far as one with 1) and
-        the rate fields are re-derived from the merged counters — rates are
-        never averaged in per-request space. Verification state
-        (``manually_verified`` / ``last_verified_at``) and revocation state
-        are never touched by live traffic, so a live request can never
-        auto-verify, refresh the certification clock, or un-revoke a record.
-        Pre-v4 records that stored rates without counters are seeded from
-        their stored rates before merging, so historical data is preserved.
-        ``task_completion_rate`` is not derivable from a single live
-        request, so it is left at the existing value (or 0.0 for a
-        brand-new record) rather than being guessed.
-
-        A persistence failure must never break the client request, so the
-        whole operation is wrapped to log and swallow.
+        record for the exact compatibility tuple (see
+        ``agent_interop.evidence.recorder`` for the merge rules: exact
+        per-decision counters, pre-v4 seeding, rate re-derivation, and the
+        never-touch-certification-state rule). A persistence failure must
+        never break the client request, so the whole operation is wrapped
+        to log and swallow.
         """
         store = self._evidence_store
         if store is None:
             return
-        try:
-            self._record_evidence_observation_inner(invocation, execution, store)
-        except Exception:
-            logger.warning("failed to record compatibility evidence", exc_info=True)
-
-    def _record_evidence_observation_inner(
-        self,
-        invocation: ResolvedInvocation,
-        execution: InteropRequestExecution,
-        store: EvidenceStore,
-    ) -> None:
-        key = self._selected_evidence_key(invocation, execution)
-        if key is None:
-            return
-
-        decisions = execution.tool_decisions
-        n = len(decisions)
-
-        # One row per tool-call decision, for `interop repair stats`.
-        # Same opt-in gate as the rest of this method (evidence store must
-        # be configured) and the same swallow-and-log discipline —
-        # analytics persistence must never break the request that
-        # triggered it.
-        route_id = invocation.route.id if invocation.route is not None else ""
-        for d in decisions:
-            try:
-                store.record_repair_event(
-                    route_id=route_id,
-                    model_id=key.model_id,
-                    client_id=key.client_id,
-                    tool_name=d.tool_name,
-                    outcome=d.outcome_status,
-                    repair_rules=d.repair_steps,
-                )
-            except Exception:
-                logger.warning("failed to record repair event", exc_info=True)
-
-        # Per-request OBSERVATION captured as COUNTERS (one unit per tool-call
-        # decision), not as rates. This is what lets the merge weight each
-        # call equally: a request with 10 decisions moves the aggregate 10x
-        # as far as a request with 1. Rates are re-derived from the merged
-        # counters below, never averaged in per-request space.
-        #
-        # task_completion_rate is deliberately excluded — it cannot be observed
-        # from a single live request, so folding a guessed 0.0 into the
-        # aggregate would only degrade an existing value.
-        if n == 0:
-            # Tools were offered but the model produced no tool-call decision
-            # (e.g. it replied with text). No candidate calls to count — only
-            # the no-selection signal is recorded.
-            observation: dict[str, int | bool] = {
-                "candidate_count": 0,
-                "valid_unchanged_count": 0,
-                "repaired_count": 0,
-                "regenerated_count": 0,
-                "accepted_count": 0,
-                "rejected_count": 0,
-                "no_selection": True,
-            }
-        else:
-            valid_unchanged = sum(
-                1 for d in decisions
-                if d.outcome_status == RepairStatus.VALID_UNCHANGED.value
-            )
-            repaired = sum(
-                1 for d in decisions
-                if d.outcome_status == RepairStatus.REPAIRED.value
-            )
-            regenerated = sum(
-                1 for d in decisions
-                if d.outcome_status == RepairStatus.REGENERATED.value
-            )
-            accepted = sum(1 for d in decisions if d.accepted)
-            observation = {
-                "candidate_count": n,
-                "valid_unchanged_count": valid_unchanged,
-                "repaired_count": repaired,
-                "regenerated_count": regenerated,
-                "accepted_count": accepted,
-                "rejected_count": (n - accepted),
-                "no_selection": False,
-            }
-
-        existing = store.get_result(key)
-        now = datetime.now(UTC).isoformat()
-
-        if existing is not None:
-            new_n = existing.sample_count + 1
-
-            # ── Migration / seeding for pre-v4 records ─────────────────────
-            # A record written before this fix (or seeded directly by a
-            # pre-existing test) stores rates but has candidate_count == 0.
-            # Seed the counters from the stored rates BEFORE adding this
-            # request's contribution, so historical data isn't silently
-            # discarded. The sample_count guard ensures we only seed when
-            # there is something to seed from.
-            if existing.candidate_count == 0 and existing.no_selection_request_count == 0 and existing.sample_count > 0:
-                seed_n = existing.sample_count
-                seed_candidate_count = seed_n
-                seed_valid_unchanged_count = round(
-                    existing.valid_call_rate_before_repair * seed_n
-                )
-                seed_repaired_count = round(
-                    existing.deterministic_repair_rate * seed_n
-                )
-                seed_regenerated_count = round(
-                    existing.regeneration_rate * seed_n
-                )
-                seed_accepted_count = round(
-                    existing.valid_call_rate_after_repair * seed_n
-                )
-                seed_rejected_count = round(existing.rejection_rate * seed_n)
-                seed_no_selection = round(
-                    (1.0 - existing.tool_selection_rate) * seed_n
-                )
-            else:
-                # Genuine v4 record: pass existing counters through unchanged.
-                seed_candidate_count = existing.candidate_count
-                seed_valid_unchanged_count = existing.valid_unchanged_count
-                seed_repaired_count = existing.repaired_count
-                seed_regenerated_count = existing.regenerated_count
-                seed_accepted_count = existing.accepted_count
-                seed_rejected_count = existing.rejected_count
-                seed_no_selection = existing.no_selection_request_count
-
-            # Accumulate this request's counters on top of the seed.
-            c_candidate = seed_candidate_count + observation["candidate_count"]
-            c_valid_unchanged = (
-                seed_valid_unchanged_count + observation["valid_unchanged_count"]
-            )
-            c_repaired = seed_repaired_count + observation["repaired_count"]
-            c_regenerated = (
-                seed_regenerated_count + observation["regenerated_count"]
-            )
-            c_accepted = seed_accepted_count + observation["accepted_count"]
-            c_rejected = seed_rejected_count + observation["rejected_count"]
-            c_no_selection = seed_no_selection + (
-                1 if observation["no_selection"] else 0
-            )
-
-            # Derive rates fresh from the merged counters. Guard
-            # divide-by-zero: a record with zero candidates has 0.0 rates.
-            # Rates are passed as explicit kwargs (not a ``**dict`` spread)
-            # so mypy can verify each field's type — a ``dict[str, float]``
-            # spread is not assignable to the dataclass's per-field types.
-            result = replace(
-                existing,
-                sample_count=new_n,
-                last_observed_at=now,
-                candidate_count=c_candidate,
-                valid_unchanged_count=c_valid_unchanged,
-                repaired_count=c_repaired,
-                regenerated_count=c_regenerated,
-                accepted_count=c_accepted,
-                rejected_count=c_rejected,
-                no_selection_request_count=c_no_selection,
-                valid_call_rate_before_repair=(
-                    c_valid_unchanged / c_candidate if c_candidate else 0.0
-                ),
-                valid_call_rate_after_repair=(
-                    c_accepted / c_candidate if c_candidate else 0.0
-                ),
-                deterministic_repair_rate=(
-                    c_repaired / c_candidate if c_candidate else 0.0
-                ),
-                regeneration_rate=(
-                    c_regenerated / c_candidate if c_candidate else 0.0
-                ),
-                rejection_rate=(
-                    c_rejected / c_candidate if c_candidate else 0.0
-                ),
-                tool_selection_rate=(
-                    (new_n - c_no_selection) / new_n if new_n else 0.0
-                ),
-            )
-            # replace() only overrides the fields passed in, so
-            # manually_verified / revoked / revocation_reason / created_at /
-            # tested_at / last_verified_at are preserved from the existing
-            # record unchanged. CRUCIALLY we do NOT set tested_at or
-            # last_verified_at here — live traffic must never refresh the
-            # certification clock. last_observed_at tracks only that we saw
-            # this tuple, for informational purposes.
-        else:
-            # Brand-new record from live traffic alone. tested_at /
-            # last_verified_at are intentionally left at their defaults ("")
-            # — a live-only record was never certified. The trust gate
-            # (gateway.py _prepare_invocation) already requires
-            # manually_verified=True before a record is trusted, so an
-            # uncertified live-only record can never be activated.
-            c_candidate = observation["candidate_count"]
-            result = CompatibilityResult(
-                sample_count=1,
-                created_at=now,
-                last_observed_at=now,
-                manually_verified=False,
-                revoked=False,
-                candidate_count=c_candidate,
-                valid_unchanged_count=observation["valid_unchanged_count"],
-                repaired_count=observation["repaired_count"],
-                regenerated_count=observation["regenerated_count"],
-                accepted_count=observation["accepted_count"],
-                rejected_count=observation["rejected_count"],
-                no_selection_request_count=(
-                    1 if observation["no_selection"] else 0
-                ),
-                valid_call_rate_before_repair=(
-                    observation["valid_unchanged_count"] / c_candidate
-                    if c_candidate else 0.0
-                ),
-                valid_call_rate_after_repair=(
-                    observation["accepted_count"] / c_candidate
-                    if c_candidate else 0.0
-                ),
-                deterministic_repair_rate=(
-                    observation["repaired_count"] / c_candidate
-                    if c_candidate else 0.0
-                ),
-                regeneration_rate=(
-                    observation["regenerated_count"] / c_candidate
-                    if c_candidate else 0.0
-                ),
-                rejection_rate=(
-                    observation["rejected_count"] / c_candidate
-                    if c_candidate else 0.0
-                ),
-                tool_selection_rate=(
-                    0.0 if observation["no_selection"] else 1.0
-                ),
-            )
-
-        store.store_result(key, result)
+        record_evidence_observation(invocation, execution, store)
 
     # ─── Request preparation (P0.1 contract) ───────────────────────────
 
@@ -969,6 +803,7 @@ class Gateway:
         streaming: bool,
         *,
         inspect_runtime: bool = True,
+        cost_snapshot: Any | None = None,
     ) -> tuple[Any, Any, RepairPolicy, Any, Any, Any, Any, Any, Any]:
         """Resolve backend metadata, model profile, repair policy, invocation
         plan, and the authoritative compatibility key for an already-routed
@@ -980,6 +815,9 @@ class Gateway:
 
         The ``route`` must already be resolved; ``request`` should be the
         history-reconciled request that will actually be sent upstream.
+        ``cost_snapshot`` is the caller's single serialization pass over
+        that same request — when supplied, planning and key fingerprinting
+        consume it instead of re-serializing.
 
         Returns:
             (backend_metadata, model_profile, repair_policy, invocation_plan,
@@ -1001,12 +839,11 @@ class Gateway:
 
         from agent_interop.agents.base import ClientRequirementProfile
         from agent_interop.agents.manifests import load_builtin_descriptor
-        from agent_interop.planning import RequestCompatibilityPlanner
         behavioral = self._behavioral_capabilities(runtime_capabilities)
         descriptor = load_builtin_descriptor(getattr(context, "client_id", ""))
         client_requirements = descriptor.required_capabilities if descriptor else ClientRequirementProfile()
         planning_route = route if route.controller is not None else replace(route, controller=self.config.controller)
-        compatibility_plan = await RequestCompatibilityPlanner().plan(
+        compatibility_plan = await self._compatibility_planner.plan(
             request=request,
             context=context,
             route=planning_route,
@@ -1014,6 +851,10 @@ class Gateway:
             codec_capabilities=codec.capabilities(),
             runtime_capabilities=runtime_capabilities,
             behavioral_capabilities=behavioral,
+            # P0.19 (review #13/#14): operator policy flows from server config
+            unknown_capacity_policy=self.config.resources.unknown_capacity_policy,
+            unknown_capacity_fallback_tokens=self.config.resources.unknown_capacity_fallback_tokens,
+            cost_snapshot=cost_snapshot,
         )
         context_plan = compatibility_plan.context_plan
         tool_surface_plan = compatibility_plan.tool_surface_plan
@@ -1095,6 +936,12 @@ class Gateway:
             issue_messages = "; ".join(i.message for i in validation_issues)
             raise ValueError(f"Invalid tool contract: {issue_messages}")
 
+        # P0.4 (review: private-tool authority): the reserved __interop_*
+        # namespace is Interop's execution boundary. Enforce the collision
+        # check against the CLIENT DECLARATION (not the reduced surface) so a
+        # withheld-by-surface-reduction colliding tool is still rejected.
+        self._check_reserved_namespace_collision(list(request.tools))
+
         # Construct repair policy with confidence gating.
         repair_policy = RepairPolicy.from_config(route.repair)
         profile_confidence = getattr(model_profile, 'source_confidence', 0.5) if model_profile else 0.5
@@ -1114,8 +961,13 @@ class Gateway:
             validation_tools=tool_surface_plan.validation_tools,
         )
 
-        # Compute compatibility key.
-        tool_schema_fingerprint = self._compute_tool_schema_fingerprint(request.tools)
+        # Compute compatibility key. P1-F: the fingerprint comes from the
+        # request's single serialization snapshot (identical canonical form)
+        # — local fallback preserves the standalone diagnostic path.
+        if cost_snapshot is not None and cost_snapshot.tool_schema_fingerprint:
+            tool_schema_fingerprint = cost_snapshot.tool_schema_fingerprint
+        else:
+            tool_schema_fingerprint = self._compute_tool_schema_fingerprint(request.tools)
         compat_key = build_compatibility_key(CompatibilityKeyInputs(
             # Pass the context OBJECT, not context.client_id — the builder reads
             # .client_id/.client_version/.client_protocol off it. Passing the
@@ -1220,28 +1072,9 @@ class Gateway:
         context_plan: Any,
         summary: str,
     ) -> CanonicalRequest:
-        """Replace only planner-approved old turns with an explicit summary.
-
-        The context planner has already excluded system/developer messages,
-        the latest user turn, and the current tool exchange from its compacted
-        indices.  Keeping this mutation here makes the lossy step visible and
-        auditable, instead of allowing a controller response to silently
-        overwrite arbitrary canonical history.
-        """
-        compacted = set(context_plan.compacted_message_indices)
-        messages = [
-            message for index, message in enumerate(request.messages)
-            if index not in compacted
-        ]
-        system = [*request.system, CanonicalTextBlock(
-            text=(
-                "Interop controller summary of older conversation history. "
-                "It is incomplete; retain and prioritize all unsummarized "
-                "system/developer instructions and current tool results.\n\n"
-                f"{summary.strip()}"
-            ),
-        )]
-        return replace(request, system=system, messages=messages)
+        return replace_compacted_history_with_controller_summary(
+            request, context_plan, summary,
+        )
 
     async def _summarize_old_history_with_controller(
         self,
@@ -1251,94 +1084,16 @@ class Gateway:
         context: Any,
         context_plan: Any,
         inspect_runtime: bool,
+        execution: InteropRequestExecution | None = None,
     ) -> CanonicalRequest | None:
-        """Ask a qualified, sufficiently large controller to summarize old turns.
-
-        This is deliberately an opt-in *last* context adaptation.  It runs
-        only after deterministic safe tool-result reduction failed, only when
-        the controller can hold the original no-tool request itself, and only
-        replaces message indices the context planner already marked as old.
-        Unknown capacity, an unqualified controller, a controller error, or
-        an empty/non-text summary all leave the request untouched.
-        """
-        effective_controller = route.controller or self.config.controller
-        if not (
-            route.context.allow_controller_decomposition
-            and effective_controller.enabled
-            and context_plan.compacted_message_indices
-        ):
-            return None
-        controller_route = await self._select_controller_route(route, effective_controller)
-        if controller_route is None:
-            return None
-
-        from agent_interop.context_budget import effective_context_limit
-        from agent_interop.context_budget.estimator import estimate_request_context
-
-        controller_runtime = (
-            await self._inspect_model_runtime(controller_route)
-            if inspect_runtime else self._static_runtime_capabilities(controller_route)
+        return await self._history_summarizer.summarize(
+            route=route,
+            request=request,
+            context=context,
+            context_plan=context_plan,
+            inspect_runtime=inspect_runtime,
+            execution=execution,
         )
-        controller_limit = effective_context_limit(
-            controller_runtime.architecture_context_tokens,
-            controller_runtime.configured_context_tokens,
-            controller_route.context.context_limit_tokens,
-            controller_runtime.effective_context_tokens,
-        )
-        # No observed capacity means no proof that a summary call is safe.
-        if not controller_limit:
-            return None
-
-        summary_generation = replace(
-            request.generation,
-            stream=False,
-            max_output_tokens=min(512, max(64, request.generation.max_output_tokens)),
-        )
-        summary_request = replace(
-            request,
-            model=replace(request.model, requested_name=controller_route.id),
-            system=[*request.system, CanonicalTextBlock(
-                text=(
-                    "Summarize only the older conversation history for a later "
-                    "coding-model turn. Preserve file paths, tool-call IDs, error "
-                    "outcomes, edits, and unresolved requirements. Do not claim any "
-                    "tool was executed. Return concise plain text only."
-                ),
-            )],
-            tools=[],
-            tool_choice=CanonicalToolChoice.none(),
-            generation=summary_generation,
-        )
-        summary_required = estimate_request_context(
-            summary_request,
-            visible_tools=(),
-            output_reserve_tokens=summary_generation.max_output_tokens,
-        ).total_required_tokens
-        if summary_required > int(controller_limit * 0.90):
-            return None
-
-        summary_context = replace(context, route_id=controller_route.id)
-        summary_execution = InteropRequestExecution(context=summary_context)
-        try:
-            summary_invocation = await self._prepare_invocation_async(
-                summary_request,
-                summary_context,
-                streaming=False,
-                execution=summary_execution,
-                inspect_runtime=inspect_runtime,
-                allow_controller_summary=False,
-            )
-            response = await self._handle_request_send(summary_invocation, summary_execution)
-        except (ValueError, RuntimeError):
-            return None
-        if response.error is not None:
-            return None
-        text = "\n".join(
-            block.text for block in response.content if isinstance(block, CanonicalTextBlock)
-        ).strip()
-        if not text:
-            return None
-        return self._replace_compacted_history_with_controller_summary(request, context_plan, text)
 
     async def _prepare_invocation_async(
         self,
@@ -1349,6 +1104,7 @@ class Gateway:
         *,
         inspect_runtime: bool = True,
         allow_controller_summary: bool = True,
+        route_override: ModelRoute | None = None,
     ) -> ResolvedInvocation:
         """Prepare a resolved invocation for one request (P0.1).
 
@@ -1367,11 +1123,20 @@ class Gateway:
         """
         from agent_interop.repair.pipeline import RepairBudget
 
-        # 1-3. Resolve the route
-        route = self._resolve_route(request)
+        # 1-3. Resolve the route (explicit override for internal probes —
+        # review #22; never registers anything in self.config)
+        route = self._resolve_route(request, route_override=route_override)
         # Attach to the caller-supplied execution record as soon as it is
         # available so it is populated even on the early-exit branches below.
         execution.route = route
+
+        # 3.25 Config-level contradiction check BEFORE any I/O: a DISABLED
+        # route + REQUIRED/NAMED choice can never be satisfied, and refusing
+        # it here means the request triggers no metadata inspection, no
+        # probe, and no generation — the backend is never contacted at all.
+        conflict = self._config_tool_choice_conflict(route, request)
+        if conflict is not None:
+            raise ValueError(f"TOOL_CHOICE_VIOLATION: {conflict.message}")
 
         # 3.5 Check for session loop (before expensive preparation)
         session_state = self._get_session_state(context)
@@ -1421,7 +1186,20 @@ class Gateway:
             )
 
         from dataclasses import replace
-        reconciled_request = replace(request, messages=history_result.messages)
+        # P0-4: the AUTHORITATIVE request is frozen immediately after history
+        # reconciliation. It carries the client's semantics + reconciled
+        # history ONLY — never virtualized results, paged history, or
+        # model-generated summaries. All capacity adaptation below operates
+        # on a separate projected request.
+        authoritative_request = replace(request, messages=history_result.messages)
+        reconciled_request = authoritative_request
+
+        # P1-F (review item 29): the request's ONE full serialization pass.
+        # System/history/tool-schema costs and the canonical tool-schema
+        # fingerprint come from this snapshot; the planning pipeline and the
+        # compatibility key below consume it instead of each re-serializing.
+        from agent_interop.context_budget import build_request_cost_snapshot
+        cost_snapshot = build_request_cost_snapshot(reconciled_request)
 
         # Resolve the codec up front — it only depends on the route (already in
         # hand) and is needed for the ResolvedInvocation returned below.
@@ -1437,66 +1215,59 @@ class Gateway:
             await self._resolve_invocation_plan_and_key_async(
                 route, reconciled_request, context, streaming,
                 inspect_runtime=inspect_runtime,
+                cost_snapshot=cost_snapshot,
             )
         )
+        # P0-4: the projected request is what adaptation is allowed to
+        # reshape. It starts equal to the authoritative request and diverges
+        # only through explicit, recorded transformations.
+        projected_request = authoritative_request
+        # Track what this request's adaptation did — drives private read_result
+        # capability and ref pinning below.
+        from agent_interop.context_budget.compaction import ContextAdaptationResult
+        # P1.1: the request lifecycle is the TTL cleanup hook — a store that
+        # is never swept by traffic would otherwise only evict on insert.
+        self._context_store.evict_expired()
+        adaptation = ContextAdaptationResult(projected_request)
+        # Refs accumulated by this function's own adaptation passes (result
+        # virtualization lands in adaptation.stored_refs; history paging in
+        # history_page_refs). Both are seeded into the final projection.
+        history_page_refs: tuple[str, ...] = ()
         if context_plan.compaction_required:
-            # Planning alone is not capacity enforcement.  Apply the narrowly
-            # safe, deterministic adaptation (only historical pageable tool
-            # output), then re-plan against the exact request we will render.
-            # Nothing else is discarded or summarized implicitly.
-            from agent_interop.context_budget import (
-                ContextLimitExceededError,
-                compact_safe_tool_results,
+            adapt = AdaptationState(
+                projected_request=projected_request,
+                cost_snapshot=cost_snapshot,
+                adaptation=adaptation,
+                backend_metadata=backend_metadata,
+                model_profile=model_profile,
+                repair_policy=repair_policy,
+                plan=plan,
+                compat_key=compat_key,
+                runtime_capabilities=runtime_capabilities,
+                behavioral=behavioral,
+                compatibility_plan=compatibility_plan,
+                context_plan=context_plan,
             )
-
-            adaptation = compact_safe_tool_results(
-                reconciled_request,
-                exchanges=history_result.exchanges,
-                plan=context_plan,
+            await run_context_adaptation(
+                self, adapt,
+                route=route, context=context, history_result=history_result,
+                streaming=streaming, inspect_runtime=inspect_runtime,
+                allow_controller_summary=allow_controller_summary,
+                execution=execution,
             )
-            if adaptation.changed:
-                reconciled_request = adaptation.request
-                execution.record_compatibility_event(
-                    "context_adaptation:" + ",".join(adaptation.transformations)
-                )
-                (
-                    backend_metadata, model_profile, repair_policy, plan,
-                    compat_key, runtime_capabilities, behavioral,
-                    compatibility_plan, context_plan,
-                ) = await self._resolve_invocation_plan_and_key_async(
-                    route, reconciled_request, context, streaming,
-                    inspect_runtime=inspect_runtime,
-                )
-            if context_plan.compaction_required and allow_controller_summary:
-                summarized_request = await self._summarize_old_history_with_controller(
-                    route=route,
-                    request=reconciled_request,
-                    context=context,
-                    context_plan=context_plan,
-                    inspect_runtime=inspect_runtime,
-                )
-                if summarized_request is not None:
-                    reconciled_request = summarized_request
-                    execution.record_compatibility_event("context_adaptation:controller_summary_old_history")
-                    history_result = reconcile_history(
-                        reconciled_request.messages,
-                        session_id=getattr(context, "session_id", "") or "",
-                        request_id=getattr(context, "request_id", "") or request.request_id or "",
-                    )
-                    (
-                        backend_metadata, model_profile, repair_policy, plan,
-                        compat_key, runtime_capabilities, behavioral,
-                        compatibility_plan, context_plan,
-                    ) = await self._resolve_invocation_plan_and_key_async(
-                        route, reconciled_request, context, streaming,
-                        inspect_runtime=inspect_runtime,
-                    )
-            if context_plan.compaction_required:
-                attempted = tuple(dict.fromkeys(
-                    (*context_plan.transformations, *adaptation.transformations)
-                ))
-                execution.record_compatibility_event("context_limit_exceeded")
-                raise ContextLimitExceededError(context_plan, attempted)
+            projected_request = adapt.projected_request
+            cost_snapshot = adapt.cost_snapshot
+            adaptation = adapt.adaptation
+            history_page_refs = adapt.history_page_refs
+            backend_metadata = adapt.backend_metadata
+            model_profile = adapt.model_profile
+            repair_policy = adapt.repair_policy
+            plan = adapt.plan
+            compat_key = adapt.compat_key
+            runtime_capabilities = adapt.runtime_capabilities
+            behavioral = adapt.behavioral
+            compatibility_plan = adapt.compatibility_plan
+            context_plan = adapt.context_plan
         if not compatibility_plan.attempts:
             raise ValueError(
                 "REQUEST_PLAN_UNAVAILABLE: no direct, adapted, or configured controller path "
@@ -1505,18 +1276,29 @@ class Gateway:
         execution.invocation_plan = plan
         execution.compatibility_key = compat_key
 
+        # P0-4: the authoritative request stays frozen as established above
+        # (client semantics + reconciled history ONLY). The projected request
+        # carries every recorded transformation from this point on — result
+        # virtualization, history paging, and the controller summary are real
+        # work paid for below and must never be discarded by re-deriving the
+        # projection from authoritative state here. The single authoritative
+        # initialization lives at the top of this function.
+
         # Look up verified evidence for this exact tuple (opt-in only). A record
         # only qualifies when it is present, manually verified, not revoked, not
         # stale, and backed by a sufficient sample base. Absent that, packs must
         # NOT be activated on a merely well-formed key.
+        # P1-G: ONE fetch — the historical form read the row, then is_stale()
+        # re-read the identical row before evaluating it.
         evidence_record = None
         if self._evidence_store is not None:
+            from agent_interop.evidence.store import result_is_stale
+
             candidate = self._evidence_store.get_result(compat_key)
             if (
                 candidate is not None
                 and candidate.manually_verified
-                and not candidate.revoked
-                and not self._evidence_store.is_stale(compat_key)
+                and not result_is_stale(candidate)
                 and candidate.sample_count >= MIN_EVIDENCE_SAMPLE_COUNT
             ):
                 evidence_record = candidate
@@ -1525,10 +1307,41 @@ class Gateway:
         repair_budget = RepairBudget()
         execution.repair_budget = repair_budget
 
+        # P0-5: ModelProjector.project() is the SOLE projection authority.
+        # The gateway no longer hand-builds the model-facing request; the
+        # projector owns result virtualization carried in `adaptation`,
+        # history paging, system projection, tool-surface selection, private
+        # capabilities, the withheld-tool index, and the ModelView. The
+        # gateway only orchestrates ordering and owns ref pinning.
+        from agent_interop.projection import ModelProjector
+        projection = ModelProjector.project(
+            authoritative_request=authoritative_request,
+            route=route,
+            runtime_capabilities=runtime_capabilities,
+            compatibility_plan=compatibility_plan,
+            policy=None,
+            context_store=self._context_store,
+            session_context=context,
+            perform_history_paging=False,
+            adaptation=adaptation if adaptation.changed else None,
+            invocation_plan=plan,
+            # P0-4: the projection pipeline continues from the request this
+            # function's adaptation actually produced (virtualized results,
+            # paged history, controller summary). Re-deriving from the
+            # authoritative request would silently discard that paid work.
+            projected_request=projected_request,
+            seed_refs=tuple(dict.fromkeys((*adaptation.stored_refs, *history_page_refs))),
+        )
+        model_request = projection.request
+        model_view = projection.model_view
+        private_caps = projection.private_capabilities
+        # Every ref the projected request exposes — gateway-adapted, result
+        # virtualization, and history paging — participates in pinning.
+        virtualized_refs = projection.referenced_refs
+
         resolved_invocation = ResolvedInvocation(
             request_context=context,
             original_request=request,
-            reconciled_request=reconciled_request,
             route=route,
             backend_metadata=backend_metadata,
             model_profile=model_profile,
@@ -1545,6 +1358,16 @@ class Gateway:
             compatibility_plan=compatibility_plan,
             context_plan=context_plan,
             tool_surface_plan=compatibility_plan.tool_surface_plan,
+            # P0-4: authoritative vs projected are distinct fields with
+            # distinct meanings — validation/audit reads authoritative,
+            # rendering reads model_request.
+            authoritative_request=authoritative_request,
+            reconciled_request=projected_request,
+            model_request=model_request,
+            model_view=model_view,
+            private_capabilities=private_caps,
+            model_visible_tools=tuple(model_request.tools),
+            pinned_refs=virtualized_refs,
         )
         execution.configure_token_efficiency(resolved_invocation)
         return resolved_invocation
@@ -1564,31 +1387,66 @@ class Gateway:
         """
         exec_record = InteropRequestExecution(context=context)
         try:
+            # P0-16: the budget exists BEFORE preparation — every model
+            # generation on this request (public attempt, private
+            # continuation, controller turn) spends against the same
+            # ledger, and preparation itself can consult it.  The route's
+            # attempt ceiling is stamped in as soon as the route is known.
+            from agent_interop.execution_attempts import AttemptBudget
+
+            budget = AttemptBudget()
+            exec_record.attempt_budget = budget
             # Prepare the resolved invocation (passes in the shared record so
             # diagnostics/route/plan all land on the object that gets finalized)
             invocation = await self._prepare_invocation_async(
                 canonical, context, streaming=False, execution=exec_record,
             )
             if await self._ensure_bootstrap_qualification(invocation):
-                # Qualification contributes only low-risk behavior evidence;
-                # rebuild the request plan so it can select the now-proven
-                # presentation path before its first real execution.
-                invocation = await self._prepare_invocation_async(
-                    canonical, context, streaming=False, execution=exec_record,
+                # P0-3: qualification contributes only low-risk behavior
+                # evidence. Rebuild JUST the evidence-dependent facts — the
+                # resolved route/metadata/profile, history reconciliation,
+                # tool registry, and context estimate are all unchanged —
+                # instead of re-running the entire preparation pipeline.
+                invocation = await self._replan_after_qualification(
+                    invocation, exec_record,
                 )
-            from agent_interop.execution_attempts import AttemptBudget, CompatibilityAttemptExecutor
+            budget.max_upstream_attempts = invocation.route.compatibility.max_attempts
+            from agent_interop.execution_attempts import CompatibilityAttemptExecutor
 
-            executor = CompatibilityAttemptExecutor(AttemptBudget(
-                max_upstream_attempts=invocation.route.compatibility.max_attempts,
-            ))
-            result = await executor.execute(
-                invocation,
-                build_invocation=self._invocation_for_attempt,
-                execute_attempt=lambda attempt_invocation: self._execute_compatibility_attempt(
-                    attempt_invocation, exec_record
-                ),
-                replan_withheld_tool=self._invocation_with_withheld_tool,
+            executor = CompatibilityAttemptExecutor(budget)
+            # P0.3/P0.6: pin this request's refs for the WHOLE request
+            # lifecycle — private continuations and controller turns may still
+            # need the stored content after the first worker generation. The
+            # registry below unpins on every exit path (success, error,
+            # cancellation), so pins can never leak past the request.
+            request_id = getattr(context, "request_id", "") or canonical.request_id
+            session_id = getattr(context, "session_id", "") or ""
+            from agent_interop.context_store import RequestRefRegistry
+            ref_registry = RequestRefRegistry(
+                self._context_store, session_id, request_id,
             )
+            # P0: initial projection refs join through the registry too, so
+            # the snapshot the firewall reads and the pins the store hold
+            # have exactly one source of truth.
+            ref_registry.register_all(getattr(invocation, "pinned_refs", ()) or ())
+            invocation = replace(invocation, pinned_refs=())
+            exec_record.ref_registry = ref_registry
+            try:
+                result = await executor.execute(
+                    invocation,
+                    build_invocation=self._invocation_for_attempt,
+                    execute_attempt=lambda attempt_invocation: self._execute_compatibility_attempt(
+                        attempt_invocation, exec_record
+                    ),
+                    replan_withheld_tool=self._invocation_with_withheld_tool,
+                    hint_key=lambda inv: self._attempt_hint_key(
+                        inv, bool(getattr(inv.reconciled_request.generation, "stream", False)),
+                    ),
+                    hint_get=self._attempt_hints.get,
+                    hint_record=self._attempt_hints.record,
+                )
+            finally:
+                ref_registry.close()
             # Live evidence write-back: only on the success path, only when tools
             # were offered, only when an evidence store was injected. Backend
             # errors carry no tool-calling signal, so they are skipped.
@@ -1632,27 +1490,22 @@ class Gateway:
         execution: InteropRequestExecution,
     ) -> Any:
         """Use an enriched key only when a controller actually selected it."""
-        original = invocation.compatibility_key
-        selected = execution.compatibility_key
-        if selected is None or original is None:
-            return selected or original
-        controller_dimensions = (
-            "controller_model_id",
-            "controller_model_digest",
-            "controller_profile_revision",
-        )
-        if any(
-            getattr(selected, field, "") != getattr(original, field, "")
-            for field in controller_dimensions
-        ):
-            return selected
-        return original
+        return selected_evidence_key(invocation, execution)
 
     @staticmethod
     def _preflight_error(exc: Exception) -> CanonicalError | None:
         """Translate known planning preflight failures to canonical errors."""
         from agent_interop.context_budget import ContextLimitExceededError
+        from agent_interop.context_budget.planner import ContextCapacityUnknownError
 
+        if isinstance(exc, ContextCapacityUnknownError):
+            # P0.19 (review #13/#14): unknown capacity is a hard reject for
+            # tool-bearing requests — never a silent 8K guess.
+            return CanonicalError(
+                code=InteropErrorCode.CONTEXT_CAPACITY_UNKNOWN,
+                message=str(exc),
+                details=exc.details(),
+            )
         if isinstance(exc, ContextLimitExceededError):
             return CanonicalError(
                 code=InteropErrorCode.CONTEXT_LIMIT_EXCEEDED,
@@ -1774,6 +1627,138 @@ class Gateway:
             compatibility_verified=invocation.evidence_record is not None,
         )
 
+    async def _replan_after_qualification(
+        self,
+        invocation: ResolvedInvocation,
+        execution: InteropRequestExecution,
+        *,
+        streaming: bool = False,
+    ) -> ResolvedInvocation:
+        """P0-3: replan ONLY the qualification-dependent facts.
+
+        A full ``_prepare_invocation_async`` re-runs history reconciliation,
+        requirement derivation, tool ranking, token estimates, schema hashes,
+        and projection — all unchanged by qualification. What DID change is
+        the behavioral-capability evidence, so this rebuilds exactly:
+        behavioral capabilities → compatibility plan → invocation plan →
+        compatibility key → model presentation.
+
+        P1.5 (review #13): ``streaming`` is threaded through so the
+        compatibility key fingerprints the same streaming shape the planner
+        downstream will see — a stream that requalified and replanned
+        without ``streaming=True`` would otherwise compute a stale key.
+
+        P1.6 (review #12): ModelView + private_capabilities + model_request +
+        pinned_refs are rebuilt atomically through ``ModelProjector.project``
+        AFTER the replan, using the FRESH ``compatibility_plan`` /
+        ``tool_surface_plan`` / ``context_plan``. The previous code left
+        ModelView (and the codec-native tool surface it describes) pointing
+        at the pre-qualification facts — so a freshly-promoted model could
+        observe telemetry contradicting the surface it was actually rendered
+        with.
+        """
+        behavioral = self._behavioral_capabilities(invocation.runtime_capabilities)
+        (
+            backend_metadata, model_profile, repair_policy, plan,
+            compat_key, runtime_capabilities, _behavioral,
+            compatibility_plan, context_plan,
+        ) = await self._resolve_invocation_plan_and_key_async(
+            invocation.route,
+            invocation.reconciled_request,
+            invocation.request_context,
+            streaming=streaming,
+            inspect_runtime=False,  # metadata is already resolved and cached
+        )
+        # Atomic ModelView rebuild: project from the SAME authoritative
+        # request the original preparation used, with the FRESH surface /
+        # plan. ``seed_refs`` carries forward refs the original preparation
+        # minted (history pages) so the new virtualized set does not lose
+        # work the prior projection already paid for.
+        from agent_interop.projection import ModelProjector
+        projection = ModelProjector.project(
+            authoritative_request=invocation.authoritative_request
+                or invocation.reconciled_request,
+            route=invocation.route,
+            runtime_capabilities=runtime_capabilities,
+            compatibility_plan=compatibility_plan,
+            policy=None,
+            context_store=self._context_store,
+            session_context=invocation.request_context,
+            # P1.5: history paging was already paid for in preparation —
+            # the replan does not re-paging, it only re-presents.
+            perform_history_paging=False,
+            # No new adaptation at replan time.
+            adaptation=None,
+            invocation_plan=plan,
+            projected_request=invocation.reconciled_request,
+            seed_refs=tuple(getattr(invocation, "pinned_refs", ()) or ()),
+        )
+        updated = replace(
+            invocation,
+            behavioral_capabilities=behavioral,
+            backend_metadata=backend_metadata,
+            model_profile=model_profile,
+            repair_policy=repair_policy,
+            invocation_plan=plan,
+            compatibility_key=compat_key,
+            runtime_capabilities=runtime_capabilities,
+            compatibility_plan=compatibility_plan,
+            context_plan=context_plan,
+            request_requirements=compatibility_plan.requirements,
+            tool_surface_plan=compatibility_plan.tool_surface_plan,
+            evidence_record=None,
+            # P1.6: the fresh presentation fields.
+            model_request=projection.request,
+            model_view=projection.model_view,
+            private_capabilities=projection.private_capabilities,
+            pinned_refs=projection.referenced_refs,
+        )
+        execution.invocation_plan = plan
+        execution.compatibility_key = compat_key
+        return updated
+
+    def _attempt_hint_key(self, invocation: ResolvedInvocation, streaming: bool) -> str:
+        """P0-45: the complete serving tuple behind an attempt-path hint."""
+        from agent_interop.planning.hints import attempt_hint_key
+
+        runtime = invocation.runtime_capabilities
+        fingerprint = ""
+        requirements = invocation.request_requirements
+        if requirements is not None:
+            fingerprint = getattr(requirements, "tool_schema_fingerprint", "") or ""
+        if not fingerprint:
+            fingerprint = self._compute_tool_schema_fingerprint(
+                invocation.reconciled_request.tools,
+            )
+        choice = invocation.reconciled_request.tool_choice
+        choice_class = {
+            "auto": "auto",
+            "none": "none",
+            "required": "required",
+        }.get(getattr(choice.mode, "value", str(choice.mode)), "named")
+        # P1.9 (review #19): the textual contract carries prompt-mode
+        # behavior. Same model + surface + tool_choice with different
+        # contracts produces different ladder outcomes — cache by it.
+        plan = invocation.invocation_plan
+        contract_fingerprint = (
+            getattr(plan, "prompt_contract_digest", "") or ""
+            if plan is not None else ""
+        )
+        return attempt_hint_key(
+            model_digest=getattr(runtime, "model_digest", "") or "",
+            template_digest=getattr(runtime, "chat_template_digest", "") or "",
+            serving_config_digest=getattr(runtime, "serving_config_digest", "") or "",
+            profile_revision=str(getattr(invocation.model_profile, "profile_revision", "") or ""),
+            client_protocol=(
+                f"{getattr(invocation.request_context, 'client_id', '') or ''}"
+                f"/{getattr(invocation.request_context, 'wire_protocol', '') or ''}"
+            ),
+            tool_surface_fingerprint=fingerprint,
+            streaming=streaming,
+            tool_choice_class=choice_class,
+            prompted_contract_fingerprint=contract_fingerprint,
+        )
+
     def _invocation_for_attempt(self, invocation: ResolvedInvocation, attempt: Any) -> ResolvedInvocation:
         """Build the request-specific InvocationPlan for one ladder rung."""
         from agent_interop.evidence.key import CompatibilityKeyInputs, build_compatibility_key
@@ -1789,9 +1774,21 @@ class Gateway:
             codec_capabilities=invocation.codec.capabilities(),
             upstream_tools=surface.visible_tools,
             validation_tools=surface.validation_tools,
+            capabilities=getattr(invocation, "private_capabilities", None),
         )
         if attempt.constrained_output:
             plan = replace(plan, constrained_output=True)
+        # P1-F: reuse the fingerprint from the request's single serialization
+        # snapshot (carried on requirements) — history reconciliation never
+        # touches tools, so the attempt-level key needs no re-serialization.
+        fingerprint = ""
+        requirements = invocation.request_requirements
+        if requirements is not None:
+            fingerprint = getattr(requirements, "tool_schema_fingerprint", "") or ""
+        if not fingerprint:
+            fingerprint = self._compute_tool_schema_fingerprint(
+                invocation.reconciled_request.tools,
+            )
         compatibility_key = build_compatibility_key(CompatibilityKeyInputs(
             request_context=invocation.request_context,
             route=invocation.route,
@@ -1799,9 +1796,7 @@ class Gateway:
             backend_metadata=invocation.backend_metadata,
             model_profile=invocation.model_profile,
             invocation_plan=plan,
-            tool_schema_fingerprint=self._compute_tool_schema_fingerprint(
-                invocation.reconciled_request.tools,
-            ),
+            tool_schema_fingerprint=fingerprint,
             streaming=invocation.reconciled_request.generation.stream,
             runtime_capabilities=invocation.runtime_capabilities,
             compatibility_plan=invocation.compatibility_plan,
@@ -1835,50 +1830,22 @@ class Gateway:
         replanned = replace(invocation, tool_surface_plan=surface)
         return self._invocation_for_attempt(replanned, invocation.compatibility_attempt)
 
-    def _controller_invocation_with_delegate_tool(
-        self, invocation: ResolvedInvocation,
+    def _rebuild_invocation_from_request(
+        self,
+        invocation: ResolvedInvocation,
+        authoritative_request: Any,
+        *,
+        plan: Any,
+        tool_surface_plan: Any | None = None,
+        private_capabilities: Any | None = None,
     ) -> ResolvedInvocation:
-        """Expose the private delegation tool only on a controller request.
-
-        Tool-surface planning deliberately knows only about client-declared
-        tools.  The controller's refinement request is an Interop control
-        message, so add it after normal preparation and rebuild the exact
-        invocation plan used for rendering/validation.  It never alters the
-        outer client request or its validation registry.
-        """
-        from agent_interop.config import ToolSurfaceConfig, ToolSurfaceMode
-        from agent_interop.controller.policy import controller_delegate_tool
-        from agent_interop.repair.invocation import build_invocation_plan
-        from agent_interop.tool_surface import ToolSurfacePlanner
-
-        delegate_tool = controller_delegate_tool()
-        tools = tuple(invocation.reconciled_request.tools)
-        if not any(tool.name == delegate_tool.name for tool in tools):
-            tools = (*tools, delegate_tool)
-        canonical = replace(invocation.reconciled_request, tools=list(tools))
-        original_plan = invocation.invocation_plan
-        plan = build_invocation_plan(
-            tools=None,
-            tool_choice=canonical.tool_choice,
-            route_mode=original_plan.effective_tool_mode,
-            model_profile=invocation.model_profile,
-            repair_policy=invocation.repair_policy,
-            codec_capabilities=getattr(original_plan, "codec_capabilities", None),
-            upstream_tools=tools,
-            validation_tools=tools,
-        )
-        return replace(
-            invocation,
-            original_request=canonical,
-            reconciled_request=canonical,
-            invocation_plan=plan,
-            # This request is already an intentionally reduced controller
-            # surface. Re-selecting it dynamically could hide a tool that the
-            # controller was explicitly permitted to choose and would turn a
-            # valid decision into a misleading "withheld" failure.
-            tool_surface_plan=ToolSurfacePlanner().plan(
-                canonical, ToolSurfaceConfig(mode=ToolSurfaceMode.TRANSPARENT),
-            ),
+        """Atomic invocation rebuild — the canonical implementation lives in
+        ``agent_interop.projection.rebuild_invocation_atomic``."""
+        return rebuild_invocation_atomic(
+            invocation, authoritative_request,
+            plan=plan,
+            tool_surface_plan=tool_surface_plan,
+            private_capabilities=private_capabilities,
         )
 
     async def _execute_compatibility_attempt(
@@ -1896,288 +1863,9 @@ class Gateway:
         invocation: ResolvedInvocation,
         exec_record: InteropRequestExecution,
     ) -> CanonicalResponse:
-        """Use a qualified companion route for the agent/tool protocol.
-
-        The primary route is first asked for a tool-free work product. The
-        configured controller receives that work product plus the original
-        client request and decides whether to emit canonical tool calls. Tool
-        execution remains with the client; controller-generated calls are
-        explicitly provenance-labelled before leaving Interop.
-        """
-        from agent_interop.controller.policy import (
-            mark_controller_provenance,
-            missing_controller_result_ids,
-        )
-        from agent_interop.controller.prompts import CONTROLLER_SYSTEM_PROMPT
-        from agent_interop.controller.types import ControllerAction, ControllerSessionState
-
-        effective_controller = invocation.route.controller or self.config.controller
-        controller_route = await self._select_controller_route(
-            invocation.route, effective_controller,
-        )
-        if controller_route is None:
-            from agent_interop.controller.companion import ControllerRegistry
-
-            candidates = ControllerRegistry().candidates(self.config, invocation.route)
-            return CanonicalResponse(
-                model=CanonicalModelReference(
-                    requested_name=invocation.reconciled_request.model.requested_name,
-                    resolved_name=invocation.route.upstream_model,
-                ),
-                error=CanonicalError(
-                    code=InteropErrorCode.CONTROLLER_UNAVAILABLE,
-                    message=(
-                        "No configured controller route has passed the required qualification level"
-                        if candidates else "No distinct configured controller route is available"
-                    ),
-                    details={
-                        "path": "controlled",
-                        "responsible": "controller",
-                        "minimum_controller_level": effective_controller.minimum_controller_level,
-                        "next": "run interop qualify for a controller route" if candidates else "configure_controller_route",
-                    },
-                ),
-            )
-
-        # Controller-mediated observations must identify the actual served
-        # controller, not merely the primary request's route.  These fields
-        # are part of the immutable evidence key and isolate controller
-        # upgrades, profile changes, and tag repoints.
-        controller_runtime = await self._inspect_model_runtime(controller_route)
-        controller_metadata = self._backend_metadata_from_runtime(controller_runtime)
-        controller_profile = self._resolve_profile(controller_route, controller_metadata)
-        if exec_record.compatibility_key is not None:
-            exec_record.compatibility_key = replace(
-                exec_record.compatibility_key,
-                controller_model_id=controller_route.upstream_model,
-                controller_model_digest=controller_runtime.model_digest,
-                controller_profile_revision=getattr(controller_profile, "profile_revision", ""),
-            )
-
-        session_id = invocation.request_context.session_id
-        client_id = invocation.request_context.client_id
-        prior_state = self._controller_state.get(session_id, client_id, invocation.route.id)
-        if prior_state is not None:
-            if prior_state.primary_turn_count >= effective_controller.max_primary_turns:
-                self._controller_state.remove(session_id, client_id, invocation.route.id)
-                return CanonicalResponse(
-                    error=CanonicalError(
-                        code=InteropErrorCode.CONTROLLER_LOOP_DETECTED,
-                        message="Primary worker exceeded its bounded delegation turn budget",
-                        details={"path": "controlled", "responsible": "primary", "next": "abort_session"},
-                    ),
-                )
-            if prior_state.controller_turn_count >= effective_controller.max_controller_turns:
-                self._controller_state.remove(session_id, client_id, invocation.route.id)
-                return CanonicalResponse(
-                    error=CanonicalError(
-                        code=InteropErrorCode.CONTROLLER_LOOP_DETECTED,
-                        message="Controller exceeded its bounded turn budget",
-                        details={"path": "controlled", "responsible": "controller", "next": "abort_session"},
-                    ),
-                )
-            missing_result_ids = missing_controller_result_ids(
-                invocation.reconciled_request.messages,
-                prior_state.pending_tool_call_ids,
-            )
-            if missing_result_ids:
-                return CanonicalResponse(
-                    error=CanonicalError(
-                        code=InteropErrorCode.CONTROLLER_LOOP_DETECTED,
-                        message="Controller session resumed before every pending tool result arrived",
-                        details={
-                            "path": "controlled",
-                            "responsible": "client",
-                            "missing_tool_result_ids": list(missing_result_ids),
-                            "next": "return_tool_result",
-                        },
-                    ),
-                )
-
-        # The primary worker may reason/code, but cannot emit tool calls. Its
-        # output is untrusted advisory text to the controller.  A controller
-        # may request a focused refinement through one private tool; Interop
-        # consumes that request and never returns it to the coding client.
-        from agent_interop.controller import CompatibilityController
-
-        primary_turns = prior_state.primary_turn_count if prior_state else 0
-        controller_turns = prior_state.controller_turn_count if prior_state else 0
-        work_products: list[str] = []
-        controller_context = replace(invocation.request_context, route_id=controller_route.id)
-
-        def loop_error(message: str, *, responsible: str) -> CanonicalResponse:
-            self._controller_state.remove(session_id, client_id, invocation.route.id)
-            return CanonicalResponse(
-                error=CanonicalError(
-                    code=InteropErrorCode.CONTROLLER_LOOP_DETECTED,
-                    message=message,
-                    details={"path": "controlled", "responsible": responsible, "next": "abort_session"},
-                ),
-            )
-
-        async def ask_primary(refinement_prompt: str = "") -> CanonicalResponse | None:
-            nonlocal primary_turns
-            if primary_turns >= effective_controller.max_primary_turns:
-                return loop_error(
-                    "Primary worker exceeded its bounded delegation turn budget",
-                    responsible="primary",
-                )
-            primary_system = list(invocation.reconciled_request.system)
-            if refinement_prompt:
-                primary_system.append(CanonicalTextBlock(
-                    text=(
-                        "The compatibility controller needs this focused follow-up. "
-                        "Do not claim to execute tools; provide only reasoning or a "
-                        f"work product.\n\n{refinement_prompt}"
-                    ),
-                ))
-            primary_request = replace(
-                invocation.reconciled_request,
-                system=primary_system,
-                tools=[],
-                tool_choice=CanonicalToolChoice.none(),
-            )
-            primary_plan = replace(
-                invocation.invocation_plan,
-                effective_tool_mode=ToolMode.DISABLED,
-                upstream_tools=(),
-                prompt_contract="",
-                parser_id=None,
-            )
-            primary_invocation = replace(
-                invocation,
-                reconciled_request=primary_request,
-                invocation_plan=primary_plan,
-            )
-            primary = await self._handle_request_send(primary_invocation, exec_record)
-            if primary.error is not None:
-                return primary
-            primary_turns += 1
-            work_products.append("\n".join(
-                block.text for block in primary.content if isinstance(block, CanonicalTextBlock)
-            ))
-            return None
-
-        refinement_prompt = ""
-        while True:
-            # A controller delegation consumes a controller turn already.
-            # Check that budget before asking the worker for another costly
-            # work product; otherwise a saturated controller could still
-            # cause one unnecessary primary-model generation.
-            if controller_turns >= effective_controller.max_controller_turns:
-                return loop_error(
-                    "Controller exceeded its bounded turn budget", responsible="controller",
-                )
-            primary_failure = await ask_primary(refinement_prompt)
-            if primary_failure is not None:
-                return primary_failure
-            refinement_prompt = ""
-            rendered_work_products = "\n\n".join(
-                f"[primary turn {index}]\n{work_product}"
-                for index, work_product in enumerate(work_products, start=1)
-            )
-            controller_system = list(invocation.reconciled_request.system)
-            controller_system.append(CanonicalTextBlock(
-                text=f"{CONTROLLER_SYSTEM_PROMPT}\n\nPrimary worker work product:\n{rendered_work_products}",
-            ))
-            # The controller gets only the selected client surface plus the
-            # private refinement action. A client named-tool requirement must
-            # not prevent it from obtaining necessary worker reasoning.
-            visible_tools = tuple(getattr(
-                invocation.tool_surface_plan, "visible_tools", invocation.reconciled_request.tools,
-            ))
-            controller_request = replace(
-                invocation.reconciled_request,
-                model=replace(invocation.reconciled_request.model, requested_name=controller_route.id),
-                system=controller_system,
-                tools=list(visible_tools),
-                tool_choice=CanonicalToolChoice.auto(),
-            )
-            controller_invocation = await self._prepare_invocation_async(
-                controller_request,
-                controller_context,
-                streaming=False,
-                execution=exec_record,
-            )
-            controller_invocation = self._controller_invocation_with_delegate_tool(controller_invocation)
-            # The controller is a second model call; keep it visible in the
-            # request's efficiency record rather than hiding it behind a single
-            # compatibility attempt.
-            exec_record.record_attempt(controller_tokens=(len(rendered_work_products) + 3) // 4)
-            response = await self._handle_request_send(controller_invocation, exec_record)
-            if response.error is not None:
-                return response
-            controller_turns += 1
-
-            decision = CompatibilityController().decide(response.content)
-            if decision.action == ControllerAction.FAIL:
-                diagnostic = decision.diagnostics[0] if decision.diagnostics else "invalid_controller_decision"
-                message = (
-                    "Controller mixed a primary-refinement request with client tool calls"
-                    if diagnostic == "mixed_private_delegation_and_client_calls"
-                    else "Controller emitted an invalid primary-refinement request"
-                )
-                return loop_error(message, responsible="controller")
-            if decision.action == ControllerAction.DELEGATE_PRIMARY:
-                exec_record.record_compatibility_event("controller_delegated_primary")
-                # The next loop iteration performs exactly one additional
-                # worker turn and one controller decision, with both budgets
-                # checked before dispatch.
-                refinement_prompt = decision.primary_prompt
-                continue
-
-            raw_calls = decision.tool_calls
-
-            # The controller used ``auto`` internally so it could request
-            # worker refinement even for a client named-tool request. Before
-            # its response crosses back to the client boundary, restore and
-            # enforce the client's original tool-choice contract.
-            outer_choice = invocation.reconciled_request.tool_choice
-            call_names = tuple(call.name for call in raw_calls)
-            choice_violation = ""
-            if outer_choice.mode == ToolChoiceMode.NONE and raw_calls:
-                choice_violation = "tool_choice=none forbids controller tool calls"
-            elif outer_choice.mode == ToolChoiceMode.REQUIRED and not raw_calls:
-                choice_violation = "tool_choice=required requires a controller tool call"
-            elif outer_choice.mode == ToolChoiceMode.NAMED and (
-                not raw_calls or any(name != outer_choice.name for name in call_names)
-            ):
-                choice_violation = (
-                    f"tool_choice=named requires only {outer_choice.name!r}, got {list(call_names)!r}"
-                )
-            if choice_violation:
-                self._controller_state.remove(session_id, client_id, invocation.route.id)
-                return CanonicalResponse(
-                    error=CanonicalError(
-                        code=InteropErrorCode.TOOL_CHOICE_VIOLATION,
-                        message=choice_violation,
-                        details={
-                            "path": "controlled",
-                            "responsible": "controller",
-                            "next": "retry_with_qualified_controller",
-                        },
-                    ),
-                )
-
-            calls = tuple(
-                mark_controller_provenance(block)
-                if isinstance(block, CanonicalToolCallBlock) else block
-                for block in response.content
-            )
-            pending = tuple(block.id for block in calls if isinstance(block, CanonicalToolCallBlock))
-            self._controller_state.put(ControllerSessionState(
-                session_id=controller_context.session_id,
-                route_id=invocation.route.id,
-                client_id=controller_context.client_id,
-                controller_route_id=controller_route.id,
-                primary_route_id=invocation.route.id,
-                phase="awaiting_tool_result" if pending else "final_text",
-                visible_tool_fingerprint=invocation.tool_surface_plan.fingerprint,
-                pending_tool_call_ids=pending,
-                primary_turn_count=primary_turns,
-                controller_turn_count=controller_turns,
-            ))
-            return replace(response, content=list(calls))
+        """Delegate to the extracted controlled-attempt executor (bounded
+        primary↔controller loop)."""
+        return await self._controller_attempt.execute(invocation, exec_record)
 
     async def _select_controller_route(self, primary_route: ModelRoute, config: Any) -> ModelRoute | None:
         """Select an explicitly configured or verified installed controller."""
@@ -2205,22 +1893,45 @@ class Gateway:
         record = self._qualification_record_for_runtime(runtime)
         if record is None:
             return False
-        from agent_interop.qualification import QualificationState
+        return state_meets_controller_level(
+            getattr(record, "state", None), minimum_level,
+        )
 
-        required = {"L1": QualificationState.FORCED_TOOL, "L2": QualificationState.AUTOMATIC_TOOL,
-                    "L3": QualificationState.SEQUENTIAL_AGENT, "L4": QualificationState.ADVANCED_AGENT}
-        candidate = getattr(record, "state", QualificationState.UNKNOWN)
-        order = {
-            QualificationState.UNKNOWN: 0,
-            QualificationState.CHAT_ONLY: 1,
-            QualificationState.FORCED_TOOL: 2,
-            QualificationState.AUTOMATIC_TOOL: 3,
-            QualificationState.SEQUENTIAL_AGENT: 4,
-            QualificationState.ADVANCED_AGENT: 5,
-            QualificationState.DEGRADED: 0,
-            QualificationState.PROBING: 0,
-        }
-        return order.get(candidate, 0) >= order.get(required.get(minimum_level, QualificationState.SEQUENTIAL_AGENT), 4)
+    async def _prepare_model_generation(
+        self,
+        invocation: ResolvedInvocation,
+        *,
+        stream: bool,
+    ) -> tuple[Any, bytes, Any, int, int] | CanonicalResponse:
+        """Delegate to the generation seam: render, serialize once, gate."""
+        return await self._generation_seam.prepare(
+            invocation,
+            stream=stream,
+            attempt_request=self.prepare_model_request_for_attempt(
+                invocation, invocation.invocation_plan,
+            ),
+            context_limit_error=self._context_limit_error,
+        )
+
+    async def _dispatch_model_generation(
+        self,
+        invocation: ResolvedInvocation,
+        exec_record: InteropRequestExecution,
+        *,
+        prepared: tuple[Any, bytes, Any, int, Any],
+        purpose: str,
+    ) -> tuple[Any, bytes, Any | None]:
+        """Delegate to the generation seam: reserve, admit, send.
+
+        On success the third element is the still-OPEN reservation — the
+        caller commits it with post-decode actuals via the seam's
+        ``finalize_reservation``; on failure it is None and reconciliation
+        already happened inside the seam.
+        """
+        return await self._generation_seam.dispatch(
+            invocation, exec_record, prepared=prepared, purpose=purpose,
+            context_limit_error=self._context_limit_error,
+        )
 
     async def _handle_request_send(
         self,
@@ -2274,46 +1985,49 @@ class Gateway:
                 error=choice_conflict,
             )
 
-        # 1. Render through codec
-        request_local = copy.deepcopy(canonical)
-        rendered = codec.render_request(request_local, route.upstream_model, stream=False)
+        # 1-2. THE generation seam: render, serialize once, exact-context
+        # gate. Every generation kind passes here (P0-12) — presentation and
+        # context safety cannot drift between public, private, controller,
+        # and probe generations.
+        prepared = await self._prepare_model_generation(invocation, stream=False)
+        if isinstance(prepared, CanonicalResponse):
+            return prepared
+        # Rendered form + byte count are consumed by calibration below; the
+        # gate/meter/output-reserve tuple elements stay inside the seam.
+        _request_local, rendered_bytes, _meter, _reserve, rendered = prepared
 
-        # 2. Apply invocation plan
-        rendered = self._apply_invocation_plan_to_request(rendered, plan, route)
-
-        # 3. Build typed upstream request
-        upstream_request = PreparedUpstreamRequest(
-            method="POST",
-            url=f"{route.upstream.base_url}{codec.endpoint_path()}",
-            headers=self._build_upstream_headers(
-                route,
-                client_headers=dict(invocation.request_context.forwardable_transport_headers),
-                codec_headers=codec.required_headers(),
-            ),
-            body=rendered,
-            stream=False,
-            timeout_seconds=route.upstream.timeout_seconds,
+        # 3-4. Dispatch under admission with full budget reconciliation
+        # (GenerationReservation commit/release, rendered-byte accounting).
+        # On success the reservation stays OPEN — actual usage exists only
+        # after the codec decodes below, so committing at dispatch time
+        # would strand every generation on its estimate.
+        purpose = (
+            "controller" if getattr(invocation.compatibility_attempt, "use_controller", False)
+            else "worker"
         )
+        response, rendered_bytes, open_reservation = await self._dispatch_model_generation(
+            invocation, exec_record, prepared=prepared, purpose=purpose,
+        )
+        # The seam returns CanonicalResponse (always carrying .error) on
+        # admission/context/budget/transport failure, and the raw
+        # UpstreamResponse on success so the decode pipeline can feed the
+        # codec. Every CanonicalResponse return is terminal here (the seam
+        # already reconciled the reservation on those paths).
+        if isinstance(response, CanonicalResponse):
+            return response
 
-        # 4. Send with bounded retries
-        try:
-            response = await self.transport.send(upstream_request)
-        except UpstreamResponseTooLargeError as exc:
-            return CanonicalResponse(
-                content=[],
-                stop_reason=CanonicalStopReason.INVALID_OUTPUT,
-                usage=CanonicalUsage(),
-                model=CanonicalModelReference(
-                    requested_name=canonical.model.requested_name,
-                    resolved_name=route.upstream_model,
-                ),
-                error=CanonicalError(
-                    code=InteropErrorCode.STREAM_SIZE_LIMIT,
-                    message=str(exc),
-                ),
-            )
+        def _reconcile_decode_failure() -> None:
+            # Dispatched but the wire answer was unusable — conservative
+            # commit_estimated (the backend spent the tokens), matching the
+            # stream path's dispatched-failure rule.
+            if open_reservation is not None:
+                open_reservation.commit_estimated()
+                budget = getattr(exec_record, "attempt_budget", None)
+                if budget is not None:
+                    budget.record_rendered_bytes(len(rendered_bytes))
 
         if response.is_error():
+            _reconcile_decode_failure()
             return CanonicalResponse(
                 content=[],
                 stop_reason=CanonicalStopReason.END_TURN,
@@ -2324,7 +2038,10 @@ class Gateway:
                 ),
                 error=CanonicalError(
                     code=classify_http_status(response.status_code),
-                    message=f"Upstream returned {response.status_code}: {response.body[:500].decode('utf-8', errors='replace')}",
+                    message=(
+                        f"Upstream returned {response.status_code}: "
+                        f"{response.body[:500].decode('utf-8', errors='replace')}"
+                    ),
                 ),
             )
 
@@ -2332,6 +2049,7 @@ class Gateway:
         try:
             data = response.json()
         except (json.JSONDecodeError, ValueError):
+            _reconcile_decode_failure()
             return CanonicalResponse(
                 content=[],
                 stop_reason=CanonicalStopReason.END_TURN,
@@ -2348,8 +2066,46 @@ class Gateway:
 
         decoded = codec.decode_response(data)
 
+        # 5b. The generation happened and its REAL usage is now known —
+        # replace the reservation's estimate with actuals (exactly one
+        # commit per generation, same rule as the stream tail).
+        if open_reservation is not None:
+            self._generation_seam.finalize_reservation(decoded, open_reservation)
+            budget = getattr(exec_record, "attempt_budget", None)
+            if budget is not None:
+                budget.record_rendered_bytes(len(rendered_bytes))
+
+        # P0.42 (review #20): feed the backend's REAL prompt token count back
+        # into the meter, keyed by the full serving identity, so the next
+        # request's budget uses an exact count instead of a conservative
+        # estimate.
+        self._calibrate_token_meter(
+            invocation, rendered, getattr(decoded, "usage", None),
+            rendered_byte_count=len(rendered_bytes),
+        )
+
         # 6. Extract tool calls from model-dialect output
         candidates = self._extract_tool_candidates(decoded, invocation)
+
+        # P0.4/P0.5: Any internal call means the model's turn is NOT finished —
+        # execute the enabled internal tools privately and continue the turn.
+        # The continuation returns the FINAL public turn content, from which
+        # candidates are re-derived; internal identity never crosses the
+        # client boundary.
+        enabled_internal = self._enabled_internal_tools(invocation)
+        internal_candidates = [c for c in candidates if c.name in enabled_internal]
+        if internal_candidates:
+            continued = await self._private_loop.run(
+                invocation,
+                exec_record,
+                internal_candidates=internal_candidates,
+                decoded=decoded,
+                budget=getattr(exec_record, "attempt_budget", None),
+            )
+            if isinstance(continued, CanonicalResponse):
+                return continued  # terminal: loop/budget failure, already firewalled
+            decoded = continued
+            candidates = self._extract_tool_candidates(decoded, invocation)
 
         # A withheld declared tool is not executable merely because a model
         # guessed its identifier. Record the event and let the bounded ladder
@@ -2375,7 +2131,6 @@ class Gateway:
             )
 
         # 7. Run tool transaction pipeline
-        from agent_interop.transaction import ToolBatchPolicy, process_tool_batch
 
         transaction_context = self._build_transaction_context(invocation, canonical)
         batch_decision = await process_tool_batch(
@@ -2395,7 +2150,7 @@ class Gateway:
         self._record_tool_decisions(batch_decision, exec_record)
 
         # 8. Assemble canonical response
-        return self._assemble_response(decoded, batch_decision, canonical, route)
+        return self._assemble_response(decoded, batch_decision, canonical, route, exec_record=exec_record)
 
     def _disabled_tool_choice_conflict(self, plan: Any) -> CanonicalError | None:
         """A DISABLED route combined with a required/named tool choice is a
@@ -2416,6 +2171,152 @@ class Gateway:
                 ),
             )
         return None
+
+    def _config_tool_choice_conflict(self, route: ModelRoute, request: CanonicalRequest) -> CanonicalError | None:
+        """Route-config-level contradiction check, runnable BEFORE any I/O.
+
+        When the route's configured ``tool_mode`` is DISABLED outright, a
+        REQUIRED/NAMED tool choice is already unsatisfiable — resolution
+        (which consults profile/codec) can only keep it DISABLED or leave
+        it, never make the contradiction satisfiable. Detecting it here
+        means a contradictory request never triggers even metadata I/O,
+        let alone a generation.
+        """
+        if route.tool_mode != ToolMode.DISABLED:
+            return None
+        choice = request.tool_choice
+        if choice is not None and choice.mode in (ToolChoiceMode.REQUIRED, ToolChoiceMode.NAMED):
+            return CanonicalError(
+                code=InteropErrorCode.TOOL_CHOICE_VIOLATION,
+                message=(
+                    f"tool_choice={choice.mode.value!r} requires a tool call, but this route's "
+                    "tool_mode is DISABLED"
+                ),
+            )
+        return None
+
+    def _context_limit_error(
+        self,
+        invocation: Any,
+        reason: str,
+    ) -> CanonicalResponse:
+        """Bounded CONTEXT_LIMIT_EXCEEDED response after final rendered
+        measurement (P0-12). Unlike planning-time failures this fires on the
+        EXACT body about to be sent, including prompted contracts, private
+        schemas, and continuation history.
+
+        P1.12 (review #32): takes a :class:`ResolvedInvocation` so the
+        canonical request, route, and plan cannot drift out of sync at
+        the gate. Pre-fix callers passed the three components
+        separately, which made it trivial to mis-thread them in
+        streaming/continuation paths and silently mis-report the
+        responsible limit.
+        """
+        canonical = invocation.reconciled_request
+        route = invocation.route
+        context_plan = getattr(invocation, "context_plan", None)
+        details: dict[str, Any] = {
+            "gate": "rendered_body",
+            "reason": reason,
+            "path": "preflight",
+            "responsible": "request_size",
+        }
+        if context_plan is not None:
+            details["safe_limit_tokens"] = getattr(context_plan, "safe_limit_tokens", 0)
+            details["runtime_limit_tokens"] = getattr(context_plan, "runtime_limit_tokens", 0)
+        return CanonicalResponse(
+            content=[],
+            stop_reason=CanonicalStopReason.END_TURN,
+            usage=CanonicalUsage(),
+            model=CanonicalModelReference(
+                requested_name=canonical.model.requested_name,
+                resolved_name=route.upstream_model,
+            ),
+            error=CanonicalError(
+                code=InteropErrorCode.CONTEXT_LIMIT_EXCEEDED,
+                message="Rendered request exceeds the model's effective context limit",
+                details=details,
+            ),
+        )
+
+    # ─── Private internal-tool continuation loop (P0.4/P0.5) ──────────────
+
+    def _enabled_internal_tools(self, invocation: ResolvedInvocation) -> dict[str, Any]:
+        """The executable internal-tool registry for THIS request.
+
+        P0-24: capability IS authority — a request may privately execute only
+        the internal tools its own :class:`PrivateCapabilityPlan` admitted to
+        the model surface. The previous registry handed out every internal
+        tool globally, so a capability the projection never advertised (and
+        the client never opted into) was still executable if the model
+        hallucinated its name — surface and execution disagreed.
+
+        Every internal tool remains a side-effect-free READ scoped to the
+        caller's own session (the ContextStore fails closed across
+        sessions), so the blast radius of a granted capability is the
+        request's own session state. Unknown non-Interop names are never
+        here — they fall through to the client transaction layer.
+        """
+        from agent_interop.context_store.schema_tools import all_schema_tools
+        from agent_interop.context_store.tools import all_internal_tools
+
+        capabilities = invocation.private_capabilities
+        if capabilities is None:
+            # No capability plan → no private authority at all.  (Defensive:
+            # _no_private_capabilities() is the normal producer of this state.)
+            return {}
+        by_name: dict[str, Any] = {}
+        for tool in (*all_internal_tools(), *all_schema_tools()):
+            by_name[tool.name] = tool
+        enabled: dict[str, Any] = {}
+        if capabilities.read_result:
+            enabled["__interop_read_result"] = by_name["__interop_read_result"]
+        if capabilities.recall_history:
+            enabled["__interop_recall_history"] = by_name["__interop_recall_history"]
+        if capabilities.search_history:
+            enabled["__interop_search_history"] = by_name["__interop_search_history"]
+        if capabilities.get_tool_schema:
+            enabled["__interop_get_tool_schema"] = by_name["__interop_get_tool_schema"]
+        return enabled
+
+    def _request_identity(self, invocation: ResolvedInvocation, call_ids: set[str]) -> Any:
+        """Build the request-scoped identity for the output firewall.
+
+        Refs created by this request's projection AND refs minted later by
+        internal executors (schema-on-demand) are the authoritative leak
+        identity: a ref is an unguessable token, so its appearance in public
+        content IS the leak signal — no marker-syntax pattern needed. The
+        request's ref registry is the single source for both.
+        """
+        from agent_interop.private_loop import InternalIdentity
+
+        registry = getattr(invocation.execution_record, "ref_registry", None)
+        if registry is not None:
+            refs = registry.snapshot()
+        else:
+            refs = frozenset(getattr(invocation, "pinned_refs", ()) or ())
+        names = tuple(self._enabled_internal_tools(invocation))
+        return InternalIdentity(
+            call_ids=frozenset(ids for ids in call_ids if ids),
+            refs=refs,
+            tool_names=frozenset(names),
+        )
+
+    async def _send_one_model_step(
+        self,
+        invocation: ResolvedInvocation,
+        exec_record: InteropRequestExecution,
+        *,
+        purpose: str = "private_continuation",
+    ) -> tuple[CanonicalResponse, bytes]:
+        """One generation with no extraction and no transaction pipeline —
+        the private continuation loop's unit of work, delegated to the
+        generation seam (which owns budget reservation, admission, and
+        decoding into the uniform CanonicalResponse shape)."""
+        return await self._generation_seam.run_step(
+            invocation, exec_record, purpose=purpose,
+            context_limit_error=self._context_limit_error,
+        )
 
     def _extract_tool_candidates(
         self,
@@ -2636,18 +2537,19 @@ class Gateway:
     async def _inspect_model_runtime(self, route: ModelRoute) -> Any:
         """Inspect the live backend/model tuple through the shared transport.
 
-        Unlike the retired route-only metadata helper, this has enough
-        information to constrain context and distinguish backend wire support
-        from model capability.  Callers convert it to ``BackendMetadata`` only
-        at the profile-registry boundary, which preserves the richer runtime
-        object for planning and diagnostics.
+        P0-1: METADATA-ONLY. Live request traffic never runs behavioral
+        probe generations — those belong to explicit qualification tooling
+        (``interop qualify``, conformance commands). Ollama's four metadata
+        reads (/version, /tags, /show, /ps) are concurrent and TTL-cached,
+        so a warm route pays zero inspection latency.
+
+        ``runtime_inspection.mode`` governs this independently of
+        ``probe_on_startup``: health probing and planning metadata are
+        separate concerns.
         """
         from agent_interop.backends.registry import get_backend_inspector
 
-        # ``--no-probe`` remains a real operational contract: request traffic
-        # must not turn it into several metadata calls (which can themselves
-        # retry) before the actual inference request.
-        if not self.config.probe_on_startup:
+        if self.config.runtime_inspection.mode == "off":
             return self._static_runtime_capabilities(route)
 
         cached = self._runtime_capability_cache.get_for_route(
@@ -2658,7 +2560,13 @@ class Gateway:
 
         inspector = get_backend_inspector(route.upstream.kind)
         try:
-            runtime = await inspector.inspect(route, self.transport)
+            if hasattr(inspector, "inspect_runtime_metadata"):
+                runtime = await inspector.inspect_runtime_metadata(
+                    route,
+                    self.transport,
+                )
+            else:  # pragma: no cover - non-Ollama inspectors without the split
+                runtime = await inspector.inspect(route, self.transport)
             self._runtime_capability_cache.put(runtime, route.upstream.base_url)
             return runtime
         except (AttributeError, OSError, RuntimeError) as exc:
@@ -2667,6 +2575,38 @@ class Gateway:
             # or when a backend's metadata endpoint is unavailable.
             logger.debug("Runtime inspection unavailable for %s: %s", route.id, exc)
             return self._static_runtime_capabilities(route)
+
+    async def _warm_runtime_metadata(self) -> None:
+        """Warm the runtime-metadata cache for every route concurrently.
+
+        Called from ``startup()`` so the user's FIRST generation does not pay
+        the (cheap but nonzero) metadata round trips. Purely metadata — no
+        model generations, matching the P0-1 invariant.
+
+        P1.11 (review #30): the operator can disable warm-up via
+        ``runtime_inspection.warm_on_startup=False`` — useful when the
+        upstream is slow to respond on cold boot or when the operator
+        wants to make the first-request behavior explicit instead of
+        implicit. Default is on (warm) for backwards-compatible behavior.
+        """
+        if not getattr(self.config.runtime_inspection, "warm_on_startup", True):
+            logger.debug(
+                "Runtime metadata warm-up disabled (runtime_inspection.warm_on_startup=False)",
+            )
+            return
+        if self.config.runtime_inspection.mode != "cached_metadata":
+            return
+        if not self.config.routes:
+            return
+        results = await asyncio.gather(
+            *(self._inspect_model_runtime(route) for route in self.config.routes.values()),
+            return_exceptions=True,
+        )
+        for route, outcome in zip(self.config.routes.values(), results):
+            if isinstance(outcome, BaseException):
+                logger.debug(
+                    "Runtime metadata warm-up skipped for %s: %s", route.id, outcome,
+                )
 
     @staticmethod
     def _static_runtime_capabilities(route: ModelRoute) -> Any:
@@ -2683,139 +2623,78 @@ class Gateway:
             model_name=route.upstream_model,
         )
 
+    def _calibrate_token_meter(
+        self,
+        invocation: ResolvedInvocation,
+        rendered: Any,
+        usage: Any | None,
+        rendered_byte_count: int | None = None,
+    ) -> None:
+        """P0.42 (review #20): calibrate the TokenMeter from a real response.
+
+        Each completed generation feeds the backend's actual input token
+        count back into the meter, keyed by the full serving identity
+        (model_digest, chat_template_digest, wire_protocol), so subsequent
+        budget decisions use an exact count instead of the conservative
+        bytes/token estimate.  Missing usage or digest → no-op.
+
+        P0-11: callers pass ``rendered_byte_count`` (the length of the bytes
+        serialized exactly once in the send path); re-serializing `rendered`
+        here is a fallback only for legacy callers.
+        """
+        if usage is None:
+            return
+        runtime = getattr(invocation, "runtime_capabilities", None)
+        digest = getattr(runtime, "model_digest", "") if runtime else ""
+        if not digest:
+            return
+        input_tokens = getattr(usage, "input_tokens", 0) or 0
+        if input_tokens <= 0:
+            return
+        if rendered_byte_count is None:
+            try:
+                rendered_byte_count = len(json.dumps(rendered).encode("utf-8", "replace"))
+            except (TypeError, ValueError):
+                return
+        wire_protocol = ""
+        route = getattr(invocation, "route", None)
+        if route is not None:
+            wire_protocol = getattr(route.upstream.wire_protocol, "value", "")
+        self._token_meter.calibrate(
+            digest,
+            input_tokens,
+            rendered_byte_count,
+            chat_template_digest=getattr(runtime, "chat_template_digest", "") or "",
+            wire_protocol=wire_protocol,
+        )
+
+    # ─── Qualification (delegated to qualification.coordinator) ──────────
+
     @staticmethod
     def _qualification_key(runtime: Any) -> str:
-        # Tags are mutable aliases. Persisting their outcome could apply a
-        # previous model's qualification after a tag is repointed.
-        return getattr(runtime, "model_digest", "")
+        return QualificationCoordinator.key(runtime)
 
     def record_qualification(self, record: Any) -> None:
-        """Store bounded bootstrap results for future safe planning decisions."""
-        key = getattr(record, "model_digest", "")
-        if key:
-            self._qualification_records[key] = record
-            if self._qualification_store is not None:
-                self._qualification_store.put(record)
+        self._qualification.record(record)
 
     def _qualification_record_for_runtime(self, runtime: Any) -> Any | None:
-        """Restore only digest-keyed safe facts from the durable cache."""
-        key = self._qualification_key(runtime)
-        # Legacy in-memory callers may explicitly seed a qualification before
-        # runtime probing is enabled.  That ephemeral compatibility path is
-        # never persisted and therefore cannot survive a mutable tag change.
-        if not key and self._qualification_store is None:
-            key = getattr(runtime, "model_name", "")
-        if not key:
-            return None
-        record = self._qualification_records.get(key)
-        if record is None and self._qualification_store is not None:
-            record = self._qualification_store.get(key)
-            if record is not None:
-                self._qualification_records[key] = record
-        return record
+        return self._qualification.record_for_runtime(runtime)
 
     def _behavioral_capabilities(self, runtime: Any) -> Any:
-        """Return only behavior proven by the synthetic bootstrap battery."""
-        from agent_interop.planning import BehavioralCapabilities
-        from agent_interop.qualification import QualificationState
+        return self._qualification.behavioral_capabilities(runtime)
 
-        record = self._qualification_record_for_runtime(runtime)
-        if record is None:
-            return BehavioralCapabilities()
-        forced = bool(getattr(record, "native_forced_tool", False) or getattr(record, "prompted_forced_tool", False))
-        sequential = bool(getattr(record, "continuation", False) and forced)
-        return BehavioralCapabilities(
-            # Qualification does not test automatic selection or parallelism.
-            native_tools=bool(getattr(record, "native_forced_tool", False)),
-            prompted_tools=bool(getattr(record, "prompted_forced_tool", False)),
-            forced_selection=forced,
-            sequential_tool_use=sequential,
-            tool_result_continuation=sequential,
-            streaming=(getattr(record, "state", None) == QualificationState.ADVANCED_AGENT),
-            chat_only=(getattr(record, "state", None) == QualificationState.CHAT_ONLY),
-            sample_count=1,
-        )
+    def _required_probes_for_request(
+        self,
+        invocation: ResolvedInvocation,
+        record: Any | None,
+    ) -> tuple[str, ...]:
+        return self._qualification.required_probes_for_request(invocation, record)
 
     async def _ensure_bootstrap_qualification(self, invocation: ResolvedInvocation) -> bool:
-        """Qualify an unknown tool model with side-effect-free synthetic calls.
-
-        Only required/named tool turns block.  Automatic selection may
-        legitimately choose no tool, so it uses existing evidence or the
-        controller path rather than treating a no-call probe as a failure.
-        """
-        qualification = invocation.route.qualification
-        choice = invocation.reconciled_request.tool_choice
-        if (
-            qualification.bootstrap != "blocking_for_tool_requests"
-            or not invocation.reconciled_request.tools
-            or choice.mode not in (ToolChoiceMode.NAMED, ToolChoiceMode.REQUIRED)
-        ):
-            return False
-        key = self._qualification_key(invocation.runtime_capabilities)
-        if not key or not qualification.cache_by_digest:
-            return False
-        if self._qualification_record_for_runtime(invocation.runtime_capabilities) is not None:
-            return False
-        lock = self._qualification_locks.setdefault(key, asyncio.Lock())
-        async with lock:
-            if self._qualification_record_for_runtime(invocation.runtime_capabilities) is not None:
-                return False
-            from agent_interop.qualification import BootstrapQualifier
-
-            async def execute(probe: Any) -> bool:
-                return await self._execute_bootstrap_probe(invocation, probe)
-
-            record = await BootstrapQualifier().qualify(key, execute)
-            self.record_qualification(record)
-            return True
+        return await self._qualification.ensure_bootstrap(invocation)
 
     async def _execute_bootstrap_probe(self, invocation: ResolvedInvocation, probe: Any) -> bool:
-        """Execute one synthetic qualification probe without client authority."""
-        from agent_interop.abi import CanonicalMessage
-        from agent_interop.qualification.probes import SYNTHETIC_TOOL
-
-        tools = [SYNTHETIC_TOOL] if probe.requires_tools else []
-        choice = CanonicalToolChoice.required() if probe.requires_tools else CanonicalToolChoice.none()
-        messages = [CanonicalMessage(role="user", content=[CanonicalTextBlock(text=probe.prompt)])]
-        if probe.name == "tool_result_continuation":
-            messages = [
-                CanonicalMessage(role="user", content=[CanonicalTextBlock(text="Call the probe tool.")]),
-                CanonicalMessage(
-                    role="assistant",
-                    content=[CanonicalToolCallBlock(id="interop_probe_call", name="interop_probe", arguments={"marker": "done"})],
-                ),
-                CanonicalMessage(
-                    role="tool",
-                    content=[CanonicalToolResultBlock(tool_call_id="interop_probe_call", content="marker=done")],
-                ),
-                CanonicalMessage(role="user", content=[CanonicalTextBlock(text=probe.prompt)]),
-            ]
-        request = CanonicalRequest(
-            model=invocation.reconciled_request.model,
-            messages=messages,
-            tools=tools,
-            tool_choice=choice,
-        )
-        execution = InteropRequestExecution(context=invocation.request_context)
-        probe_invocation = await self._prepare_invocation_async(
-            request,
-            invocation.request_context,
-            streaming=False,
-            execution=execution,
-        )
-        response = await self._handle_request_send(probe_invocation, execution)
-        if response.error is not None:
-            return False
-        calls = [block for block in response.content if isinstance(block, CanonicalToolCallBlock)]
-        if probe.name == "exact_text":
-            return any("INTEROP_PROBE_OK" in block.text for block in response.content if isinstance(block, CanonicalTextBlock))
-        if probe.name == "no_tool":
-            return not calls
-        if probe.name == "native_forced_tool":
-            return bool(calls) and probe_invocation.invocation_plan.effective_tool_mode == ToolMode.NATIVE
-        if probe.name == "prompted_forced_tool":
-            return bool(calls) and probe_invocation.invocation_plan.effective_tool_mode in (ToolMode.PROMPTED, ToolMode.TEXTUAL)
-        return not calls
+        return await self._qualification.execute_bootstrap_probe(invocation, probe)
 
     @staticmethod
     def _backend_metadata_from_runtime(runtime: Any) -> Any:
@@ -2923,6 +2802,7 @@ class Gateway:
         batch_decision: Any,
         canonical: CanonicalRequest,
         route: ModelRoute,
+        exec_record: InteropRequestExecution | None = None,
     ) -> CanonicalResponse:
         """Assemble the canonical response from decoded + transaction output."""
 
@@ -2936,15 +2816,15 @@ class Gateway:
         # Add accepted tool blocks from the transaction decision
         content.extend(batch_decision.accepted_blocks)
 
-        # Repair-note feedback: a short, structured text block naming
-        # exactly what got normalized, only when a repair actually fired.
-        # Riding along in the SAME assistant turn as the tool call means
-        # it survives into conversation history exactly the way any other
-        # assistant text does — no separate state tracking needed to
-        # resurface it to the model on a later turn.
+        # Repair-note feedback (P1.4): a short, structured note naming exactly
+        # what got normalized, only when a repair actually fired. It is
+        # recorded on the EXECUTION RECORD — never appended to the
+        # client-visible response, where it would corrupt the coding client's
+        # transcript (the client owns assistant-turn content). The internal
+        # recall surface resurfaces it to the model on later turns.
         repair_note = self._build_repair_note(getattr(batch_decision, "decisions", []))
-        if repair_note:
-            content.append(CanonicalTextBlock(text=repair_note))
+        if repair_note and exec_record is not None:
+            exec_record.record_repair_hint(repair_note)
 
         # Determine stop reason
         stop_reason = decoded.stop_reason
@@ -3073,6 +2953,13 @@ class Gateway:
         """
         exec_record = InteropRequestExecution(context=context)
         try:
+            # P0-16: the budget exists BEFORE preparation — and covers BOTH
+            # stream shapes, so the direct-streaming path is no longer the
+            # only request kind running without a token/attempt ledger.
+            from agent_interop.execution_attempts import AttemptBudget
+
+            budget = AttemptBudget()
+            exec_record.attempt_budget = budget
             # Prepare the resolved invocation (same as non-streaming; passes in
             # the shared record so diagnostics/route/plan land on the record
             # that gets finalized)
@@ -3081,47 +2968,36 @@ class Gateway:
             )
             if await self._ensure_bootstrap_qualification(invocation):
                 # A stream that requires qualification must not leak its first
-                # unqualified attempt.  Re-plan before deciding whether native
-                # passthrough is now justified or buffered validation remains
-                # necessary.
-                invocation = await self._prepare_invocation_async(
-                    canonical, context, streaming=True, execution=exec_record,
+                # unqualified attempt.  Re-plan (NOT a full re-prep) so the
+                # compatibility key fingerprints the streaming shape the
+                # dispatcher will use — a key computed under streaming=False
+                # would never match the live gate's stream request.
+                invocation = await self._replan_after_qualification(
+                    invocation, exec_record, streaming=True,
+                )
+            budget.max_upstream_attempts = invocation.route.compatibility.max_attempts
+            # P0-27: pin this request's refs for the WHOLE streaming
+            # generator lifecycle — private continuations inside the stream
+            # still need stored content after the first generation, and the
+            # finally guarantees unpinning on every exit path including
+            # client cancellation. The registry also captures refs minted
+            # mid-stream (schema-on-demand) and feeds the firewall identity.
+            request_id = getattr(context, "request_id", "") or canonical.request_id
+            session_id = getattr(context, "session_id", "") or ""
+            from agent_interop.context_store import RequestRefRegistry
+            ref_registry = RequestRefRegistry(
+                self._context_store, session_id, request_id,
             )
-            if self._requires_buffered_stream_validation(invocation):
-                from agent_interop.execution_attempts import (
-                    AttemptBudget,
-                    CompatibilityAttemptExecutor,
-                )
-
-                executor = CompatibilityAttemptExecutor(AttemptBudget(
-                    max_upstream_attempts=invocation.route.compatibility.max_attempts,
-                ))
-                response = await executor.execute(
-                    invocation,
-                    build_invocation=self._invocation_for_attempt,
-                    execute_attempt=lambda attempt_invocation: self._execute_compatibility_attempt(
-                        attempt_invocation, exec_record,
-                    ),
-                    replan_withheld_tool=self._invocation_with_withheld_tool,
-                )
-                if (
-                    self._evidence_store is not None
-                    and canonical.tools
-                    and response.error is None
+            ref_registry.register_all(getattr(invocation, "pinned_refs", ()) or ())
+            invocation = replace(invocation, pinned_refs=())
+            exec_record.ref_registry = ref_registry
+            try:
+                async for event in self._stream_dispatch(
+                    invocation, canonical, context, exec_record, budget,
                 ):
-                    self._record_evidence_observation(invocation, exec_record)
-                exec_record.finalize_response(response)
-                self._capture_diagnostic_case(invocation, exec_record, response)
-                async for event in self._events_from_buffered_response(response):
                     yield event
-                return
-            # The sub-generator finalizes the record (success or internal
-            # terminal error) — and logs the summary — BEFORE yielding its
-            # terminal event, not after. The ASGI server stops consuming this
-            # generator as soon as it sees message_stop, so nothing here can
-            # rely on running after the last yield to be reached.
-            async for event in self._handle_stream_send(invocation, exec_record):
-                yield event
+            finally:
+                ref_registry.close()
         except asyncio.CancelledError:
             # Mid-request cancellation: finalize the record as CANCELLED so it is
             # not left permanently ACTIVE, then re-raise. Do NOT yield
@@ -3137,10 +3013,82 @@ class Gateway:
             yield CanonicalEvent(type="message_stop")
             return
 
+    async def _stream_dispatch(
+        self,
+        invocation: Any,
+        canonical: CanonicalRequest,
+        context: Any,
+        exec_record: InteropRequestExecution,
+        budget: Any,
+    ) -> AsyncGenerator[CanonicalEvent, None]:
+        """Buffered-vs-direct stream dispatch (P0-27 refactor): the pin
+        lifecycle in handle_stream wraps everything this method yields."""
+        if self._requires_buffered_stream_validation(invocation):
+            from agent_interop.execution_attempts import CompatibilityAttemptExecutor
+
+            executor = CompatibilityAttemptExecutor(budget)
+            response = await executor.execute(
+                invocation,
+                build_invocation=self._invocation_for_attempt,
+                execute_attempt=lambda attempt_invocation: self._execute_compatibility_attempt(
+                    attempt_invocation, exec_record,
+                ),
+                replan_withheld_tool=self._invocation_with_withheld_tool,
+                hint_key=lambda inv: self._attempt_hint_key(
+                    inv, bool(getattr(inv.reconciled_request.generation, "stream", False)),
+                ),
+                hint_get=self._attempt_hints.get,
+                hint_record=self._attempt_hints.record,
+            )
+            if (
+                self._evidence_store is not None
+                and canonical.tools
+                and response.error is None
+            ):
+                self._record_evidence_observation(invocation, exec_record)
+            exec_record.finalize_response(response)
+            self._capture_diagnostic_case(invocation, exec_record, response)
+            async for event in self._events_from_buffered_response(response):
+                yield event
+            return
+        # The sub-generator finalizes the record (success or internal
+        # terminal error) — and logs the summary — BEFORE yielding its
+        # terminal event, not after. The ASGI server stops consuming this
+        # generator as soon as it sees message_stop, so nothing here can
+        # rely on running after the last yield to be reached.
+        async for event in self._handle_stream_send(invocation, exec_record):
+            yield event
+
     @staticmethod
     def _requires_buffered_stream_validation(invocation: ResolvedInvocation) -> bool:
-        """Whether this stream must wait for an accepted ladder response."""
+        """Whether this stream must wait for an accepted ladder response.
+
+        P0-24/P0-25 (review): buffering is a TTFT tax, so it applies ONLY
+        when tool interpretation could actually convert prose into
+        execution:
+
+          1. P0-25 — private capabilities active ⇒ ALWAYS buffer. Already-
+             streamed text cannot be withdrawn if the model later requests
+             __interop_read_result; only the firewalled final turn may be
+             emitted.
+          2. No client tools AND no private capabilities ⇒ never buffer —
+             there is no tool surface to misinterpret; text streams
+             immediately.
+          3. tool_choice=NONE (no private caps) ⇒ never buffer, same reason.
+          4. Otherwise: unverified native/prompted tool streams buffer until
+             a validated response exists (verified native+evidence streams
+             immediately).
+        """
         if not invocation.route.compatibility.buffer_unverified_streaming:
+            return False
+        private_capabilities = getattr(invocation, "private_capabilities", None)
+        if private_capabilities is not None and private_capabilities.has_any:
+            return True
+        request = invocation.authoritative_request or invocation.reconciled_request
+        if not request.tools:
+            return False
+        choice = getattr(request, "tool_choice", None)
+        if choice is not None and getattr(choice.mode, "value", choice.mode) == "none":
             return False
         plan = invocation.invocation_plan
         compatibility = invocation.compatibility_plan
@@ -3176,542 +3124,10 @@ class Gateway:
         invocation: ResolvedInvocation,
         exec_record: InteropRequestExecution,
     ) -> AsyncIterator[CanonicalEvent]:
-        """Send a prepared invocation to the upstream and stream decoded events."""
-        # Unsafe history — finalize BEFORE yielding the terminal event. The
-        # server stops consuming this generator as soon as it sees
-        # message_stop, so any bookkeeping placed after that yield may never
-        # run through the real ASGI path.
-        if invocation.invocation_plan is None or invocation.codec is None:
-            err = CanonicalError(
-                code=InteropErrorCode.HISTORY_UNSAFE,
-                message="History reconciliation detected unsafe history",
-            )
-            exec_record.finalize_error(err)
-            yield CanonicalEvent(type="error", error=err)
-            yield CanonicalEvent(type="message_stop")
-            return
-
-        route = invocation.route
-        plan = invocation.invocation_plan
-        codec = invocation.codec
-        canonical = invocation.reconciled_request
-
-        choice_conflict = self._disabled_tool_choice_conflict(plan)
-        if choice_conflict is not None:
-            exec_record.finalize_error(choice_conflict)
-            yield CanonicalEvent(type="error", error=choice_conflict)
-            yield CanonicalEvent(type="message_stop")
-            return
-
-        # Render through codec
-        request_local = copy.deepcopy(canonical)
-        rendered = codec.render_request(request_local, route.upstream_model, stream=True)
-        rendered = self._apply_invocation_plan_to_request(rendered, plan, route)
-
-        # Build typed upstream request
-        upstream_request = PreparedUpstreamRequest(
-            method="POST",
-            url=f"{route.upstream.base_url}{codec.endpoint_path()}",
-            headers=self._build_upstream_headers(
-                route,
-                client_headers=dict(invocation.request_context.forwardable_transport_headers),
-                codec_headers=codec.required_headers(),
-            ),
-            body=rendered,
-            stream=True,
-            timeout_seconds=route.upstream.timeout_seconds,
-        )
-
-        coordinator = StreamCoordinator(
-            route.upstream.wire_protocol,
-            limits=StreamLimits(
-                max_accumulated_arg_bytes=self.config.max_tool_argument_bytes,
-                max_simultaneous_tool_calls=self.config.max_simultaneous_tool_calls,
-            ),
-        )
-
-        async with self.transport.stream(upstream_request) as stream:
-            if stream.status_code >= 400:
-                # Read a short excerpt of the error body for the message
-                excerpt = ""
-                try:
-                    parts: list[str] = []
-                    total = 0
-                    async for raw in stream.raw_lines():
-                        parts.append(raw)
-                        total += len(raw)
-                        if total >= 200 or len(parts) >= 5:
-                            break
-                    excerpt = "".join(parts)[:200]
-                except Exception:
-                    excerpt = ""
-                error_msg = f"Upstream returned {stream.status_code}"
-                if excerpt:
-                    error_msg += f": {excerpt}"
-                canonical_error = CanonicalError(
-                    code=classify_http_status(stream.status_code), message=error_msg
-                )
-                exec_record.finalize_error(canonical_error)
-                yield CanonicalEvent(type="error", error=canonical_error)
-                yield CanonicalEvent(type="message_stop")
-                return
-
-            # The invocation plan decides how tool calls are extracted. For
-            # PROMPTED-mode local models stream_extraction_mode is
-            # BUFFER_TEXTUAL_RESPONSE: raw <tool_call>...</tool_call> envelopes
-            # must be buffered until the response is complete, then run through
-            # the SAME textual-extraction machinery as the non-streaming path —
-            # never streamed straight through as text. Any other mode uses the
-            # native-fragments path (text streams through immediately).
-            mode = plan.stream_extraction_mode
-            buffered_text_parts: list[str] = []
-            final_stop_reason: CanonicalStopReason | None = None
-            final_usage: CanonicalUsage | None = None
-            malformed_frame_count = 0
-
-            # Decode stream frames through codec
-            async for frame_data, raw_frame_text in self._iter_frame_data(stream, codec.stream_framing):
-                if frame_data is None:
-                    # Malformed frame. Record a bounded, sanitized diagnostic
-                    # regardless of outcome so evidence/replay can see how
-                    # often a backend emits unparseable frames.
-                    malformed_frame_count += 1
-                    exec_record.record_malformed_frame(
-                        malformed_frame_count, "unparseable_frame", raw_frame_text,
-                    )
-                    if coordinator.has_pending_tool_calls:
-                        # Fail the tool batch and terminate
-                        coordinator.tool_accumulator.fail_all_pending("malformed_frame")
-                        err = CanonicalError(
-                            code="MALFORMED_FRAME",
-                            message="Malformed frame with open tool state",
-                        )
-                        # GAP 5 FIX — a malformed frame with open tool state is a
-                        # terminal error; the record must be finalized as FAILED
-                        # rather than left permanently ACTIVE. Finalize BEFORE
-                        # yielding message_stop — the server stops consuming
-                        # this generator as soon as it sees that event.
-                        exec_record.finalize_error(err)
-                        yield CanonicalEvent(type="error", error=err)
-                        yield CanonicalEvent(type="message_stop")
-                        return
-                    if malformed_frame_count > self.config.max_malformed_stream_frames:
-                        # No open tool state, but the backend has now sent
-                        # more malformed frames than the configured threshold.
-                        # Without a bound, a backend that never resends valid
-                        # frames could be silently `continue`d forever.
-                        err = CanonicalError(
-                            code="MALFORMED_FRAME",
-                            message=(
-                                f"Too many malformed stream frames "
-                                f"({malformed_frame_count} > "
-                                f"{self.config.max_malformed_stream_frames})"
-                            ),
-                        )
-                        exec_record.finalize_error(err)
-                        yield CanonicalEvent(type="error", error=err)
-                        yield CanonicalEvent(type="message_stop")
-                        return
-                    continue
-
-                # GAP 2 FIX — always decode the frame FIRST, even when it is
-                # the terminal frame. The terminal frame often carries the final
-                # tool fragments, usage, and/or stop reason; checking
-                # is_stream_complete first and returning early silently dropped
-                # all of that. Decode now, then consult is_stream_complete below.
-                is_complete = codec.is_stream_complete(frame_data)
-                decoded_events: list[DecodedStreamEvent] = codec.decode_stream_chunk(frame_data)
-
-                stream_error: CanonicalError | None = None
-                for decoded_event in decoded_events:
-                    # Handle text deltas. In BUFFER_TEXTUAL_RESPONSE mode the
-                    # model emits raw tool envelopes as text, so we must buffer
-                    # and extract later — never yield the envelope literally.
-                    if isinstance(decoded_event, DecodedTextDelta):
-                        if mode == StreamExtractionMode.BUFFER_TEXTUAL_RESPONSE:
-                            buffered_text_parts.append(decoded_event.text)
-                        else:
-                            yield CanonicalEvent(
-                                type="text_delta",
-                                index=0,
-                                partial=decoded_event.text,
-                            )
-
-                    # Handle tool batch completion — complete all pending calls
-                    elif isinstance(decoded_event, DecodedToolBatchComplete):
-                        coordinator.tool_accumulator.complete_all_pending()
-
-                    # Handle tool fragments - accumulate via the accumulator's
-                    # feed methods so size limits are actually enforced.
-                    elif isinstance(decoded_event, DecodedToolFragment):
-                        key = ToolStreamKey(
-                            choice_index=decoded_event.choice_index,
-                            tool_index=decoded_event.tool_index,
-                        )
-                        coordinator.tool_accumulator.start_call(key, decoded_event.call_id_fragment or None)
-                        if decoded_event.name_fragment:
-                            coordinator.tool_accumulator.feed_name(key, decoded_event.name_fragment)
-                        if decoded_event.argument_fragment:
-                            # GAP 3 FIX — route argument fragments through
-                            # feed_arguments so max_accumulated_arg_bytes is
-                            # enforced. The old direct-append path bypassed the
-                            # limit entirely. A limit breach is a terminal error.
-                            try:
-                                coordinator.tool_accumulator.feed_arguments(key, decoded_event.argument_fragment)
-                            except ToolCallLimitExceeded as exc:
-                                err = CanonicalError(
-                                    code="TOOL_CALL_LIMIT_EXCEEDED",
-                                    message=str(exc),
-                                )
-                                exec_record.finalize_error(err)
-                                yield CanonicalEvent(type="error", error=err)
-                                yield CanonicalEvent(type="message_stop")
-                                return
-
-                    # Handle per-call completion
-                    elif isinstance(decoded_event, DecodedToolCallComplete):
-                        key = ToolStreamKey(choice_index=decoded_event.choice_index, tool_index=decoded_event.tool_index)
-                        coordinator.tool_accumulator.complete_call(key)
-
-                    # GAP 2 — capture usage updates from terminal frames instead
-                    # of silently dropping them.
-                    elif isinstance(decoded_event, DecodedUsageUpdate):
-                        final_usage = decoded_event.usage
-
-                    # Capture the stream's stop reason and any trailing usage.
-                    elif isinstance(decoded_event, DecodedStreamComplete):
-                        final_stop_reason = decoded_event.stop_reason
-                        if decoded_event.usage is not None:
-                            final_usage = decoded_event.usage
-
-                    # Surface a stream-level error as a terminal error event.
-                    elif isinstance(decoded_event, DecodedStreamError):
-                        stream_error = CanonicalError(
-                            code="BACKEND_STREAM_ERROR",
-                            message=decoded_event.error,
-                        )
-
-                if stream_error is not None:
-                    exec_record.finalize_error(stream_error)
-                    yield CanonicalEvent(type="error", error=stream_error)
-                    yield CanonicalEvent(type="message_stop")
-                    return
-
-                # GAP 4 FIX — the mid-loop drain_completed() + immediate
-                # _process_completed_stream_tools(...) call that used to live
-                # here is DELETED. Completed tool calls now accumulate in the
-                # coordinator until end-of-turn (below), so the whole turn's
-                # tool calls are validated as ONE atomic batch instead of being
-                # split across per-drain decisions.
-
-                if is_complete:
-                    break
-
-            # ── End-of-turn (shared by terminal-frame break AND natural loop-end) ──
-            # Native fragments are accumulated during the loop regardless of the
-            # plan's extraction mode (the codec emits them from the wire stream,
-            # which does not depend on the plan). So always finish any still-
-            # pending calls and drain the WHOLE turn's completed calls. In BUFFER
-            # mode a prompted model emits its tool envelopes as text deltas rather
-            # than native fragments — but a model can also hallucinate native-style
-            # tool_calls deltas even when PROMPTED mode stripped tool schemas from
-            # the request, so the two sources are NOT guaranteed mutually exclusive.
-            # To honour the turn-level atomicity guarantee, BOTH candidate sources
-            # are merged into ONE deduped list (via _dedup_tool_candidates) and
-            # decided as a single atomic batch. In non-BUFFER mode textual
-            # candidates are empty, so this collapses to the single native batch
-            # exactly as before.
-            coordinator.tool_accumulator.complete_all_pending()
-            remaining = coordinator.tool_accumulator.drain_completed()
-
-            if mode == StreamExtractionMode.BUFFER_TEXTUAL_RESPONSE:
-                # GAP 1 FIX — run the buffered raw text through the SAME
-                # textual-extraction machinery as the non-streaming path. The
-                # envelopes are consumed here so the literal <tool_call> text
-                # never leaks to the client as a text delta. Native fragments (if
-                # any) are merged with the textual candidates below so the WHOLE
-                # turn is decided as ONE atomic batch instead of two.
-                native_candidates = self._pending_to_candidates(remaining, invocation)
-                textual_candidates: list[RawToolCallCandidate] = []
-                remaining_content: list[CanonicalContentBlock] = []
-                buffered_text = "".join(buffered_text_parts)
-                if buffered_text:
-                    decoded = DecodedModelResponse(
-                        content=[CanonicalTextBlock(text=buffered_text)],
-                    )
-                    textual_candidates = self._extract_tool_candidates(decoded, invocation)
-                    remaining_content = list(decoded.content)
-
-                merged = self._dedup_tool_candidates(native_candidates, textual_candidates)
-                if merged:
-                    transaction_context = self._build_transaction_context(invocation, canonical)
-                    batch_decision = await process_tool_batch(
-                        merged,
-                        canonical.tools,
-                        context=transaction_context,
-                        policy=ToolBatchPolicy(invocation.repair_policy.batch_policy),
-                    )
-                    self._record_repairs_to_session(batch_decision, invocation.request_context)
-                    # Record per-call decisions onto the shared execution record
-                    # unconditionally — the in-memory record is always populated
-                    # (so finalize_response's outcome classification sees the
-                    # decisions), matching the non-streaming path (~line 938) and
-                    # the non-BUFFER streaming path (_process_completed_stream_
-                    # tools). Evidence-store write-back remains a separate, opt-in
-                    # step in _record_evidence_observation.
-                    self._record_tool_decisions(batch_decision, invocation.execution_record)
-                    # Emit the remaining (non-envelope) text, then the accepted
-                    # tool calls, exactly as the non-streaming path assembles them.
-                    # Plain text is emitted even on rejection — _assemble_response
-                    # keeps content text blocks alongside a set .error.
-                    for block in remaining_content:
-                        if isinstance(block, CanonicalTextBlock) and block.text:
-                            yield CanonicalEvent(type="text_delta", index=0, partial=block.text)
-                    # Emit the decided batch: either the accepted tool_use blocks,
-                    # or — on a fully-rejected batch — a structured error +
-                    # INVALID_OUTPUT message_stop (mirrors _assemble_response's
-                    # non-streaming handling). The shared helper also finalizes the
-                    # record as failed and marks the coordinator's turn rejected so
-                    # the caller skips its generic end-of-turn tail.
-                    async for event in self._emit_batch_decision_events(
-                        batch_decision, canonical.request_id, coordinator, invocation.execution_record,
-                    ):
-                        yield event
-                else:
-                    # No candidates extracted but there is plain text — yield it.
-                    if buffered_text:
-                        yield CanonicalEvent(type="text_delta", index=0, partial=buffered_text)
-            else:
-                # Non-BUFFER mode: native fragments only (text already streamed as
-                # it arrived). Decide them as one atomic batch via the single-source
-                # path — byte-for-byte identical to the pre-fix behaviour.
-                if remaining:
-                    async for event in self._process_completed_stream_tools(
-                        remaining, invocation, coordinator,
-                    ):
-                        yield event
-
-            # A fully-rejected batch already emitted its terminal error +
-            # message_stop(INVALID_OUTPUT) and finalized the record as failed via
-            # the shared helper. Skip the generic end-of-turn tail (stop-reason
-            # computation, a second message_stop, evidence write-back, and
-            # finalize_response) — mirroring the non-streaming path's
-            # `result.error is None` gate on evidence write-back.
-            if coordinator.turn_rejected:
-                return
-
-            # GAP 6 FIX — read the public property instead of the private attr.
-            #
-            # coordinator.has_emitted_tool_calls MUST win over whatever the
-            # backend's terminal frame reported. Found via a real live-client
-            # run: Ollama (gpt-oss:20b-cloud) streams the tool_calls fragment
-            # in a non-terminal chunk, then closes with a `done:true` frame
-            # whose own done_reason is "stop" (mapped to END_TURN) and no
-            # tool_calls of its own — decode_stream_chunk has no cross-chunk
-            # state, so it can only see that one frame and reports END_TURN
-            # as final_stop_reason, silently overriding the correct TOOL_CALL
-            # signal `coordinator` already recorded from the earlier chunk. A
-            # response containing an emitted tool_use block is a protocol
-            # invariant that must report stop_reason=tool_use regardless of
-            # what the backend's last frame claimed — this mirrors the
-            # equivalent guard already applied on the non-streaming path
-            # (see ~line 1710: `if batch_decision.accepted_blocks and
-            # stop_reason == END_TURN: stop_reason = TOOL_CALL`).
-            stop_reason = (
-                CanonicalStopReason.TOOL_CALL
-                if coordinator.has_emitted_tool_calls
-                else (final_stop_reason or CanonicalStopReason.END_TURN)
-            )
-
-            # Live evidence write-back at clean stream end: only when tools were
-            # offered and an evidence store was injected. This shared end-of-turn
-            # path is reached by BOTH the terminal-frame break and the natural
-            # loop-end, so write-back fires on both success exits.
-            #
-            # IMPORTANT: this tail runs BEFORE the terminal message_stop is
-            # yielded. The server stops consuming this generator as soon as it
-            # sees message_stop, so bookkeeping placed after that yield may
-            # never execute through the real ASGI path (only direct-generator
-            # tests would see it run). If finalization itself fails, surface
-            # it as a genuine terminal error instead of silently completing.
-            try:
-                if self._evidence_store is not None and canonical.tools:
-                    self._record_evidence_observation(invocation, exec_record)
-
-                # GAP 5 FIX — the terminal-frame completion path (the most common
-                # one for OpenAI/Ollama streams) used to return WITHOUT finalizing
-                # the record. Unifying both exits into this shared path means a
-                # normal completion now finalizes as SUCCEEDED.
-                exec_record.finalize_response(CanonicalResponse(usage=final_usage or CanonicalUsage()))
-            except Exception as exc:
-                logger.warning(
-                    "stream finalization failed before the terminal event",
-                    exc_info=True,
-                )
-                err = CanonicalError(code="STREAM_ERROR", message=str(exc))
-                exec_record.finalize_error(err)
-                yield CanonicalEvent(type="error", error=err)
-                yield CanonicalEvent(type="message_stop", stop_reason=CanonicalStopReason.INVALID_OUTPUT)
-                return
-
-            if final_usage is not None:
-                yield CanonicalEvent(
-                    type="usage_update",
-                    input_tokens=final_usage.input_tokens,
-                    output_tokens=final_usage.output_tokens,
-                )
-
-            yield CanonicalEvent(type="message_stop", stop_reason=stop_reason)
-
-    async def _emit_batch_decision_events(
-        self,
-        batch_decision: Any,
-        request_id: str,
-        coordinator: StreamCoordinator,
-        exec_record: InteropRequestExecution,
-    ) -> AsyncIterator[CanonicalEvent]:
-        """Emit canonical events for a decided tool batch.
-
-        Fully rejected atomic batch (no calls accepted): emits an ``error``
-        event with the structured rejection (mirrors ``_assemble_response``'s
-        non-streaming handling), then ``message_stop(INVALID_OUTPUT)``,
-        finalizes the execution record as failed, and marks the coordinator's
-        turn as rejected so the caller skips its own generic end-of-turn
-        handling (stop-reason computation, second message_stop, and evidence
-        write-back). Accepted / partially-accepted batches emit each accepted
-        tool_use block, unchanged from prior behavior.
-        """
-        if not batch_decision.is_accepted and not batch_decision.accepted_blocks:
-            rejection_error = self._build_batch_rejection_error(batch_decision, request_id)
-            exec_record.finalize_error(rejection_error)
-            coordinator.mark_turn_rejected()
-            yield CanonicalEvent(type="error", error=rejection_error)
-            yield CanonicalEvent(type="message_stop", stop_reason=CanonicalStopReason.INVALID_OUTPUT)
-            return
-
-        for accepted_block in batch_decision.accepted_blocks:
-            coordinator.mark_tool_calls_emitted()
-            yield CanonicalEvent(type="tool_use", index=0, content_block=accepted_block)
-
-    def _pending_to_candidates(
-        self,
-        completed: list[PendingToolCall],
-        invocation: ResolvedInvocation,
-    ) -> list[RawToolCallCandidate]:
-        """Convert drained ``PendingToolCall``s to ``RawToolCallCandidate``s.
-
-        Shared by the native-only streaming path (``_process_completed_stream_
-        tools``) and the combined native+textual BUFFER path so both build
-        candidates from the same wire fragments.
-        """
-        route = invocation.route
-        candidates: list[RawToolCallCandidate] = []
-        for c in completed:
-            if c.completed and c.name_fragments:
-                name = "".join(c.name_fragments)
-                args_str = "".join(c.argument_fragments)
-                candidates.append(RawToolCallCandidate(
-                    id=c.call_id,
-                    name=name,
-                    raw_arguments=args_str,
-                    source_protocol=route.upstream.wire_protocol.value,
-                    source_index=c.tool_index,
-                    choice_index=c.choice_index,
-                    tool_index=c.tool_index,
-                ))
-        return candidates
-
-    async def _process_completed_stream_tools(
-        self,
-        completed: list[PendingToolCall],
-        invocation: ResolvedInvocation,
-        coordinator: StreamCoordinator,
-    ) -> AsyncIterator[CanonicalEvent]:
-        """Process completed native tool calls through the transaction service.
-
-        Used by the non-BUFFER streaming path where native fragments are the
-        only candidate source. The combined native+textual BUFFER path builds
-        its candidate list separately (via ``_pending_to_candidates``) but runs
-        the same single atomic batch below the end-of-turn merge.
-        """
-        candidates = self._pending_to_candidates(completed, invocation)
-        if not candidates:
-            return
-
-        canonical = invocation.reconciled_request
-        request_context = invocation.request_context
-
-        # Run through the transaction service. Uses the shared helper so the
-        # streaming path gets the confidence-gated repair policy, the
-        # request-scoped budget (shared across batches), telemetry, and the
-        # compatibility key — identical to the non-streaming path.
-        transaction_context = self._build_transaction_context(invocation, canonical)
-        batch_decision = await process_tool_batch(
-            candidates,
-            canonical.tools,
-            context=transaction_context,
-            policy=ToolBatchPolicy(invocation.repair_policy.batch_policy),
-        )
-
-        # Record repairs into session state for loop detection
-        self._record_repairs_to_session(batch_decision, request_context)
-
-        # Record per-call decisions onto the shared execution record. The
-        # in-memory record is always populated; evidence-store write-back is a
-        # separate, opt-in step in _record_evidence_observation.
-        self._record_tool_decisions(batch_decision, invocation.execution_record)
-
-        # Emit the decided batch: either the accepted tool_use blocks, or — on a
-        # fully-rejected batch — a structured error + INVALID_OUTPUT message_stop
-        # (mirrors _assemble_response's non-streaming handling). The shared
-        # helper also finalizes the record as failed and marks the coordinator's
-        # turn rejected so the caller skips its generic end-of-turn tail.
-        async for event in self._emit_batch_decision_events(
-            batch_decision, canonical.request_id, coordinator, invocation.execution_record,
-        ):
+        """Delegate to the extracted streaming engine (frame loop → batch →
+        events)."""
+        async for event in self._stream_engine.run_send_stream(invocation, exec_record):
             yield event
-
-    async def _iter_frame_data(
-        self,
-        stream: Any,  # UpstreamStream
-        framing: Any,  # StreamFraming
-    ) -> AsyncIterator[tuple[dict[str, Any] | None, str]]:
-        """Normalize SSE or NDJSON frames into the shape the downstream
-        streaming loop expects.
-
-        Yields ``(frame, raw_text)`` per wire frame. ``frame`` is a ``dict``
-        for a successfully parsed frame, or ``None`` for a malformed/
-        unparseable one — matching exactly what ``_parse_stream_frame`` used
-        to return. ``raw_text`` is the frame's original text (bounded by the
-        caller before use) so malformed frames can be recorded as bounded
-        diagnostics instead of being dropped with no trace.
-        """
-        from agent_interop.upstreams.codec import StreamFraming
-
-        if framing == StreamFraming.NDJSON:
-            async for item in stream.ndjson_events():
-                if isinstance(item, MalformedNDJSONLine):
-                    yield None, item.line
-                else:
-                    # NDJSON yields already-parsed frames (dicts); yield them
-                    # directly. Non-dict items are treated as unparseable.
-                    yield (item if isinstance(item, dict) else None), str(item)
-            return
-
-        # Default: SSE framing
-        async for frame in stream.sse_events():
-            data = frame.data
-            if not data or not data.strip():
-                # Skip empty/whitespace-only frames (e.g. keep-alives)
-                continue
-            stripped = data.strip()
-            if stripped == "[DONE]":
-                yield {"done": True}, stripped
-                continue
-            try:
-                yield json.loads(stripped), stripped
-            except json.JSONDecodeError:
-                yield None, stripped
 
     # ─── Helpers ───────────────────────────────────────────────────────────
 

@@ -41,6 +41,7 @@ from agent_interop.config import (
     UpstreamConfig,
     UpstreamKind,
     UpstreamProtocol,
+    ContextConfig,
 )
 from agent_interop.context import RequestContext
 from agent_interop.errors import InteropErrorCode
@@ -226,6 +227,7 @@ def _gateway_with_mocked_probe(handler):
                     wire_protocol=UpstreamProtocol.OLLAMA_CHAT,
                 ),
                 tool_mode=ToolMode.AUTO,
+                context=ContextConfig(context_limit_tokens=32768),
             ),
         },
     )
@@ -350,6 +352,7 @@ class TestReadinessReflectsBackendState:
                         wire_protocol=UpstreamProtocol.OLLAMA_CHAT,
                     ),
                     tool_mode=ToolMode.AUTO,
+                    context=ContextConfig(context_limit_tokens=32768),
                 ),
             },
         )
@@ -493,6 +496,7 @@ class TestMultiRouteProbing:
                         wire_protocol=UpstreamProtocol.OLLAMA_CHAT,
                     ),
                     tool_mode=ToolMode.AUTO,
+                    context=ContextConfig(context_limit_tokens=32768),
                 ),
                 "route_b": ModelRoute(
                     id="route_b",
@@ -504,6 +508,7 @@ class TestMultiRouteProbing:
                         wire_protocol=UpstreamProtocol.OPENAI_CHAT,
                     ),
                     tool_mode=ToolMode.AUTO,
+                    context=ContextConfig(context_limit_tokens=32768),
                 ),
             },
         )
@@ -512,10 +517,10 @@ class TestMultiRouteProbing:
 
         # Both routes should have probe results recorded
         # even if they fail (since no backends are running)
-        assert len(gw._probe_results) == 2, (
-            f"Expected 2 probe results, got {len(gw._probe_results)}"
+        assert len(gw._readiness.results) == 2, (
+            f"Expected 2 probe results, got {len(gw._readiness.results)}"
         )
-        probed_ids = set(gw._probe_results.keys())
+        probed_ids = set(gw._readiness.results.keys())
         assert "route_a" in probed_ids
         assert "route_b" in probed_ids
 
@@ -537,12 +542,13 @@ class TestMultiRouteProbing:
                         wire_protocol=UpstreamProtocol.OLLAMA_CHAT,
                     ),
                     tool_mode=ToolMode.AUTO,
+                    context=ContextConfig(context_limit_tokens=32768),
                 ),
             },
         )
         gw = Gateway(config)
         await gw.startup()
-        assert len(gw._probe_results) == 0
+        assert len(gw._readiness.results) == 0
         await gw.close()
 
 
@@ -574,6 +580,7 @@ class TestSessionManagerIntegration:
                         wire_protocol=UpstreamProtocol.OLLAMA_CHAT,
                     ),
                     tool_mode=ToolMode.AUTO,
+                    context=ContextConfig(context_limit_tokens=32768),
                 ),
             },
         )
@@ -630,6 +637,7 @@ class TestSessionManagerIntegration:
                         wire_protocol=UpstreamProtocol.OLLAMA_CHAT,
                     ),
                     tool_mode=ToolMode.AUTO,
+                    context=ContextConfig(context_limit_tokens=32768),
                 ),
             },
         )
@@ -685,6 +693,7 @@ class TestSessionManagerIntegration:
                         wire_protocol=UpstreamProtocol.OLLAMA_CHAT,
                     ),
                     tool_mode=ToolMode.AUTO,
+                    context=ContextConfig(context_limit_tokens=32768),
                 ),
             },
         )
@@ -831,6 +840,7 @@ class TestAssembleResponseRejection:
                     wire_protocol=UpstreamProtocol.OPENAI_CHAT,
                 ),
                 tool_mode=ToolMode.AUTO,
+                context=ContextConfig(context_limit_tokens=32768),
             ),
         })
         gw = Gateway(config)
@@ -936,6 +946,7 @@ class TestRequestResponseIdSeparation:
                     wire_protocol=UpstreamProtocol.OPENAI_CHAT,
                 ),
                 tool_mode=ToolMode.AUTO,
+                context=ContextConfig(context_limit_tokens=32768),
             ),
         })
         gw = Gateway(config)
@@ -973,6 +984,7 @@ class TestBatchPolicyFromConfig:
                     ),
                     tool_mode=ToolMode.AUTO,
                     repair=RepairConfig(batch_policy=batch_policy),
+                    context=ContextConfig(context_limit_tokens=32768),
                 ),
             },
         )

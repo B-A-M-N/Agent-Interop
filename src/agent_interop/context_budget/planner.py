@@ -7,6 +7,8 @@ silently discarded during planning.
 
 from __future__ import annotations
 
+from typing import Any
+
 from agent_interop.abi import CanonicalRequest, CanonicalToolCallBlock, CanonicalToolResultBlock
 from agent_interop.context_budget.estimator import estimate_request_context
 from agent_interop.context_budget.types import ContextPlan
@@ -37,16 +39,89 @@ class ContextLimitExceededError(ValueError):
         }
 
 
+class ContextCapacityUnknownError(ValueError):
+    """Context capacity is unknown — cannot confirm request fits.
+
+    This is NOT the same as infinite. The caller must either:
+    - Fail with CONTEXT_CAPACITY_UNKNOWN
+    - Apply a conservative operator fallback (e.g., a small default limit)
+    """
+
+    def __init__(self, plan: ContextPlan | None = None, message: str | None = None) -> None:
+        self.plan = plan
+        super().__init__(
+            message
+            or (
+                "Context capacity is unknown — cannot confirm request fits. "
+                "Configure context_limit_tokens or set ollama_num_ctx."
+            )
+        )
+
+    @classmethod
+    def unresolvable(cls, model_name: str = "", policy_hint: str = "") -> ContextCapacityUnknownError:
+        """Raise-form for a request rejected by the unknown-capacity policy
+        before a ContextPlan exists (review #13/#14)."""
+        hint = f" {policy_hint}" if policy_hint else ""
+        return cls(
+            message=(
+                "CONTEXT_CAPACITY_UNKNOWN: context capacity for model "
+                f"'{model_name}' could not be established (no observed runtime "
+                "limit, route context_limit_tokens, ollama num_ctx, or trusted "
+                f"model profile).{hint}"
+            ),
+        )
+
+    def details(self) -> dict[str, Any]:
+        if self.plan is None:
+            return {"capacity_unknown": True}
+        return {
+            "required_tokens": self.plan.after.total_required_tokens,
+            "message_tokens": self.plan.after.message_tokens,
+        }
+
+
 def effective_context_limit(
-    architecture_limit: int,
-    configured_limit: int,
+    architecture_limit: int = 0,
+    configured_limit: int = 0,
     route_override: int = 0,
     observed_effective_limit: int = 0,
+    *,
+    architecture_ceiling: int | None = None,
 ) -> int:
-    limits = [value for value in (
-        architecture_limit, configured_limit, route_override, observed_effective_limit,
-    ) if value > 0]
-    return min(limits) if limits else 0
+    """Return the usable serving-context limit.
+
+    P0.20: thin wrapper over resolve_context_capacity.  New code should use
+    resolve_context_capacity directly for the full ContextCapacity object.
+
+    P0-49 source semantics:
+
+    * Usable capacity is chosen from OBSERVED serving context, then the
+      operator route cap, then the configured serving context — actual or
+      operator-asserted allocations only.
+    * ``architecture_ceiling`` (or the legacy positional
+      ``architecture_limit``) NEVER supplies capacity by itself.  It is a
+      clamp: any resolved limit above the architecture's hard maximum is
+      cut down to it.  The architecture maximum says nothing about what a
+      backend actually allocated (num_ctx) — treating it as capacity let
+      a 32K-architecture model with an 8K num_ctx plan against 32K.
+    """
+    from agent_interop.admission import resolve_context_capacity
+
+    ceiling = (
+        architecture_ceiling
+        if architecture_ceiling is not None
+        else architecture_limit
+    )
+    capacity = resolve_context_capacity(
+        observed_runtime=observed_effective_limit,
+        route_context_limit=route_override,
+        ollama_num_ctx=configured_limit,
+        profile_max_context=0,  # P0-49: architecture is a clamp, not a source
+    )
+    tokens = capacity.tokens or 0
+    if ceiling > 0 and tokens > ceiling:
+        return int(ceiling)
+    return tokens
 
 
 class ContextBudgetPlanner:
@@ -61,21 +136,33 @@ class ContextBudgetPlanner:
         visible_tools=None,
         original_tools=None,
         prompted_contract: str = "",
+        cost_snapshot: Any | None = None,
     ) -> ContextPlan:
         before = estimate_request_context(
             request,
             visible_tools=original_tools if original_tools is not None else request.tools,
             prompted_contract=prompted_contract,
             output_reserve_tokens=output_reserve_tokens,
+            snapshot=cost_snapshot,
         )
         after = estimate_request_context(
             request,
             visible_tools=visible_tools if visible_tools is not None else request.tools,
             prompted_contract=prompted_contract,
             output_reserve_tokens=output_reserve_tokens,
+            snapshot=cost_snapshot,
         )
         safe_limit = int(runtime_limit_tokens * 0.90) if runtime_limit_tokens else 0
-        fits = not safe_limit or after.total_required_tokens <= safe_limit
+        # P0.6: Unknown context capacity does NOT mean infinite.
+        # Use a conservative default (8K tokens) for unknown capacity.
+        # The capacity_unknown flag is set so the gateway can warn or apply
+        # a stricter policy for beta.
+        if safe_limit == 0:
+            safe_limit = 8192  # conservative default for unknown capacity
+            capacity_unknown = True
+        else:
+            capacity_unknown = False
+        fits = after.total_required_tokens <= safe_limit
         all_indices = tuple(range(len(request.messages)))
         if fits:
             return ContextPlan(
@@ -86,6 +173,7 @@ class ContextBudgetPlanner:
                 fits_directly=True,
                 preserved_message_indices=all_indices,
                 transformations=("reduce_tool_surface",) if after.tool_schema_tokens < before.tool_schema_tokens else (),
+                capacity_unknown=capacity_unknown,
             )
 
         # Preserve required constraints, the latest user turn, and the most
@@ -131,4 +219,5 @@ class ContextBudgetPlanner:
                 "summarize_old_history_in_controlled_mode",
                 "delegate_through_controller",
             ),
+            capacity_unknown=capacity_unknown,
         )

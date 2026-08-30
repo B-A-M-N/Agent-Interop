@@ -39,6 +39,7 @@ from agent_interop.config import (
     UpstreamConfig,
     UpstreamKind,
     UpstreamProtocol,
+    ContextConfig,
 )
 from agent_interop.server.app import create_app
 
@@ -427,6 +428,7 @@ async def _create_interop_app(
                     wire_protocol=wire_protocol,
                     timeout_seconds=30.0,
                 ),
+                context=ContextConfig(context_limit_tokens=32768),
                 tool_mode=tool_mode,
                 translation_mode=TranslationMode.CANONICAL,
             ),
