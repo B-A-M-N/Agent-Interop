@@ -46,7 +46,7 @@ Local model
 | `interop start` | Start the Interop gateway server. | `interop start --model qwen3-coder --backend ollama` |
 | `interop install` | Install the Interop shim to intercept `ollama launch` commands. | `interop install` |
 | `interop status` | Verify the Interop installation/shim status (not model capability — see `interop evidence`). | `interop status` |
-| `interop test {model}` | Run conformance tests for a specific model and compute its L0-L4 level. | `interop test qwen3-coder` |
+| `interop test {model}` | Run conformance tests for a specific model and compute its L0-L4 level. Add `--enable-controller` if the test requires a controller route (e.g. `explicit_forced_tool`). | `interop test qwen3-coder --enable-controller` |
 | `interop evidence list --route/--model` | List recorded compatibility evidence (every distinct compatibility key, never collapsed). | `interop evidence list --model qwen3-coder` |
 
 ### CLI Options

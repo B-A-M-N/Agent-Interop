@@ -3,6 +3,38 @@
 All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+- **Explicit tool choices now bypass the controller** — When a client sends
+  `tool_choice: named("tool_name")` or `tool_choice: required`, the planner
+  now forces NATIVE mode (was incorrectly choosing PROMPTED mode which
+  skipped native tool_calls from the backend) and skips the controller
+  mediation path (which unconditionally stripped tools). This fixes
+  `explicit_forced_tool` conformance test failures.
+- **Conformance runner false negatives** — Tests with forced tool choices
+  no longer fail when `min_tool_calls` was already satisfied on a previous
+  turn but the current turn produced only text. Also passes when
+  `max_turns` is hit but `min_tool_calls` is satisfied.
+- **CLI: `--enable-controller` flag** — `interop test` now accepts
+  `--enable-controller` to add a controller route for tests that require one.
+
+### Added
+- **Demo: `demo/fix_bug_demo.py`** — End-to-end demonstration of a local
+  model fixing a real bug through Interop's Anthropic Messages API
+  translation. Shows multi-turn tool use (read → fix → verify).
+
+### Changed
+- **Profile: `qwen-coder-ollama`** — Simplified to native presentation mode
+  with `whole_message_json` fallback for all tool_choice modes. This matches
+  the model's actual behavior (returns bare JSON tool calls, not `<tool>`
+  envelopes).
+
+### Verified
+- qwen2.5-coder:14b passes all 12 conformance tests (L4).
+- qwen2.5-coder:7b passes 11/12 (blocked on `malformed_call_repair` — a
+  model instruction-following limitation, not an Interop bug).
+
 ## [0.2.0] — 2026-08-30
 
 ### Added
