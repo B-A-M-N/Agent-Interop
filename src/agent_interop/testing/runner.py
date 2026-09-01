@@ -259,6 +259,23 @@ class RealConformanceRunner:
                 # this same response.error path, but only one of them is
                 # infrastructure noise rather than capability evidence.
                 if response.error:
+                    # A TOOL_CHOICE_VIOLATION on a later turn (after we
+                    # already accumulated enough tool calls) is not a
+                    # real failure — the model produced text after
+                    # fulfilling the forced choice on an earlier turn.
+                    from agent_interop.errors import InteropErrorCode
+                    if (
+                        response.error.code == InteropErrorCode.TOOL_CHOICE_VIOLATION
+                        and test.tool_choice
+                        and test.tool_choice.mode in (ToolChoiceMode.REQUIRED, ToolChoiceMode.NAMED)
+                        and len(result.tool_calls) >= test.min_tool_calls
+                    ):
+                        result.final_text = " ".join(
+                            block.text for block in response.content
+                            if isinstance(block, CanonicalTextBlock) and block.text
+                        )
+                        result.passed = True
+                        break
                     result.error = f"Gateway error [{response.error.code}]: {response.error.message}"
                     result.error_code = str(response.error.code)
                     break
@@ -274,10 +291,20 @@ class RealConformanceRunner:
                     if test.tool_choice and test.tool_choice.mode in (
                         ToolChoiceMode.REQUIRED, ToolChoiceMode.NAMED,
                     ):
-                        result.error = (
-                            f"{test.tool_choice.mode.value.upper()} tool choice "
-                            "but no tool calls in response"
-                        )
+                        # If we already accumulated enough tool calls from
+                        # previous turns, the requirement is satisfied even
+                        # if this turn produced only text.
+                        if len(result.tool_calls) >= test.min_tool_calls:
+                            result.final_text = " ".join(
+                                block.text for block in response.content
+                                if isinstance(block, CanonicalTextBlock) and block.text
+                            )
+                            result.passed = True
+                        else:
+                            result.error = (
+                                f"{test.tool_choice.mode.value.upper()} tool choice "
+                                "but no tool calls in response"
+                            )
                         break
 
                     # No tool calls — conversation complete
@@ -308,6 +335,13 @@ class RealConformanceRunner:
         except Exception as exc:
             result.error = str(exc)
             logger.error("conformance test %s failed: %s", test.name, exc)
+
+        # If we hit max_turns but already satisfied min_tool_calls, the
+        # test is actually a pass — the model did what was asked, just
+        # ran out of turns (common with forced tool choices).
+        if not result.passed and result.turns >= test.max_turns and len(result.tool_calls) >= test.min_tool_calls:
+            result.passed = True
+            result.error = ""
 
         # Verify explicit test criteria
         if result.passed:

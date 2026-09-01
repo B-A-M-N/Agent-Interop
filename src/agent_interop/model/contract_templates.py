@@ -4,7 +4,7 @@ mode model receives describing how to call tools.
 Different model families respond to different phrasing. Concretely: a
 live benchmark against qwen2.5-coder:7b found it defaults to wrapping its
 tool-call JSON in a markdown code fence instead of emitting the taught
-``<tool_call>`` tag directly — see ``extraction.WholeMessageJsonExtractor``,
+<tool_call> tag directly — see ``extraction.WholeMessageJsonExtractor``,
 the recovery tier built for that exact shape. A profile can select a
 template by ID (``tool_calling.presentation.contract_template``) instead
 of always getting the universal default. Previously this field was parsed
@@ -25,16 +25,20 @@ _CONTRACT_VERSION = "1"
 
 
 def _render_interop_tool_v1(tool_descriptions: str, choice_instructions: str) -> str:
-    """The universal default contract — bare ``<tool_call>`` tag envelope,
+    """The universal default contract — bare
+<tool_call> tag envelope,
     no dialect-specific guidance."""
     return f"""\
 <interop_tool_contract version="{_CONTRACT_VERSION}">
 To call a tool, emit exactly:
 
-<tool_call>{{"name":"tool_name","arguments":{{"key":"value"}}}}</tool_call>
 
-Text outside a <tool_call> block is ordinary assistant text.
-A <tool_call> block means the tool is intended to execute.
+<tool_call>{{"name":"tool_name","arguments":{{"key":"value"}}}}
+
+Text outside a
+<tool_call> block is ordinary assistant text.
+A
+<tool_call> block means the tool is intended to execute.
 
 Available tools:
 
@@ -54,14 +58,14 @@ def _render_qwen_tool_v1(tool_descriptions: str, choice_instructions: str) -> st
 <interop_tool_contract version="{_CONTRACT_VERSION}">
 To call a tool, emit exactly:
 
-<tool_call>{{"name":"tool_name","arguments":{{"key":"value"}}}}</tool_call>
+<tool>{{"name":"tool_name","arguments":{{"key":"value"}}}}</tool>
 
-Do NOT wrap the <tool_call> block in Markdown or code fences (no triple
+Do NOT wrap the <tool> block in Markdown or code fences (no triple
 backticks before or after it). Emit the tag directly, with no surrounding
 formatting.
 
-Text outside a <tool_call> block is ordinary assistant text.
-A <tool_call> block means the tool is intended to execute.
+Text outside a <tool> block is ordinary assistant text.
+A <tool> block means the tool is intended to execute.
 
 Available tools:
 

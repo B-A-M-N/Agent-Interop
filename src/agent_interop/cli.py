@@ -13,7 +13,6 @@ from rich.console import Console
 from rich.table import Table
 
 from agent_interop.config import (
-    ContextConfig,
     InteropServerConfig,
     ModelRoute,
     ToolMode,
@@ -64,7 +63,6 @@ def _gateway_from_config_path(path: str):
 def _canonical_request_from_json(value: dict[str, Any]):
     """Read the documented compact canonical request JSON for ``explain``."""
     from agent_interop.abi import (
-        CanonicalContentBlock,
         CanonicalMessage,
         CanonicalModelReference,
         CanonicalRequest,
@@ -81,10 +79,8 @@ def _canonical_request_from_json(value: dict[str, Any]):
     for raw_message in value.get("messages", []):
         content = raw_message.get("content", "")
         if isinstance(content, list):
-            blocks: list[CanonicalContentBlock] = [
-                CanonicalTextBlock(text=str(item.get("text", item))) if isinstance(item, dict)
-                else CanonicalTextBlock(text=str(item)) for item in content
-            ]
+            blocks = [CanonicalTextBlock(text=str(item.get("text", item))) if isinstance(item, dict)
+                      else CanonicalTextBlock(text=str(item)) for item in content]
         else:
             blocks = [CanonicalTextBlock(text=str(content))]
         messages.append(CanonicalMessage(role=raw_message.get("role", "user"), content=blocks))
@@ -130,11 +126,7 @@ def explain(
     request: str = typer.Option(..., "--request", help="Canonical request JSON file"),
     path: str = typer.Option("./interop.yaml", "--path", "-p", help="Configuration path"),
 ) -> None:
-    """Show a compatibility plan without submitting an inference request.
-
-    P1.8: prints a resource breakdown showing client tokens vs model-visible
-    tokens, projection ratio, visible tools, virtualization, etc.
-    """
+    """Show a compatibility plan without submitting an inference request."""
     import asyncio
 
     try:
@@ -162,34 +154,6 @@ def explain(
     console.print(f"Attempts: {', '.join(item.kind.value for item in plan.attempts)}")
     if plan.missing_capabilities:
         console.print(f"Missing capability evidence: {', '.join(plan.missing_capabilities)}")
-
-    # P1.8: resource breakdown
-    console.print()
-    console.print("[bold]Resource breakdown:")
-    _print_resource_breakdown(invocation)
-
-
-def _print_resource_breakdown(invocation: Any) -> None:
-    """Print a client-tokens vs model-visible-tokens breakdown (P1.8)."""
-    breakdown = getattr(invocation.context_plan, "after", None)
-    before = getattr(invocation.context_plan, "before", None)
-    view = getattr(invocation, "model_view", None)
-    if breakdown is None or before is None:
-        console.print("  No context plan available.")
-        return
-    console.print(f"  System:              {before.system_tokens}")
-    console.print(f"  History:            {before.message_tokens}")
-    console.print(f"  Tool schemas:       {before.tool_schema_tokens}")
-    console.print(f"  Requested output:   {before.output_reserve_tokens}")
-    console.print(f"  Raw total:          {before.total_required_tokens}")
-    console.print("  ---")
-    console.print(f"  Model-visible total: {breakdown.total_required_tokens}")
-    if view:
-        console.print(f"  Visible tools: {view.visible_tool_count} / {view.authorized_tool_count}")
-        console.print(f"  Virtualized results: {getattr(view, 'virtualized_result_count', 0)}")
-        console.print(f"  System projected: {view.system_projected}")
-    console.print(f"  Projection ratio: {getattr(view, 'tool_reduction_ratio', 0):.0%}")
-    console.print(f"  Status: {'FIT' if getattr(invocation.context_plan, 'fits_directly', False) else 'ADAPTED'}")
 
 
 @app.command()
@@ -712,6 +676,11 @@ def test(
     suite_timeout: float = typer.Option(900.0, "--suite-timeout", help="Whole-suite timeout in seconds"),
     max_turns: int = typer.Option(0, "--max-turns", help="Optional maximum turns per test"),
     result_json: str = typer.Option("", "--result-json", help="Atomically write suite status JSON here"),
+    enable_controller: bool = typer.Option(
+        False, "--enable-controller/--no-controller",
+        help="Add a controller route (required for explicit_forced_tool test)",
+    ),
+    controller_model: str = typer.Option("", "--controller-model", help="Model for the controller route (defaults to same as test model)"),
 ) -> None:
     """Run conformance tests against a model.
 
@@ -726,6 +695,7 @@ def test(
     import tempfile
 
     from agent_interop.config import (
+        ControllerConfig,
         InteropServerConfig,
         ModelRoute,
         ToolMode,
@@ -749,28 +719,47 @@ def test(
 
     wire_protocol = _resolve_wire_protocol(backend_kind)
 
+    routes = {
+        "test": ModelRoute(
+            id="test",
+            client_model_aliases=[model],
+            upstream_model=model,
+            upstream=UpstreamConfig(
+                kind=backend_kind,
+                base_url=backend_url,
+                wire_protocol=wire_protocol,
+            ),
+            tool_mode=ToolMode.AUTO,
+            profile=profile,
+        ),
+    }
+
+    if enable_controller:
+        ctrl_model = controller_model or model
+        routes["controller"] = ModelRoute(
+            id="controller",
+            client_model_aliases=[f"{model}-controller"],
+            upstream_model=ctrl_model,
+            upstream=UpstreamConfig(
+                kind=backend_kind,
+                base_url=backend_url,
+                wire_protocol=wire_protocol,
+            ),
+            tool_mode=ToolMode.AUTO,
+            profile=profile,
+        )
+        routes["test"].controller = ControllerConfig(
+            enabled=True,
+            route_id="controller",
+            minimum_controller_level="L1",
+            require_verified=False,
+            allow_primary_tool_calls=True,
+        )
+
     base_config = InteropServerConfig(
         probe_on_startup=False,
         default_route_id="test",
-        routes={
-            "test": ModelRoute(
-                id="test",
-                client_model_aliases=[model],
-                upstream_model=model,
-                upstream=UpstreamConfig(
-                    kind=backend_kind,
-                    base_url=backend_url,
-                    wire_protocol=wire_protocol,
-                ),
-                tool_mode=ToolMode.AUTO,
-                profile=profile,
-                # The synthetic conformance route has no live backend to
-                # inspect at config-build time; give it a conservative
-                # explicit capacity so tool-bearing conformance requests
-                # are budgeted instead of rejected as CONTEXT_CAPACITY_UNKNOWN.
-                context=ContextConfig(context_limit_tokens=32768),
-            ),
-        },
+        routes=routes,
     )
 
     # Path-specific runs are intentionally separate from the historical
@@ -988,10 +977,6 @@ def run(
     ),
     model: str = typer.Option("qwen3-coder", "--model", "-m",
                                help="Model name to use for the agent"),
-    ollama_num_ctx: int = typer.Option(
-        0, "--ollama-num-ctx", min=0,
-        help="Requested Ollama context window for this launch (0 uses the server default)",
-    ),
     assume_protocol: str | None = typer.Option(
         None, "--assume-protocol",
         help=(
@@ -1030,7 +1015,6 @@ def run(
         ollama_url=backend_url,
         extra_args=extra_args or [],
         assume_protocol=assume_protocol,
-        ollama_num_ctx=ollama_num_ctx,
     )
     raise typer.Exit(exit_code)
 
@@ -1929,11 +1913,10 @@ def replay(
         from agent_interop.paths import diagnostic_cases_dir
         from agent_interop.replay.store import DiagnosticCaseStore
 
-        loaded = DiagnosticCaseStore(directory=diagnostic_cases_dir()).get(file)
-        if loaded is None:
+        case = DiagnosticCaseStore(directory=diagnostic_cases_dir()).get(file)
+        if case is None:
             console.print(f"[red]Replay case not found:[/] {file}")
             raise typer.Exit(1)
-        case = loaded
     console.print(f"[bold]Replay Case:[/] {case.case_id or 'unknown'}")
     console.print(f"  Client: {case.client_protocol}")
     console.print(f"  Upstream: {case.upstream_protocol}")

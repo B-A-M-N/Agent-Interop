@@ -1,0 +1,8 @@
+{
+  "client": "Claude Code",
+  "client_version": "2.1.109",
+  "timestamp": "2026-07-30T22:48:23.047156+00:00",
+  "scenario": "single_tool_round_trip",
+  "passed": false,
+  "detail": "stdout='API Error: 422 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Tool \\'read_file\\' not found in registered tools\"},\"details\":{\"rejected_calls\":[{\"tool_name\":\"read_file\",\"candidate_id\":\"\",\"message\":\"Tool \\'read_file\\' not found in registered tools\"}]}}\\n' stderr=''"
+}

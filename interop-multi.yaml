@@ -1,0 +1,82 @@
+schema_version: 1
+default_route: default
+host: 127.0.0.1
+port: 8090
+ingress_auth:
+  mode: none_loopback
+log_level: info
+probe_on_startup: false
+routes:
+  default:
+    aliases:
+      - qwen3-coder
+      - claude-sonnet-5
+    tool_mode: auto
+    translation_mode: canonical
+    controller:
+      enabled: true
+      route_id: "controller"
+      auto_select_route: false
+      minimum_controller_level: "L3"
+      require_verified: false
+      max_controller_turns: 4
+      max_primary_turns: 4
+      allow_primary_tool_calls: false
+      preserve_primary_reasoning: false
+    repair:
+      batch_policy: atomic
+      field_aliases: compatibility_pack
+      malformed_json: safe
+      max_regenerations: 0
+    upstream:
+      base_url: http://127.0.0.1:11434
+      kind: ollama
+      wire_protocol: ollama_chat
+    upstream_model: qwen2.5-coder:7b
+  controller:
+    aliases:
+      - interop-controller
+    tool_mode: auto
+    translation_mode: canonical
+    repair:
+      batch_policy: atomic
+      field_aliases: compatibility_pack
+      malformed_json: safe
+      max_regenerations: 0
+    upstream:
+      base_url: http://127.0.0.1:11434
+      kind: ollama
+      wire_protocol: ollama_chat
+    upstream_model: muse-glimmer:30b
+  mistral:
+    aliases:
+      - mistral-7b
+      - gpt-4o-mini
+    tool_mode: auto
+    translation_mode: canonical
+    repair:
+      batch_policy: atomic
+      field_aliases: compatibility_pack
+      malformed_json: safe
+      max_regenerations: 0
+    upstream:
+      base_url: http://127.0.0.1:11434
+      kind: ollama
+      wire_protocol: ollama_chat
+    upstream_model: mistral:7b
+  deepseek:
+    aliases:
+      - deepseek-coder
+      - claude-3.5-sonnet
+    tool_mode: auto
+    translation_mode: canonical
+    repair:
+      batch_policy: atomic
+      field_aliases: compatibility_pack
+      malformed_json: safe
+      max_regenerations: 0
+    upstream:
+      base_url: http://127.0.0.1:11434
+      kind: ollama
+      wire_protocol: ollama_chat
+    upstream_model: deepseek-coder:6.7b

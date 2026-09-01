@@ -1,0 +1,24 @@
+schema_version: 1
+default_route: default
+host: 127.0.0.1
+port: 8090
+ingress_auth:
+  mode: none_loopback
+log_level: info
+probe_on_startup: false
+routes:
+  default:
+    aliases:
+      - qwen3-coder
+    tool_mode: auto
+    translation_mode: canonical
+    repair:
+      batch_policy: atomic
+      field_aliases: compatibility_pack
+      malformed_json: safe
+      max_regenerations: 0
+    upstream:
+      base_url: http://127.0.0.1:11434
+      kind: ollama
+      wire_protocol: ollama_chat
+    upstream_model: qwen2.5-coder:7b

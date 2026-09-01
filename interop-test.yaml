@@ -1,0 +1,49 @@
+default_route: default
+host: 127.0.0.1
+ingress_auth:
+  mode: none_loopback
+log_level: debug
+port: 8091
+probe_on_startup: false
+routes:
+  default:
+    aliases:
+    - qwen3-coder
+    repair:
+      batch_policy: atomic
+      field_aliases: compatibility_pack
+      malformed_json: safe
+      max_regenerations: 0
+    tool_mode: auto
+    translation_mode: canonical
+    upstream:
+      base_url: http://127.0.0.1:11434
+      kind: ollama
+      wire_protocol: ollama_chat
+    upstream_model: qwen2.5-coder:14b
+    controller:
+      enabled: true
+      route_id: "controller"
+      auto_select_route: false
+      minimum_controller_level: "L3"
+      require_verified: true
+      max_controller_turns: 4
+      max_primary_turns: 4
+      allow_primary_tool_calls: false
+      preserve_primary_reasoning: false
+  controller:
+    aliases:
+    - qwen3-controller
+    repair:
+      batch_policy: atomic
+      field_aliases: compatibility_pack
+      malformed_json: safe
+      max_regenerations: 0
+    tool_mode: auto
+    translation_mode: canonical
+    upstream:
+      base_url: http://127.0.0.1:11434
+      kind: ollama
+      wire_protocol: ollama_chat
+    upstream_model: ornith:35b
+schema_version: 2
